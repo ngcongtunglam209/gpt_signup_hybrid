@@ -176,10 +176,12 @@
     dom.logTarget.textContent = j.email;
     api(`/api/session/jobs/${jobId}/log`).then((data) => {
       const lines = data.log || [];
+      // Mỗi span tự kết thúc bằng '\n' (giống applyLog) để SSE append sau
+      // không bị dính vào span cuối.
       dom.logPane.innerHTML = lines.map((l) => {
         const cls = /(error|FAILED|fatal)/i.test(l) ? 'log-line-error' : 'log-line-info';
-        return `<span class="${cls}">${escHtml(l)}</span>`;
-      }).join('\n');
+        return `<span class="${cls}">${escHtml(l)}\n</span>`;
+      }).join('');
       dom.logPane.scrollTop = dom.logPane.scrollHeight;
     }).catch((err) => {
       dom.logPane.textContent = `[error] ${err.message}`;
@@ -296,7 +298,7 @@
         method: 'POST',
         body: JSON.stringify({ max_concurrent: target }),
       });
-      const regMode = document.getElementById('reg-mode-select')?.value || 'pure_request';
+      const regMode = document.getElementById('reg-mode-select')?.value || 'browser';
       await api('/api/session/jobs', {
         method: 'POST',
         body: JSON.stringify({ combos, reg_mode: regMode }),

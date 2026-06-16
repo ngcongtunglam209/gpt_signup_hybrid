@@ -220,15 +220,70 @@ function installRuntime(payload) {
   globalThis.top = globalThis;
   globalThis.parent = globalThis;
   globalThis.document = document;
-  globalThis.navigator = {
-    userAgent: String(payload.user_agent || "Mozilla/5.0"),
-    language: String(payload.language || "en-US"),
-    languages: Array.isArray(payload.languages) ? payload.languages : ["en-US", "en"],
-    hardwareConcurrency: Number(payload.hardware_concurrency || 12),
-    platform: "Win32",
-    vendor: "Google Inc.",
-    webdriver: false,
-  };
+  globalThis.navigator = (function () {
+    const ua = String(payload.user_agent || "Mozilla/5.0");
+    // Parse brands từ payload.sec_ch_ua_brands (mảng {brand, version}) — Python pass
+    // từ user_agent_profile. Nếu không có → suy ra Chromium/Google Chrome version
+    // từ UA string (regex Chrome/<major>) + grease brand mặc định.
+    let brands = Array.isArray(payload.sec_ch_ua_brands) ? payload.sec_ch_ua_brands : null;
+    if (!brands || !brands.length) {
+      const m = ua.match(/Chrome\/(\d+)/);
+      const major = m ? m[1] : "145";
+      brands = [
+        { brand: "Chromium", version: major },
+        { brand: "Google Chrome", version: major },
+        { brand: "Not_A Brand", version: "24" },
+      ];
+    }
+    const platform = String(payload.sec_ch_ua_platform || "Windows");
+    const platformVersion = String(payload.sec_ch_ua_platform_version || "15.0.0");
+    const isMobile = Boolean(payload.sec_ch_ua_mobile);
+    const archStr = String(payload.sec_ch_ua_arch || "x86");
+    const bitness = String(payload.sec_ch_ua_bitness || "64");
+    const model = String(payload.sec_ch_ua_model || "");
+    const fullVersion = ((brands.find(b => b.brand === "Google Chrome") || {}).version || "145") + ".0.0.0";
+    return {
+      userAgent: ua,
+      language: String(payload.language || "en-US"),
+      languages: Array.isArray(payload.languages) ? payload.languages : ["en-US", "en"],
+      hardwareConcurrency: Number(payload.hardware_concurrency || 12),
+      deviceMemory: Number(payload.device_memory || 8),
+      platform: "Win32",
+      vendor: "Google Inc.",
+      webdriver: false,
+      // Chrome 90+ Client Hints API. sdk.js modern có thể probe userAgentData
+      // (low-entropy luôn có sẵn, high-entropy qua getHighEntropyValues).
+      userAgentData: {
+        brands: brands.map(b => ({ brand: String(b.brand), version: String(b.version) })),
+        mobile: isMobile,
+        platform: platform,
+        getHighEntropyValues: function (hints) {
+          const out = {
+            brands: brands.map(b => ({ brand: String(b.brand), version: String(b.version) })),
+            mobile: isMobile,
+            platform: platform,
+          };
+          (hints || []).forEach(function (h) {
+            if (h === "platformVersion") out.platformVersion = platformVersion;
+            else if (h === "architecture") out.architecture = archStr;
+            else if (h === "bitness") out.bitness = bitness;
+            else if (h === "model") out.model = model;
+            else if (h === "uaFullVersion") out.uaFullVersion = fullVersion;
+            else if (h === "fullVersionList")
+              out.fullVersionList = brands.map(b => ({
+                brand: String(b.brand),
+                version: String(b.version) + ".0.0.0",
+              }));
+            else if (h === "wow64") out.wow64 = false;
+          });
+          return Promise.resolve(out);
+        },
+        toJSON: function () {
+          return { brands: brands, mobile: isMobile, platform: platform };
+        },
+      },
+    };
+  })();
   globalThis.location = {
     href: "https://auth.openai.com/",
     origin: "https://auth.openai.com",

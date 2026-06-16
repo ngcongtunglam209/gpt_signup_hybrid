@@ -4,6 +4,11 @@ from __future__ import annotations
 from typing import Any
 from pydantic import BaseModel, Field
 
+from .user_agent_profile import (
+    CURL_IMPERSONATE_PRIMARY as _CURL_IMPERSONATE_PRIMARY,
+    WINDOWS_USER_AGENT as _WINDOWS_USER_AGENT,
+)
+
 
 class SignupRequest(BaseModel):
     """Input cho 1 lần signup."""
@@ -18,8 +23,8 @@ class SignupRequest(BaseModel):
 
     # Registration mode: "browser" (Camoufox/Playwright) or "pure_request" (curl_cffi only)
     reg_mode: str = Field(
-        default="pure_request",
-        description="Registration mode: 'pure_request' (default, HTTP only) or 'browser' (anti-detect browser, slower).",
+        default="browser",
+        description="Registration mode: 'browser' (default, anti-detect browser) or 'pure_request' (HTTP only, faster but easier to flag).",
         pattern="^(browser|pure_request)$",
     )
     source_email: str | None = Field(
@@ -94,10 +99,13 @@ class SignupRequest(BaseModel):
 
     # Hybrid Phase 2
     user_agent: str = Field(
-        default="Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) Gecko/20100101 Firefox/135.0",
-        description="UA ép cho curl_cffi (phải khớp browser fingerprint Phase 1).",
+        default=_WINDOWS_USER_AGENT,
+        description="UA ép cho curl_cffi (phải khớp browser fingerprint Phase 1 — Windows Chrome).",
     )
-    impersonate: str = Field(default="firefox135", description="curl_cffi browser impersonation key.")
+    impersonate: str = Field(
+        default=_CURL_IMPERSONATE_PRIMARY,
+        description="curl_cffi browser impersonation key (đồng bộ với UA Chrome major).",
+    )
     proxy: str | None = Field(default=None, description="HTTP/HTTPS proxy cho cả 2 phase.")
 
 

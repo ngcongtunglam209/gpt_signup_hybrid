@@ -43,6 +43,7 @@ from ._browser_retry import (
     is_network_error as _is_network_error,
     parse_proxy_for_playwright as _parse_proxy,
 )
+from .user_agent_profile import CAMOUFOX_OS as _CAMOUFOX_OS
 
 
 class BrowserPhaseError(Exception):
@@ -1752,6 +1753,7 @@ async def run_browser_phase(
             headless=request.headless,
             persistent_context=True,
             user_data_dir=str(profile_dir),
+            os=list(_CAMOUFOX_OS),
             viewport=viewport,
             locale="en-US",
             ignore_https_errors=request.tls_insecure,

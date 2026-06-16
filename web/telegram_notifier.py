@@ -59,6 +59,33 @@ def _fmt_expiry(expires_at: int | None) -> str:
     return f"Hết hạn: {vn} VN\nExpired: {inn} IN"
 
 
+def _mask_email(email: str | None) -> str:
+    """Ẩn email cho hiển thị Telegram: giữ alias trừ 3 ký tự cuối + ẩn domain trừ TLD.
+
+    Ví dụ: ``lantrinh1xyz@hotmail.com`` → ``lantrinh1***@****.com``.
+    Alias có ≤ 3 ký tự → toàn bộ thay bằng ``***``.
+    Domain không có dot/TLD → thay bằng ``****``.
+    Email rỗng / không hợp lệ → ``***@****``.
+    """
+    if not email or "@" not in email:
+        return "***@****"
+    local, _, domain = email.partition("@")
+    if not local:
+        masked_local = "***"
+    elif len(local) <= 3:
+        masked_local = "***"
+    else:
+        masked_local = local[:-3] + "***"
+
+    dot = domain.rfind(".")
+    if dot <= 0 or dot == len(domain) - 1:
+        masked_domain = "****"
+    else:
+        masked_domain = "****" + domain[dot:]
+
+    return f"{masked_local}@{masked_domain}"
+
+
 class TelegramNotifier:
     """Quản lý config + gửi thông báo Telegram. Singleton qua get_telegram_notifier()."""
 
@@ -189,10 +216,11 @@ class TelegramNotifier:
             return False
 
         is_svg = path.suffix.lower() == ".svg"
-        # Caption gọn: chỉ tiêu đề + 2 dòng hết hạn (VN/IN). Bỏ amount, email,
-        # checkout — info account đã ở tin reply (code block tap-to-copy).
+        # Caption gọn: tiêu đề + email masked + 2 dòng hết hạn (VN/IN). Bỏ
+        # amount/checkout — combo đầy đủ ở tin reply (code block tap-to-copy).
         caption = "\n".join([
             "🟢 <b>UPI QR — ChatGPT Plus (IN)</b>",
+            f"Email: {html.escape(_mask_email(email))}",
             _fmt_expiry(qr_expires_at),
         ])
 

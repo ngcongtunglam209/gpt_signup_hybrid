@@ -21,18 +21,23 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+from .user_agent_profile import (
+    SEC_CH_UA as _SEC_CH_UA,
+    WINDOWS_USER_AGENT as _WINDOWS_USER_AGENT,
+)
+
 logger = logging.getLogger(__name__)
 
 SENTINEL_REQ_URL = "https://sentinel.openai.com/backend-api/sentinel/req"
 SENTINEL_REFERER = "https://sentinel.openai.com/backend-api/sentinel/frame.html"
 SENTINEL_SDK_URL = "https://sentinel.openai.com/sentinel/20260124ceb8/sdk.js"
 
-DEFAULT_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/145.0.0.0 Safari/537.36"
-)
-DEFAULT_SEC_CH_UA = '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"'
+# UA + sec-ch-ua đồng bộ với user_agent_profile (Windows + Chrome stable). Trước
+# refactor sentinel hardcode Windows Chrome 145 trong khi request_phase hardcode
+# Mac Chrome 136 → mismatch giữa sentinel ↔ register cho cùng device_id, anti-bot
+# OpenAI có thể flag (200 OK nhưng OTP không gửi).
+DEFAULT_UA = _WINDOWS_USER_AGENT
+DEFAULT_SEC_CH_UA = _SEC_CH_UA
 
 MAX_ATTEMPTS = 500_000
 ERROR_PREFIX = "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D"

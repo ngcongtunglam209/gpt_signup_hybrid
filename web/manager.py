@@ -311,7 +311,7 @@ class Job:
     email: str
     combo: str  # raw combo line
     mail_mode: str = "outlook"
-    reg_mode: str = "pure_request"  # "pure_request" or "browser"
+    reg_mode: str = "browser"  # "pure_request" or "browser"
     status: JobStatus = "queued"
     log_lines: list[str] = field(default_factory=list)
     error: str | None = None
@@ -751,7 +751,7 @@ class JobManager:
         self._delayed_requeue_tasks[job_id] = task
         task.add_done_callback(lambda _t, jid=job_id: self._delayed_requeue_tasks.pop(jid, None) if self._delayed_requeue_tasks.get(jid) is _t else None)
 
-    def add_jobs(self, combos: list[str], *, default_password: str | None = None, mail_mode: str = "outlook", worker_config: dict[str, str] | None = None, reg_mode: str = "pure_request") -> list[Job]:
+    def add_jobs(self, combos: list[str], *, default_password: str | None = None, mail_mode: str = "outlook", worker_config: dict[str, str] | None = None, reg_mode: str = "browser") -> list[Job]:
         """Thêm jobs từ list combo/email strings. Skip đã có trong list (dedup theo email)."""
         spec = get_spec(mail_mode)  # KeyError nếu mode lạ — server chặn trước
         existing_emails = {j.email.lower() for j in self.jobs.values() if j.status != "cancelled"}
@@ -2033,7 +2033,7 @@ class SessionJob:
     email: str
     password: str
     secret: str | None = None
-    reg_mode: str = "pure_request"  # "pure_request" or "browser"
+    reg_mode: str = "browser"  # "pure_request" or "browser"
     status: JobStatus = "queued"
     log_lines: list[str] = field(default_factory=list)
     error: str | None = None
@@ -2344,7 +2344,7 @@ class SessionJobManager:
             _log.warning("SessionMgr: update_status failed for %s → %s: %s", job.id, status, exc)
             return False
 
-    def add_jobs(self, combos: list[str], reg_mode: str = "pure_request") -> list[SessionJob]:
+    def add_jobs(self, combos: list[str], reg_mode: str = "browser") -> list[SessionJob]:
         """Parse input lines: email|password|secret. Dedup theo email."""
         existing_emails = {j.email.lower() for j in self.jobs.values() if j.status != "cancelled"}
         out: list[SessionJob] = []
@@ -2725,7 +2725,7 @@ class LinkJob:
     password: str
     secret: str | None = None
     mode: LinkMode = "combo"
-    reg_mode: str = "pure_request"  # "pure_request" or "browser"
+    reg_mode: str = "browser"  # "pure_request" or "browser"
     # Pre-provided token (dùng cho mode session_json / access_token)
     _access_token: str | None = field(default=None, repr=False)
     status: JobStatus = "queued"
@@ -3124,7 +3124,7 @@ class LinkJobManager:
     def _broadcast_job(self, job: LinkJob) -> None:
         self._broadcast({"type": "job", "job": job.to_dict()})
 
-    def add_jobs(self, lines: list[str], *, mode: LinkMode = "combo", region: str | None = None, reg_mode: str = "pure_request") -> list[LinkJob]:
+    def add_jobs(self, lines: list[str], *, mode: LinkMode = "combo", region: str | None = None, reg_mode: str = "browser") -> list[LinkJob]:
         """Parse input based on mode. Dedup theo email.
 
         Region được snapshot vào từng job (per-job), không mutate state global.
@@ -3160,7 +3160,7 @@ class LinkJobManager:
                 self._job_queue.put_nowait(j.id)
         return out
 
-    def _parse_combo(self, lines: list[str], existing_emails: set[str], region: str, reg_mode: str = "pure_request") -> list[LinkJob]:
+    def _parse_combo(self, lines: list[str], existing_emails: set[str], region: str, reg_mode: str = "browser") -> list[LinkJob]:
         """Mode combo: email|password|secret per line."""
         out: list[LinkJob] = []
         for raw in lines:

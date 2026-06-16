@@ -29,6 +29,7 @@ from ._browser_retry import (
 from ._nextauth_bootstrap import bootstrap_authorize_url
 from .config import ensure_runtime_dirs, load_settings, prepare_profile_dir
 from .totp_helper import generate_code
+from .user_agent_profile import CAMOUFOX_OS as _CAMOUFOX_OS
 
 
 LogFn = Callable[[str], None]
@@ -388,6 +389,7 @@ async def _get_session_browser(
             headless=headless,
             persistent_context=True,
             user_data_dir=str(profile_dir),
+            os=list(_CAMOUFOX_OS),
             viewport=viewport,
             locale="en-US",
             ignore_https_errors=tls_insecure,
@@ -607,7 +609,7 @@ async def fetch_session_via_http(
     cookies: Any,
     proxy: str | None = None,
     timeout: float = 30.0,
-    impersonate: str = "chrome136",
+    impersonate: str | None = None,
 ) -> dict[str, Any]:
     """GET https://chatgpt.com/api/auth/session bằng curl_cffi với cookies có sẵn.
 
@@ -615,7 +617,9 @@ async def fetch_session_via_http(
         cookies: list[dict] (Playwright format) hoặc dict {name: value}.
         proxy: HTTP/HTTPS proxy URL.
         timeout: Request timeout (seconds).
-        impersonate: curl_cffi browser impersonation key.
+        impersonate: curl_cffi browser impersonation key. None → dùng
+            ``CURL_IMPERSONATE_PRIMARY`` từ user_agent_profile (đồng bộ với UA
+            persona, tránh mismatch TLS fingerprint).
 
     Returns:
         Full session JSON (dict) với accessToken không rỗng.
@@ -624,6 +628,16 @@ async def fetch_session_via_http(
         SessionError: HTTP non-200, JSON parse fail, hoặc accessToken thiếu/rỗng.
     """
     from curl_cffi.requests import AsyncSession
+    from .user_agent_profile import (
+        CURL_IMPERSONATE_PRIMARY,
+        SEC_CH_UA,
+        SEC_CH_UA_MOBILE,
+        SEC_CH_UA_PLATFORM,
+        WINDOWS_USER_AGENT,
+    )
+
+    if impersonate is None:
+        impersonate = CURL_IMPERSONATE_PRIMARY
 
     cookie_header = _cookies_to_header(cookies)
     if not cookie_header:
@@ -633,7 +647,12 @@ async def fetch_session_via_http(
     headers = {
         "Cookie": cookie_header,
         "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://chatgpt.com/",
+        "User-Agent": WINDOWS_USER_AGENT,
+        "sec-ch-ua": SEC_CH_UA,
+        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
     }
 
     async with AsyncSession(impersonate=impersonate, proxies=proxies) as sess:
@@ -710,6 +729,11 @@ async def get_session_pure_request(
         RequestPhaseError,
         USER_AGENT,
     )
+    from .user_agent_profile import (
+        SEC_CH_UA as _SEC_CH_UA,
+        SEC_CH_UA_MOBILE as _SEC_CH_UA_MOBILE,
+        SEC_CH_UA_PLATFORM as _SEC_CH_UA_PLATFORM,
+    )
     from .totp_helper import generate_code as _generate_totp
     from urllib.parse import urljoin
     import asyncio as _asyncio
@@ -767,7 +791,7 @@ async def get_session_pure_request(
                         au,
                         headers={
                             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                            "Accept-Language": "en-US,en;q=0.5",
+                            "Accept-Language": "en-US,en;q=0.9",
                             "Accept-Encoding": "gzip, deflate, br, zstd",
                             "Referer": "https://chatgpt.com/",
                             "Connection": "keep-alive",
@@ -777,6 +801,9 @@ async def get_session_pure_request(
                             "Sec-Fetch-Site": "cross-site",
                             "Sec-Fetch-User": "?1",
                             "User-Agent": USER_AGENT,
+                            "sec-ch-ua": _SEC_CH_UA,
+                            "sec-ch-ua-mobile": _SEC_CH_UA_MOBILE,
+                            "sec-ch-ua-platform": _SEC_CH_UA_PLATFORM,
                         },
                         timeout=30,
                         allow_redirects=True,
@@ -1071,8 +1098,12 @@ async def get_session_pure_request(
                         auth_url2,
                         headers={
                             "Accept": "text/html,*/*",
+                            "Accept-Language": "en-US,en;q=0.9",
                             "Referer": "https://chatgpt.com/",
                             "User-Agent": USER_AGENT,
+                            "sec-ch-ua": _SEC_CH_UA,
+                            "sec-ch-ua-mobile": _SEC_CH_UA_MOBILE,
+                            "sec-ch-ua-platform": _SEC_CH_UA_PLATFORM,
                         },
                         timeout=30,
                         allow_redirects=False,

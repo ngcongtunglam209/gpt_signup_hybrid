@@ -133,9 +133,10 @@ def enable_2fa_cmd(
         typer.echo(f"Error: session file missing access_token", err=True)
         raise typer.Exit(1)
 
-    user_agent = sdata.get("user_agent") or (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) Gecko/20100101 Firefox/135.0"
-    )
+    user_agent = sdata.get("user_agent")
+    if not user_agent:
+        from .user_agent_profile import WINDOWS_USER_AGENT
+        user_agent = WINDOWS_USER_AGENT
 
     log = _emit_log(prefix="2fa")
 

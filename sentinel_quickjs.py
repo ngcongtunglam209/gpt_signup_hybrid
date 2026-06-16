@@ -28,6 +28,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from .user_agent_profile import sentinel_navigator_payload as _navigator_payload
+
 logger = logging.getLogger(__name__)
 
 SENTINEL_VERSION = "20260219f9f6"
@@ -51,12 +53,23 @@ def _ensure_sdk_file(session: Any, timeout_ms: int) -> Path:
     if sdk_file.exists() and sdk_file.stat().st_size > 0:
         return sdk_file
 
+    from .user_agent_profile import (
+        SEC_CH_UA,
+        SEC_CH_UA_MOBILE,
+        SEC_CH_UA_PLATFORM,
+        WINDOWS_USER_AGENT,
+    )
+
     resp = session.get(
         SENTINEL_SDK_URL,
         headers={
             "accept": "*/*",
             "accept-language": "en-US,en;q=0.9",
             "referer": "https://auth.openai.com/",
+            "user-agent": WINDOWS_USER_AGENT,
+            "sec-ch-ua": SEC_CH_UA,
+            "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
+            "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
             "sec-fetch-dest": "script",
             "sec-fetch-mode": "no-cors",
             "sec-fetch-site": "same-site",
@@ -344,6 +357,13 @@ def _fetch_sentinel_challenge(
     request_p: str,
     timeout_ms: int,
 ) -> dict:
+    from .user_agent_profile import (
+        SEC_CH_UA,
+        SEC_CH_UA_MOBILE,
+        SEC_CH_UA_PLATFORM,
+        WINDOWS_USER_AGENT,
+    )
+
     body = {"p": request_p, "id": device_id, "flow": flow}
     resp = session.post(
         SENTINEL_REQ_URL,
@@ -358,6 +378,10 @@ def _fetch_sentinel_challenge(
             "accept": "*/*",
             "accept-encoding": "gzip, deflate, br, zstd",
             "accept-language": "en-US,en;q=0.9",
+            "user-agent": WINDOWS_USER_AGENT,
+            "sec-ch-ua": SEC_CH_UA,
+            "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
+            "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "same-origin",
@@ -411,11 +435,19 @@ def get_sentinel_token_via_quickjs(
         )
 
     did = str(device_id or uuid.uuid4())
+    # Navigator persona (UA + language + hardware) — phải pass vào sdk.js để
+    # navigator.userAgent khớp Windows Chrome thực tế. Trước refactor không pass
+    # → sdk.js thấy navigator.userAgent="Mozilla/5.0" (default trong JS) →
+    # fingerprint cực kỳ generic, deep verification fail.
+    nav_payload = _navigator_payload()
     try:
         sdk_file = _ensure_sdk_file(session, timeout_ms)
 
         # Pass 1: generate requirements token (fingerprint)
-        requirements = _action("requirements", {"device_id": did})
+        requirements = _action(
+            "requirements",
+            {"device_id": did, **nav_payload},
+        )
         request_p = str(requirements.get("request_p") or "").strip()
         if not request_p:
             log("[sentinel] QuickJS requirements did not return request_p")
@@ -437,6 +469,7 @@ def get_sentinel_token_via_quickjs(
                 "device_id": did,
                 "request_p": request_p,
                 "challenge": challenge,
+                **nav_payload,
             },
         )
         final_p = str(solved.get("final_p") or solved.get("p") or "").strip()

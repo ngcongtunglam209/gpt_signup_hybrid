@@ -283,8 +283,8 @@ async def enable_2fa(
     *,
     access_token: str,
     cookies: list[dict[str, Any]] | None = None,
-    user_agent: str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) Gecko/20100101 Firefox/135.0",
-    impersonate: str = "firefox135",
+    user_agent: str | None = None,
+    impersonate: str | None = None,
     proxy: str | None = None,
     activate: bool = True,
     pending_enrollment: dict[str, Any] | None = None,
@@ -296,7 +296,11 @@ async def enable_2fa(
     Args:
         access_token: Bearer JWT của account (lấy từ SignupResult).
         cookies: Session cookies chatgpt.com — dùng để refresh token nếu bị revoke.
-        user_agent / impersonate: phải khớp với phiên browser nếu lo Sentinel.
+        user_agent: UA cho curl_cffi. None → dùng ``WINDOWS_USER_AGENT`` từ
+            user_agent_profile (đồng bộ với reg flow).
+        impersonate: TLS fingerprint preset của curl_cffi. None → dùng
+            ``CURL_IMPERSONATE_PRIMARY`` (chrome145) — KHÔNG dùng firefox135 nữa
+            vì làm UA(Chrome) ↔ TLS(Firefox) mismatch.
         proxy: HTTP/HTTPS proxy.
         activate: True = gọi activate_enrollment với code TOTP đầu tiên (bật 2FA luôn).
                   False = chỉ enroll, lưu secret để mày confirm sau.
@@ -324,13 +328,29 @@ async def enable_2fa(
         MfaError: Nếu enroll/activate fail. ``partial_state`` (nếu có) chứa
             secret/factor_id/session_id để caller persist + retry sau.
     """
+    from .user_agent_profile import (
+        CURL_IMPERSONATE_PRIMARY,
+        SEC_CH_UA,
+        SEC_CH_UA_MOBILE,
+        SEC_CH_UA_PLATFORM,
+        WINDOWS_USER_AGENT,
+    )
+
+    if user_agent is None:
+        user_agent = WINDOWS_USER_AGENT
+    if impersonate is None:
+        impersonate = CURL_IMPERSONATE_PRIMARY
+
     proxies = {"http": proxy, "https": proxy} if proxy else None
     base_headers = {
         "User-Agent": user_agent,
         "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Language": "en-US,en;q=0.9",
         "Origin": "https://chatgpt.com",
         "Referer": "https://chatgpt.com/",
+        "sec-ch-ua": SEC_CH_UA,
+        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
     }
     async with AsyncSession(impersonate=impersonate, proxies=proxies, headers=base_headers) as session:
         # ── Phase 1: secure secret ──

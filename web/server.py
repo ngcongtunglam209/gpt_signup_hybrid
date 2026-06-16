@@ -811,7 +811,7 @@ async def on_shutdown():
 
 class AddSessionJobsRequest(BaseModel):
     combos: str = Field(..., description="email|password|secret per line")
-    reg_mode: str = Field(default="pure_request", description="'pure_request' (default) or 'browser'")
+    reg_mode: str = Field(default="browser", description="'browser' (default) or 'pure_request'")
 
 
 class SetSessionConfigRequest(BaseModel):
@@ -932,7 +932,7 @@ class AddLinkJobsRequest(BaseModel):
     combos: str = Field(..., description="Input text — format depends on mode")
     mode: str = Field(default="combo", description="combo | session_json | access_token")
     region: str = Field(default="VN", description="Region: VN | ID | IN | US")
-    reg_mode: str = Field(default="pure_request", description="'pure_request' (default) or 'browser'")
+    reg_mode: str = Field(default="browser", description="'browser' (default) or 'pure_request'")
 
 
 class SetLinkConfigRequest(BaseModel):

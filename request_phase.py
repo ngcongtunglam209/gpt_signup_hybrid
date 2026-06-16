@@ -36,6 +36,14 @@ from curl_cffi import requests as curl_requests
 
 from .mail_providers import MailProvider
 from .models import SignupRequest, SignupResult
+from .user_agent_profile import (
+    CURL_IMPERSONATE_CANDIDATES as _UA_IMPERSONATE_CANDIDATES,
+    CURL_IMPERSONATE_PRIMARY as _UA_IMPERSONATE_PRIMARY,
+    SEC_CH_UA,
+    SEC_CH_UA_MOBILE,
+    SEC_CH_UA_PLATFORM,
+    WINDOWS_USER_AGENT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +54,8 @@ class RequestPhaseError(Exception):
 
 # ─── Constants ────────────────────────────────────────────────────────
 
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
-)
+# Re-export cho backward compatibility (session_phase + module khác đã import).
+USER_AGENT = WINDOWS_USER_AGENT
 
 _FIRST_NAMES = [
     "James", "John", "Robert", "Michael", "William", "David", "Richard",
@@ -88,7 +94,7 @@ def _datadog_trace_headers() -> dict[str, str]:
 # ─── Session factory ─────────────────────────────────────────────────
 
 
-def _create_session(proxy: str | None, impersonate: str = "chrome136") -> curl_requests.Session:
+def _create_session(proxy: str | None, impersonate: str = _UA_IMPERSONATE_PRIMARY) -> curl_requests.Session:
     session = curl_requests.Session(impersonate=impersonate)
     session.trust_env = False
     if proxy:
@@ -102,7 +108,9 @@ def _create_session(proxy: str | None, impersonate: str = "chrome136") -> curl_r
 
 
 # TLS fingerprint candidates — rotate on TLS handshake failure (from gpt-outlook-register).
-_IMPERSONATE_CANDIDATES = ["chrome136", "chrome124", "chrome120"]
+# Đồng bộ với UA: cùng Chrome family, version giảm dần. Defined in user_agent_profile
+# để khớp với WINDOWS_USER_AGENT (CHROME_MAJOR).
+_IMPERSONATE_CANDIDATES = list(_UA_IMPERSONATE_CANDIDATES)
 
 
 def _is_tls_error(exc: BaseException) -> bool:
@@ -162,9 +170,15 @@ def _common_headers(referer: str = "https://chatgpt.com/") -> dict[str, str]:
 
     headers = {
         "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
         "Referer": referer,
         "Origin": origin,
         "User-Agent": USER_AGENT,
+        # Client Hints — Chrome desktop luôn gửi 3 header này (low-entropy hints,
+        # không cần Accept-CH). Bắt buộc đồng bộ với USER_AGENT để tránh mismatch.
+        "sec-ch-ua": SEC_CH_UA,
+        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
     }
     headers.update(_datadog_trace_headers())
     return headers
@@ -211,7 +225,9 @@ def _bootstrap_with_tls_rotation(
     """Bootstrap CSRF + auth_url + OAuth init with TLS fingerprint rotation.
 
     On TLS handshake error, rotates curl_cffi impersonate fingerprint
-    (chrome136 → chrome124 → chrome120) and retries the whole bootstrap.
+    qua các candidate trong ``_IMPERSONATE_CANDIDATES`` (chain Chrome desktop
+    Windows: chrome145 → chrome142 → chrome136 — đồng bộ với
+    ``user_agent_profile.WINDOWS_USER_AGENT``).
     Bootstrap steps carry no critical session state yet, so restarting is safe.
 
     Returns: (session, device_id, auth_url)
@@ -298,8 +314,12 @@ def _step_oauth_init(session, auth_url: str, log: Callable) -> str:
     log("[request] [3/9] OAuth init...")
     headers = {
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://chatgpt.com/auth/login",
         "User-Agent": USER_AGENT,
+        "sec-ch-ua": SEC_CH_UA,
+        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
     }
     session.get(auth_url, headers=headers, timeout=30, allow_redirects=True)
 
@@ -565,8 +585,12 @@ def _step_follow_redirects(session, start_url: str, log: Callable) -> tuple[str,
 
         headers = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://chatgpt.com/",
             "User-Agent": USER_AGENT,
+            "sec-ch-ua": SEC_CH_UA,
+            "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
+            "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
         }
         resp = session.get(current, headers=headers, timeout=30, allow_redirects=False)
 
@@ -602,8 +626,12 @@ def _consume_callback(session, callback_url: str, log: Callable) -> bool:
             callback_url,
             headers={
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
                 "Referer": "https://auth.openai.com/",
                 "User-Agent": USER_AGENT,
+                "sec-ch-ua": SEC_CH_UA,
+                "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
+                "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
             },
             timeout=30,
             allow_redirects=True,

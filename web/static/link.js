@@ -446,7 +446,7 @@
     try {
       await api('/api/link/jobs', {
         method: 'POST',
-        body: JSON.stringify({ combos, mode: state.mode, region: state.region, reg_mode: document.getElementById('reg-mode-select')?.value || 'pure_request' }),
+        body: JSON.stringify({ combos, mode: state.mode, region: state.region, reg_mode: document.getElementById('reg-mode-select')?.value || 'browser' }),
       });
     } catch (err) {
       await Dialog.alert({ message: 'Error: ' + err.message });

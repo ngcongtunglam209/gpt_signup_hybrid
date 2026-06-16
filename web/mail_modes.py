@@ -62,7 +62,7 @@ def _build_outlook_request(
     headless: bool = True,
     keep_browser_open: bool = False,
     proxy: str | None = None,
-    reg_mode: str = "pure_request",
+    reg_mode: str = "browser",
 ) -> SignupRequest:
     from ..config import env_insecure_tls
     return SignupRequest(
@@ -110,7 +110,7 @@ def _build_worker_request(
     headless: bool = True,
     keep_browser_open: bool = False,
     proxy: str | None = None,
-    reg_mode: str = "pure_request",
+    reg_mode: str = "browser",
 ) -> SignupRequest:
     cfg = worker_config or {}
     # insecure_tls chỉ bật qua opt-in: env GPT_SIGNUP_INSECURE_TLS=1 hoặc
@@ -185,7 +185,7 @@ def _build_gmail_advanced_request(
     headless: bool = True,
     keep_browser_open: bool = False,
     proxy: str | None = None,
-    reg_mode: str = "pure_request",
+    reg_mode: str = "browser",
 ) -> SignupRequest:
     raw = parsed.raw.strip()
     # Detect format: URL-only hoặc email|url
@@ -250,7 +250,7 @@ def _build_dongvanfb_request(
     headless: bool = True,
     keep_browser_open: bool = False,
     proxy: str | None = None,
-    reg_mode: str = "pure_request",
+    reg_mode: str = "browser",
 ) -> SignupRequest:
     from ..config import env_insecure_tls
     return SignupRequest(

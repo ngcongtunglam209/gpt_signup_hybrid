@@ -82,10 +82,19 @@ def _fetch_access_token(
 ) -> tuple[str | None, str | None]:
     """GET /api/auth/session với cookies đã inject. Trả về (access_token, user_id)."""
     url = f"{_CHATGPT_BASE}/api/auth/session"
+    from .user_agent_profile import (
+        SEC_CH_UA,
+        SEC_CH_UA_MOBILE,
+        SEC_CH_UA_PLATFORM,
+    )
     headers = {
         "User-Agent": request.user_agent,
         "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
         "Referer": f"{_CHATGPT_BASE}/",
+        "sec-ch-ua": SEC_CH_UA,
+        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
     }
     try:
         response = _request_with_retry(

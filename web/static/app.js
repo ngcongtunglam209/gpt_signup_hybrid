@@ -460,12 +460,14 @@
     dom.logTarget.textContent = j.email;
     api(`/api/jobs/${jobId}/log`).then((data) => {
       const lines = data.log || [];
+      // Mỗi span tự kết thúc bằng '\n' (giống applyLog) để SSE append sau
+      // không bị dính vào span cuối.
       dom.logPane.innerHTML = lines.map((l) => {
         const cls = /(error|FAILED|fatal)/i.test(l)
           ? 'log-line-error'
           : 'log-line-info';
-        return `<span class="${cls}">${escHtml(l)}</span>`;
-      }).join('\n');
+        return `<span class="${cls}">${escHtml(l)}\n</span>`;
+      }).join('');
       dom.logPane.scrollTop = dom.logPane.scrollHeight;
     }).catch((err) => {
       dom.logPane.textContent = `[error] ${err.message}`;
@@ -570,7 +572,7 @@
         combos,
         default_password: dom.defaultPassword.value.trim() || null,
         mail_mode: state.currentMailMode,
-        reg_mode: dom.regModeSelect.value || 'pure_request',
+        reg_mode: dom.regModeSelect.value || 'browser',
       };
       if (state.currentMailMode === 'worker') {
         // Đọc trực tiếp từ DOM input (không chỉ localStorage — user có thể chưa trigger persist)
