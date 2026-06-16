@@ -76,6 +76,13 @@
     dom.panes = Array.prototype.slice.call(
       document.querySelectorAll("#tab-settings [data-settings-pane]")
     );
+    // Telegram section
+    dom.tgBotToken = $("telegram-bot-token");
+    dom.tgChatId = $("telegram-chat-id");
+    dom.tgSave = $("telegram-save");
+    dom.tgTest = $("telegram-test");
+    dom.tgStatus = $("telegram-status");
+    dom.tgBadge = $("telegram-status-badge");
   }
 
   // ── Sidebar section switching ────────────────────────────────────────────
@@ -264,6 +271,83 @@
       });
   }
 
+  // ── Telegram section ─────────────────────────────────────────────────
+  var tgState = { loaded: false, busy: false };
+
+  function setTgStatus(text, kind) {
+    if (!dom.tgStatus) return;
+    dom.tgStatus.textContent = text || "";
+    dom.tgStatus.className = "proxy-pool-status muted" + (kind ? " proxy-pool-status-" + kind : "");
+  }
+
+  function setTgBadge(configured) {
+    if (!dom.tgBadge) return;
+    dom.tgBadge.textContent = configured ? "đã cấu hình" : "chưa cấu hình";
+    dom.tgBadge.className = "badge " + (configured ? "badge-success" : "badge-muted");
+  }
+
+  function loadTelegram() {
+    if (!dom.tgBotToken) return Promise.resolve();
+    return api("/api/telegram/config")
+      .then(function (data) {
+        dom.tgBotToken.value = data.bot_token || "";
+        dom.tgChatId.value = data.chat_id || "";
+        setTgBadge(!!data.configured);
+        tgState.loaded = true;
+      })
+      .catch(function (err) {
+        setTgStatus("Load thất bại: " + err.message, "fail");
+      });
+  }
+
+  function saveTelegram() {
+    if (tgState.busy) return;
+    tgState.busy = true;
+    dom.tgSave.disabled = true;
+    setTgStatus("Đang lưu…", null);
+    api("/api/telegram/config", {
+      method: "POST",
+      body: JSON.stringify({
+        bot_token: dom.tgBotToken.value.trim(),
+        chat_id: dom.tgChatId.value.trim(),
+      }),
+    })
+      .then(function (data) {
+        setTgBadge(!!data.configured);
+        var extra = data.persist_error ? " (cảnh báo: " + data.persist_error + ")" : "";
+        setTgStatus("Đã lưu." + extra, data.persist_error ? "fail" : "ok");
+      })
+      .catch(function (err) {
+        setTgStatus("Lưu thất bại: " + err.message, "fail");
+      })
+      .finally(function () {
+        tgState.busy = false;
+        dom.tgSave.disabled = false;
+      });
+  }
+
+  function testTelegram() {
+    if (tgState.busy) return;
+    tgState.busy = true;
+    dom.tgTest.disabled = true;
+    setTgStatus("Đang gửi test…", null);
+    // Lưu trước rồi test để dùng giá trị mới nhất.
+    api("/api/telegram/config", {
+      method: "POST",
+      body: JSON.stringify({
+        bot_token: dom.tgBotToken.value.trim(),
+        chat_id: dom.tgChatId.value.trim(),
+      }),
+    })
+      .then(function () { return api("/api/telegram/test", { method: "POST" }); })
+      .then(function () { setTgStatus("Đã gửi tin test — kiểm tra Telegram.", "ok"); })
+      .catch(function (err) { setTgStatus("Test thất bại: " + err.message, "fail"); })
+      .finally(function () {
+        tgState.busy = false;
+        dom.tgTest.disabled = false;
+      });
+  }
+
   // ── Paste modal ──────────────────────────────────────────────────────────
   function openPaste() {
     dom.pasteTextarea.value = "";
@@ -320,6 +404,9 @@
     dom.btnTestAll.addEventListener("click", testAll);
     dom.btnSave.addEventListener("click", save);
 
+    if (dom.tgSave) dom.tgSave.addEventListener("click", saveTelegram);
+    if (dom.tgTest) dom.tgTest.addEventListener("click", testTelegram);
+
     dom.modeSelect.addEventListener("change", function () {
       state.mode = dom.modeSelect.value;
     });
@@ -361,11 +448,15 @@
       if (e.detail && e.detail.tab === "settings" && !state.loaded) {
         load();
       }
+      if (e.detail && e.detail.tab === "settings" && !tgState.loaded) {
+        loadTelegram();
+      }
     });
 
     // Nếu tab settings đã active sẵn lúc reload (ui.active_tab persisted)
     if (document.getElementById("tab-settings").classList.contains("active") && !state.loaded) {
       load();
+      loadTelegram();
     }
   }
 

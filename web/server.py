@@ -94,6 +94,9 @@ async def on_startup():
     get_session_manager().apply_settings(all_settings)
     get_link_manager().apply_settings(all_settings)
     get_upi_manager().apply_settings(all_settings)
+    # Telegram notifier — hydrate config (token/chat_id/notify toggle) từ DB.
+    from .telegram_notifier import get_telegram_notifier
+    get_telegram_notifier().apply_settings(all_settings)
 
     _log.info("startup: SQLite engine initialized, settings hydrated, job recovery done")
 
@@ -1640,6 +1643,12 @@ class SetUpiConfigRequest(BaseModel):
     max_concurrent: int | None = Field(default=None, ge=1, le=50)
     job_timeout: float | None = Field(default=None, ge=60, le=7200)
     approve_retries: int | None = Field(default=None, ge=1, le=2000)
+    notify_enabled: bool | None = Field(default=None)
+
+
+class SetTelegramConfigRequest(BaseModel):
+    bot_token: str | None = Field(default=None, max_length=200)
+    chat_id: str | None = Field(default=None, max_length=64)
 
 
 @app.get("/api/upi/jobs")
@@ -1728,16 +1737,19 @@ async def clear_finished_upi_jobs() -> JSONResponse:
 @app.get("/api/upi/config")
 async def get_upi_config() -> JSONResponse:
     um = get_upi_manager()
+    from .telegram_notifier import get_telegram_notifier
     return JSONResponse({
         "max_concurrent": um.max_concurrent,
         "job_timeout": um.job_timeout,
         "approve_retries": um.approve_retries,
+        "notify_enabled": get_telegram_notifier().enabled,
     })
 
 
 @app.post("/api/upi/config")
 async def set_upi_config(payload: SetUpiConfigRequest) -> JSONResponse:
     um = get_upi_manager()
+    from .telegram_notifier import get_telegram_notifier
     settings_writes: dict[str, Any] = {}
     if payload.max_concurrent is not None:
         try:
@@ -1757,6 +1769,9 @@ async def set_upi_config(payload: SetUpiConfigRequest) -> JSONResponse:
             settings_writes["upi.approve_retries"] = payload.approve_retries
         except ValueError as exc:
             raise HTTPException(400, str(exc))
+    if payload.notify_enabled is not None:
+        get_telegram_notifier().set_enabled(payload.notify_enabled)
+        settings_writes["upi.notify_enabled"] = payload.notify_enabled
     # Write-through SQLite (best-effort — không break endpoint nếu DB fail).
     if settings_writes:
         try:
@@ -1768,7 +1783,108 @@ async def set_upi_config(payload: SetUpiConfigRequest) -> JSONResponse:
         "max_concurrent": um.max_concurrent,
         "job_timeout": um.job_timeout,
         "approve_retries": um.approve_retries,
+        "notify_enabled": get_telegram_notifier().enabled,
     })
+
+
+@app.get("/api/telegram/config")
+async def get_telegram_config() -> JSONResponse:
+    """Trả config Telegram hiện tại (để Settings tab hiển thị/sửa)."""
+    from .telegram_notifier import get_telegram_notifier
+    n = get_telegram_notifier()
+    return JSONResponse({
+        "bot_token": n.bot_token or "",
+        "chat_id": n.chat_id or "",
+        "configured": n.configured,
+        "notify_enabled": n.enabled,
+    })
+
+
+@app.post("/api/telegram/config")
+async def set_telegram_config(payload: SetTelegramConfigRequest) -> JSONResponse:
+    """Lưu bot_token + chat_id → update notifier live + write-through DB."""
+    from .telegram_notifier import get_telegram_notifier
+    n = get_telegram_notifier()
+    bot_token = (payload.bot_token or "").strip() or None
+    chat_id = (payload.chat_id or "").strip() or None
+    n.set_credentials(bot_token, chat_id)
+    try:
+        _get_settings_repo().bulk_set({
+            "telegram.bot_token": bot_token,
+            "telegram.chat_id": chat_id,
+        })
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("Telegram config write-through failed: %s", exc)
+        return JSONResponse({"configured": n.configured, "persist_error": str(exc)})
+    return JSONResponse({"configured": n.configured})
+
+
+@app.post("/api/telegram/test")
+async def test_telegram() -> JSONResponse:
+    """Gửi 1 tin test để verify bot_token + chat_id."""
+    from .telegram_notifier import TelegramNotifyError, get_telegram_notifier
+    n = get_telegram_notifier()
+    if not n.configured:
+        raise HTTPException(400, "bot_token/chat_id chưa cấu hình")
+    try:
+        await n.send_test()
+    except TelegramNotifyError as exc:
+        raise HTTPException(400, str(exc))
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/telegram/debug")
+async def debug_telegram() -> JSONResponse:
+    """Trả về state hiện tại của notifier để chẩn đoán khi không gửi được tin."""
+    from .telegram_notifier import get_telegram_notifier
+    n = get_telegram_notifier()
+    token = n.bot_token or ""
+    return JSONResponse({
+        "enabled": n.enabled,
+        "configured": n.configured,
+        "bot_token_present": bool(token),
+        "bot_token_preview": (token[:8] + "..." + token[-4:]) if len(token) >= 16 else (token[:4] + "..." if token else ""),
+        "chat_id": n.chat_id or "",
+    })
+
+
+@app.post("/api/upi/jobs/{job_id}/notify")
+async def notify_upi_job(job_id: str) -> JSONResponse:
+    """Trigger gửi Telegram cho 1 job đã success — bỏ qua check ``enabled``.
+
+    Dùng để test/khắc phục khi user thấy job success nhưng tin Telegram không
+    về: bypass mọi nhánh skip, gọi thẳng notify_upi_qr → trả lỗi cụ thể
+    nếu fail (HTTP status, body của Telegram API).
+    """
+    from .telegram_notifier import TelegramNotifyError, get_telegram_notifier
+
+    um = get_upi_manager()
+    job = um.jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    if job.status != "success" or not job.qr_path:
+        raise HTTPException(400, f"job chưa success hoặc không có QR (status={job.status}, qr={bool(job.qr_path)})")
+    n = get_telegram_notifier()
+    if not n.configured:
+        raise HTTPException(400, "telegram chưa cấu hình bot_token/chat_id")
+    # Bỏ qua flag enabled — đây là endpoint manual.
+    n.set_enabled(True)
+    try:
+        await n.notify_upi_qr(
+            email=job.email,
+            password=job.password,
+            secret=job.secret,
+            amount=job.amount,
+            qr_path=job.qr_path,
+            qr_expires_at=job.qr_expires_at,
+            checkout_session=job.checkout_session,
+            return_url=job.return_url,
+        )
+    except TelegramNotifyError as exc:
+        raise HTTPException(400, f"telegram fail: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"{type(exc).__name__}: {exc}")
+    return JSONResponse({"ok": True})
 
 
 # Mount static folder cho CSS/JS

@@ -228,9 +228,15 @@
           <input type="number" id="upi-job-timeout" value="1800" min="60" max="7200" step="60" />
         </label>
         <span class="settings-divider" aria-hidden="true"></span>
+        <label class="toggle-wrap" id="upi-notify-wrap" title="Bật để gửi QR + thông tin account qua Telegram khi job xong">
+          <input type="checkbox" id="upi-notify-toggle" />
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="toggle-label">Gửi Telegram</span>
+        </label>
+        <!-- <span class="settings-divider" aria-hidden="true"></span>
         <span class="muted upi-fixed-note" title="Các biến này fix cứng trong code">
           fixed: PROMO=1 · PROXY_FROM_STEP=3 · QR_CONFIRM=1 · QR_APPROVE=1 · APPROVE_DELAY=3s · VARIANTS=qr_code,empty,flow_qr,intent
-        </span>
+        </span> -->
       </div>
     </div>
     <div class="card-actions">
@@ -530,6 +536,12 @@
       </span>
       <span class="settings-nav-label">Proxies</span>
     </button>
+    <button class="settings-nav-item" data-settings-section="telegram" role="tab" aria-selected="false">
+      <span class="settings-nav-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4 20-7z"/></svg>
+      </span>
+      <span class="settings-nav-label">Telegram</span>
+    </button>
   </aside>
 
   <!-- Content pane -->
@@ -567,6 +579,37 @@
         </div>
 
         <div id="proxy-pool-status" class="proxy-pool-status muted"></div>
+      </div>
+    </section>
+
+    <!-- ── Section: Telegram ── -->
+    <section class="card settings-section" id="settings-section-telegram" data-settings-pane="telegram">
+      <header class="card-head">
+        <h2>Telegram</h2>
+        <span id="telegram-status-badge" class="badge badge-muted">chưa cấu hình</span>
+      </header>
+
+      <div class="settings-section-body">
+        <p class="settings-hint muted">
+          Bot token lấy từ <code>@BotFather</code>. Chat ID là ID cá nhân/nhóm nhận thông báo (lấy qua <code>@userinfobot</code>). Khi bật toggle <strong>Gửi Telegram</strong> ở tab UPI QR, mỗi job thành công sẽ gửi ảnh QR kèm thời gian hết hạn (giờ VN + IN) và 1 tin reply chứa <code>email|pass|secret</code> dạng spoiler.
+        </p>
+
+        <label class="input-group">
+          <span class="input-label">Bot token</span>
+          <input type="text" id="telegram-bot-token" placeholder="123456:ABC-DEF..." spellcheck="false" autocomplete="off" />
+        </label>
+        <label class="input-group">
+          <span class="input-label">Chat ID</span>
+          <input type="text" id="telegram-chat-id" placeholder="vd: 123456789 hoặc -100123..." spellcheck="false" autocomplete="off" />
+        </label>
+
+        <div class="proxy-pool-toolbar">
+          <span class="settings-toolbar-spacer"></span>
+          <button id="telegram-test" class="btn btn-ghost btn-small" type="button">Gửi test</button>
+          <button id="telegram-save" class="btn btn-primary btn-small" type="button">Lưu</button>
+        </div>
+
+        <div id="telegram-status" class="proxy-pool-status muted"></div>
       </div>
     </section>
   </div>
@@ -732,6 +775,9 @@
         <div class="upi-qr-modal-row"><span class="muted">Amount:</span> <span id="upi-qr-modal-amount">-</span></div>
         <div class="upi-qr-modal-row"><span class="muted">Source:</span> <span id="upi-qr-modal-source">-</span></div>
         <div class="upi-qr-modal-row"><span class="muted">Checkout:</span> <code id="upi-qr-modal-cs">-</code></div>
+        <div class="upi-qr-modal-row"><span class="muted">Hết hạn sau:</span> <span id="upi-qr-modal-countdown" class="upi-countdown">-</span></div>
+        <div class="upi-qr-modal-row"><span class="muted">Hết hạn (VN):</span> <span id="upi-qr-modal-exp-vn">-</span></div>
+        <div class="upi-qr-modal-row"><span class="muted">Hết hạn (IN):</span> <span id="upi-qr-modal-exp-in">-</span></div>
       </div>
     </div>
     <footer class="modal-foot">

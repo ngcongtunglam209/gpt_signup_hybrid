@@ -22,6 +22,7 @@
     comboCount:    $('upi-combo-count'),
     approveRetries:$('upi-approve-retries'),
     jobTimeout:    $('upi-job-timeout'),
+    notifyToggle:  $('upi-notify-toggle'),
     jobList:       $('upi-job-list'),
     jobSummary:    $('upi-job-summary'),
     logPane:       $('upi-log-pane'),
@@ -36,6 +37,9 @@
     modalAmount:   $('upi-qr-modal-amount'),
     modalSource:   $('upi-qr-modal-source'),
     modalCs:       $('upi-qr-modal-cs'),
+    modalCountdown:$('upi-qr-modal-countdown'),
+    modalExpVn:    $('upi-qr-modal-exp-vn'),
+    modalExpIn:    $('upi-qr-modal-exp-in'),
     modalClose:    $('upi-qr-modal-close'),
     modalOk:       $('upi-qr-modal-ok'),
     modalCopyUrl:  $('upi-qr-modal-copy-url'),
@@ -53,6 +57,31 @@
   function fmtAmount(amount) {
     if (!amount) return '';
     return `₹${(amount / 100).toFixed(2)}`;
+  }
+
+  // Countdown tới expires_at (unix seconds). Trả {text, expired}.
+  function fmtCountdown(expiresAt) {
+    if (!expiresAt) return { text: '', expired: false };
+    const remainMs = expiresAt * 1000 - Date.now();
+    if (remainMs <= 0) return { text: 'Hết hạn', expired: true };
+    const total = Math.floor(remainMs / 1000);
+    const m = Math.floor(total / 60);
+    const s = total % 60;
+    return { text: `${m}:${String(s).padStart(2, '0')}`, expired: false };
+  }
+
+  // Định dạng thời điểm hết hạn theo timezone (VN / IN).
+  function fmtExpiryAt(expiresAt, tz) {
+    if (!expiresAt) return '-';
+    try {
+      return new Date(expiresAt * 1000).toLocaleString('vi-VN', {
+        timeZone: tz, hour12: false,
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+      });
+    } catch (_) {
+      return new Date(expiresAt * 1000).toISOString();
+    }
   }
 
   function escHtml(s) {
@@ -176,6 +205,9 @@
       const amountBadge = j.amount
         ? `<span class="badge badge-muted upi-amount" title="amount inr">${escHtml(fmtAmount(j.amount))}</span>`
         : '';
+      const countdownBadge = (j.status === 'success' && j.qr_expires_at)
+        ? `<span class="badge upi-countdown-badge" data-exp="${escHtml(String(j.qr_expires_at))}" title="QR hết hạn sau"></span>`
+        : '';
       const errBadge = (j.status === 'error' && j.error)
         ? `<span class="upi-err-inline" title="${escHtml(j.error)}">${escHtml(j.error.slice(0, 60))}</span>`
         : '';
@@ -188,6 +220,7 @@
             <div class="job-email" title="${escHtml(j.email)}">
               <span class="job-email-text">${escHtml(j.email)}</span>
               ${amountBadge}
+              ${countdownBadge}
               ${errBadge}
             </div>
           </div>
@@ -204,6 +237,7 @@
       stats.success ? `${stats.success} done` : '',
       stats.error ? `${stats.error} failed` : '',
     ].filter(Boolean).join(' · ');
+    updateCountdowns();
   }
 
   // ── Render outputs ────────────────────────────────────────────────
@@ -243,6 +277,34 @@
 
   // ── QR Modal ──────────────────────────────────────────────────────
   let _modalActiveJobId = null;
+  let _modalExpiresAt = null;
+
+  // Set các dòng hết hạn (VN/IN) trong modal + lưu mốc để countdown tick.
+  function _setModalExpiry(expiresAt) {
+    _modalExpiresAt = expiresAt || null;
+    dom.modalExpVn.textContent = fmtExpiryAt(expiresAt, 'Asia/Ho_Chi_Minh');
+    dom.modalExpIn.textContent = fmtExpiryAt(expiresAt, 'Asia/Kolkata');
+    _tickModalCountdown();
+  }
+
+  function _tickModalCountdown() {
+    if (dom.modal.style.display === 'none') return;
+    const cd = fmtCountdown(_modalExpiresAt);
+    dom.modalCountdown.textContent = _modalExpiresAt ? (cd.text || '-') : '-';
+    dom.modalCountdown.classList.toggle('upi-countdown-expired', cd.expired);
+  }
+
+  // Cập nhật mọi badge countdown trên job list (data-exp) + modal.
+  function updateCountdowns() {
+    const badges = dom.jobList.querySelectorAll('.upi-countdown-badge[data-exp]');
+    badges.forEach((el) => {
+      const exp = parseInt(el.dataset.exp, 10);
+      const cd = fmtCountdown(exp);
+      el.textContent = cd.text;
+      el.classList.toggle('upi-countdown-expired', cd.expired);
+    });
+    _tickModalCountdown();
+  }
 
   function openQrModal(jobId) {
     const j = state.jobs.get(jobId);
@@ -252,6 +314,7 @@
     dom.modalAmount.textContent = j.amount ? fmtAmount(j.amount) : '-';
     dom.modalSource.textContent = j.qr_source || '-';
     dom.modalCs.textContent = j.checkout_session || '-';
+    _setModalExpiry(j.qr_expires_at);
     dom.modal.style.display = 'flex';
     if (dom.modalOk) dom.modalOk.focus();
 
@@ -280,6 +343,7 @@
     dom.modal.style.display = 'none';
     dom.modalImg.removeAttribute('src');
     _modalActiveJobId = null;
+    _modalExpiresAt = null;
   }
 
   dom.modalClose.addEventListener('click', closeQrModal);
@@ -419,6 +483,18 @@
     } catch (err) { console.error(err); }
   });
 
+  dom.notifyToggle.addEventListener('change', async () => {
+    const enabled = dom.notifyToggle.checked;
+    try {
+      await api('/api/upi/config', {
+        method: 'POST', body: JSON.stringify({ notify_enabled: enabled }),
+      });
+    } catch (err) {
+      dom.notifyToggle.checked = !enabled; // revert nếu fail
+      await Dialog.alert({ message: 'Không lưu được toggle: ' + err.message });
+    }
+  });
+
   dom.btnCopyError.addEventListener('click', () => {
     window.GptUi.copyText(dom.errorPane.textContent);
   });
@@ -476,6 +552,7 @@
       dom.modalAmount.textContent = j.amount ? fmtAmount(j.amount) : '-';
       dom.modalSource.textContent = j.qr_source || '-';
       dom.modalCs.textContent = j.checkout_session || '-';
+      _setModalExpiry(j.qr_expires_at);
       if (j.has_qr) {
         fetchQrBlob(j.id, j.finished_at || 0).then((entry) => {
           if (_modalActiveJobId === j.id) {
@@ -529,9 +606,10 @@
     if (cfg.approve_retries) dom.approveRetries.value = cfg.approve_retries;
     if (cfg.job_timeout) dom.jobTimeout.value = cfg.job_timeout;
     state.approveRetries = cfg.approve_retries;
+    dom.notifyToggle.checked = !!cfg.notify_enabled;
   }).catch(() => {});
 
-  // Duration timer cho running jobs
+  // Duration timer cho running jobs + countdown QR
   setInterval(() => {
     let hasRunning = false;
     for (const [, j] of state.jobs) {
@@ -541,5 +619,6 @@
       }
     }
     if (hasRunning) renderJobs();
+    else updateCountdowns();
   }, 1000);
 })();

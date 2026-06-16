@@ -732,89 +732,132 @@ async def get_session_pure_request(
             loop.close()
 
     def _sync() -> dict[str, Any]:
-        # Bootstrap (CSRF + signin/openai + OAuth init) with TLS rotation.
-        session = None
-        device_id = ""
-        auth_url = ""
-        landing = ""
-        _last_exc = None
-        for _idx, _imp in enumerate(_IMPERSONATE_CANDIDATES):
-            session = _create_session(proxy=proxy, impersonate=_imp)
-            try:
-                if _idx > 0:
-                    log(f"[session-req] TLS rotation: retrying with impersonate={_imp}")
-                device_id = str(__import__('uuid').uuid4())
-                csrf = _step_csrf(session, log)
-                auth_url = _step_auth_url(session, csrf, log, device_id=device_id, login_hint=email)
-                # OAuth init: GET authorize MIMIC top-level navigation của browser
-                # (sec-fetch-* + upgrade-insecure-requests + referer chatgpt.com/).
-                # Đây là khác biệt KEY so với request_phase: browser auth.openai.com
-                # bot-detect signature header — GET authorize KHÔNG có
-                # sec-fetch-mode=navigate sẽ bị xử như XHR và trả thẳng SPA 200
-                # thay vì 302 sang /log-in/password (xác minh qua HAR thật, RID 424).
-                _r_init = session.get(
-                    auth_url,
-                    headers={
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                        "Accept-Language": "en-US,en;q=0.5",
-                        "Accept-Encoding": "gzip, deflate, br, zstd",
-                        "Referer": "https://chatgpt.com/",
-                        "Connection": "keep-alive",
-                        "Upgrade-Insecure-Requests": "1",
-                        "Sec-Fetch-Dest": "document",
-                        "Sec-Fetch-Mode": "navigate",
-                        "Sec-Fetch-Site": "cross-site",
-                        "Sec-Fetch-User": "?1",
-                        "User-Agent": USER_AGENT,
-                    },
-                    timeout=30,
-                    allow_redirects=True,
-                )
-                landing = str(getattr(_r_init, "url", "") or auth_url)
-                device_id = session.cookies.get("oai-did", "") or device_id
-                break
-            except Exception as _e:
-                _last_exc = _e
+        # ─────────────────────────────────────────────────────────────
+        # Bootstrap helper: CSRF + signin/openai + GET /authorize.
+        # `use_login_hint=True` → server có thể auto-redirect thẳng tới
+        # /log-in/password (fast path khi account đã tồn tại + có password).
+        # `use_login_hint=False` → state machine ở mức "đợi email submission",
+        # cần authorize/continue để rẽ flow (slow path / fallback).
+        # ─────────────────────────────────────────────────────────────
+        def _do_bootstrap(*, use_login_hint: bool) -> tuple[Any, str, str, str]:
+            """Returns (session, device_id, auth_url, landing_url).
+
+            Có TLS fingerprint rotation. Raise nếu bootstrap fail trên mọi
+            impersonate candidate.
+            """
+            last_exc: BaseException | None = None
+            for idx, imp in enumerate(_IMPERSONATE_CANDIDATES):
+                sess = _create_session(proxy=proxy, impersonate=imp)
                 try:
-                    session.close()
-                except Exception:
-                    pass
-                if _is_tls_error(_e) and _idx < len(_IMPERSONATE_CANDIDATES) - 1:
-                    continue
-                raise
-        if not auth_url:
-            if _last_exc:
-                raise _last_exc
+                    if idx > 0:
+                        log(f"[session-req] TLS rotation: retrying with impersonate={imp}")
+                    did = str(__import__('uuid').uuid4())
+                    csrf = _step_csrf(sess, log)
+                    au = _step_auth_url(
+                        sess, csrf, log,
+                        device_id=did,
+                        login_hint=email if use_login_hint else "",
+                    )
+                    # OAuth init: GET authorize MIMIC top-level navigation của browser
+                    # (sec-fetch-* + upgrade-insecure-requests + referer chatgpt.com/).
+                    # GET authorize KHÔNG có sec-fetch-mode=navigate sẽ bị xử như
+                    # XHR và trả thẳng SPA 200 thay vì 302 sang /log-in/password
+                    # (xác minh qua HAR thật, RID 424).
+                    r = sess.get(
+                        au,
+                        headers={
+                            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                            "Accept-Language": "en-US,en;q=0.5",
+                            "Accept-Encoding": "gzip, deflate, br, zstd",
+                            "Referer": "https://chatgpt.com/",
+                            "Connection": "keep-alive",
+                            "Upgrade-Insecure-Requests": "1",
+                            "Sec-Fetch-Dest": "document",
+                            "Sec-Fetch-Mode": "navigate",
+                            "Sec-Fetch-Site": "cross-site",
+                            "Sec-Fetch-User": "?1",
+                            "User-Agent": USER_AGENT,
+                        },
+                        timeout=30,
+                        allow_redirects=True,
+                    )
+                    land = str(getattr(r, "url", "") or au)
+                    did = sess.cookies.get("oai-did", "") or did
+                    return sess, did, au, land
+                except Exception as e:
+                    last_exc = e
+                    try:
+                        sess.close()
+                    except Exception:
+                        pass
+                    if _is_tls_error(e) and idx < len(_IMPERSONATE_CANDIDATES) - 1:
+                        continue
+                    raise
+            if last_exc:
+                raise last_exc
             raise SessionError("bootstrap failed (no auth_url)")
 
-        try:
-            log(f"[session-req] landing: {landing[:90]!r}")
+        def _detect_flow_from_landing(land_url: str) -> str:
+            """Map landing URL → 'password' | 'otp' | '' (undetermined)."""
+            if "/log-in/password" in land_url:
+                return "password"
+            if "/email-verification" in land_url:
+                return "otp"
+            return ""
 
-            page_type = ""
-            continue_url = ""
+        # ─────────────────────────────────────────────────────────────
+        # Fast path: bootstrap WITH login_hint. Nếu account tồn tại + có
+        # password, server thường redirect thẳng tới /log-in/password →
+        # skip authorize/continue (tránh bug HTTP 409 invalid_state khi
+        # state machine đã pre-set bởi login_hint).
+        # ─────────────────────────────────────────────────────────────
+        session, device_id, auth_url, landing = _do_bootstrap(use_login_hint=True)
+        log(f"[session-req] landing: {landing[:90]!r}")
 
-            # Resolve login flow. oauth_init ở trên đã theo hết redirect chain:
-            # - Nếu server đưa thẳng tới trang login → landing cho biết luôn.
-            # - Nếu server trả trang authorize/SPA (không redirect) → drive state
-            #   machine qua authorize/continue (state đã được oauth_init thiết lập)
-            #   để lấy page.type. KHÔNG đoán mò theo URL, KHÔNG retry ở ngọn.
-            flow = ""
-            if "/log-in/password" in landing:
-                flow = "password"
-            elif "/email-verification" in landing:
-                flow = "otp"
-            else:
-                log("[session-req] authorize không tự redirect — resolve qua authorize/continue...")
+        page_type = ""
+        continue_url = ""
+        flow = _detect_flow_from_landing(landing)
+
+        # ─────────────────────────────────────────────────────────────
+        # Fallback: landing không xác định → re-bootstrap KHÔNG login_hint
+        # để state machine ở "đợi email submission", rồi gọi authorize/continue
+        # clean. Đây là lý do bug "invalid_state HTTP 409" — gọi
+        # authorize/continue với email khi server đã pre-set login_hint sẽ
+        # bị reject vì state đã ở step sau.
+        # ─────────────────────────────────────────────────────────────
+        if not flow:
+            log("[session-req] landing không xác định — re-bootstrap KHÔNG login_hint để gọi authorize/continue clean...")
+            try:
+                session.close()
+            except Exception:
+                pass
+            session, device_id, auth_url, landing = _do_bootstrap(use_login_hint=False)
+            log(f"[session-req] retry landing: {landing[:90]!r}")
+            flow = _detect_flow_from_landing(landing)
+
+            if not flow:
+                # State machine giờ clean (no login_hint preset) → authorize/continue
+                # an toàn để drive flow. Vẫn catch 409 invalid_state để báo lỗi rõ.
+                log("[session-req] resolve qua authorize/continue (no login_hint)...")
                 ac_sentinel = _get_sentinel_token(session, device_id, "login", log)
-                ac_data = _step_authorize_continue(
-                    session,
-                    email,
-                    ac_sentinel,
-                    screen_hint="login",
-                    referer="https://auth.openai.com/log-in",
-                    device_id=device_id,
-                    log=log,
-                )
+                try:
+                    ac_data = _step_authorize_continue(
+                        session, email, ac_sentinel,
+                        screen_hint="login",
+                        referer="https://auth.openai.com/log-in",
+                        device_id=device_id,
+                        log=log,
+                    )
+                except RequestPhaseError as exc:
+                    msg = str(exc)
+                    if "HTTP 409" in msg and "invalid_state" in msg:
+                        raise SessionError(
+                            "authorize/continue bị OpenAI từ chối với HTTP 409 invalid_state. "
+                            "State machine không đồng bộ — có thể do proxy chậm khiến state hết hạn "
+                            "hoặc account đang ở flow đặc biệt (passwordless/blocked). "
+                            f"Detail: {msg}"
+                        ) from exc
+                    raise SessionError(f"authorize/continue failed: {msg}") from exc
                 ac_page = ac_data.get("page", {}) if isinstance(ac_data, dict) else {}
                 page_type = (ac_page.get("type") or "").strip()
                 continue_url = (ac_data.get("continue_url") or "").strip()
@@ -827,6 +870,8 @@ async def get_session_pure_request(
                     raise SessionError(
                         f"unexpected login state: page_type={page_type!r} landing={landing[:80]!r}"
                     )
+
+        try:
 
             # ── Branch A: password login ──
             if flow == "password":
@@ -941,6 +986,42 @@ async def get_session_pure_request(
             if continue_url and continue_url.startswith("/"):
                 continue_url = urljoin("https://auth.openai.com", continue_url)
 
+            # ── Helpers cho callback consume + verify session cookie ──
+            # `_consume_callback` của request_phase trả bool (cookie đã set chưa)
+            # nhưng caller cũ ignore → khi cookie chưa set kịp do server chậm /
+                # callback code đã expire, /api/auth/session sẽ trả response chỉ
+            # chứa WARNING_BANNER (unauthenticated). Retry + verify rõ ràng.
+            def _has_session_cookie() -> bool:
+                """NextAuth session-token có thể bị split thành .0/.1 khi quá dài."""
+                for name in (
+                    "__Secure-next-auth.session-token",
+                    "__Secure-next-auth.session-token.0",
+                ):
+                    if session.cookies.get(name):
+                        return True
+                return False
+
+            def _consume_callback_verified(callback_url: str, *, max_attempts: int = 3, delay: float = 1.0) -> bool:
+                """Consume callback + verify session-token cookie. Retry nếu chậm."""
+                if not callback_url or "code=" not in callback_url:
+                    return False
+                for attempt in range(1, max_attempts + 1):
+                    ok = _consume_callback(session, callback_url, log)
+                    if _has_session_cookie():
+                        log(f"[session-req] consume_callback verified (attempt {attempt}/{max_attempts}) consumed={ok}")
+                        return True
+                    if attempt < max_attempts:
+                        log(
+                            f"[session-req] consume_callback chưa set session cookie "
+                            f"(attempt {attempt}/{max_attempts}) — retry sau {delay:g}s..."
+                        )
+                        time.sleep(delay)
+                log(
+                    f"[session-req] consume_callback FAIL — session cookie KHÔNG set "
+                    f"sau {max_attempts} lần"
+                )
+                return False
+
             # Step 7-8: Follow redirects + consume callback
             # If continue_url points to auth.openai.com (not a callback), we need to
             # reauthorize to get the actual callback with code parameter.
@@ -952,18 +1033,33 @@ async def get_session_pure_request(
                     # Follow authorize URL (should redirect to callback since we're now authenticated)
                     callback_url, _ = _step_follow_redirects(session, auth_url2, log)
                     if callback_url:
-                        _consume_callback(session, callback_url, log)
+                        _consume_callback_verified(callback_url)
+                    else:
+                        log("[session-req] reauthorize: callback URL KHÔNG tìm thấy trong redirect chain")
                 except Exception as e:
                     log(f"[session-req] reauthorize attempt failed: {e}")
 
             elif continue_url:
                 _t_cb = time.monotonic()
-                callback_url, _ = _step_follow_redirects(session, continue_url, log)
-                log(f"[session-req] follow_redirects {time.monotonic() - _t_cb:.2f}s")
-                if callback_url:
-                    _t_cc = time.monotonic()
-                    _consume_callback(session, callback_url, log)
-                    log(f"[session-req] consume_callback {time.monotonic() - _t_cc:.2f}s")
+                callback_url, final_url = _step_follow_redirects(session, continue_url, log)
+                log(
+                    f"[session-req] follow_redirects {time.monotonic() - _t_cb:.2f}s "
+                    f"callback={'found' if callback_url else 'missing'}"
+                )
+                if not callback_url:
+                    raise SessionError(
+                        f"login completed but no callback URL found in redirect chain. "
+                        f"final_url={final_url[:120]!r}"
+                    )
+                _t_cc = time.monotonic()
+                if not _consume_callback_verified(callback_url):
+                    raise SessionError(
+                        "callback consumed nhưng session-token cookie KHÔNG được set. "
+                        "Nguyên nhân khả dĩ: callback code đã expire (login tới callback "
+                        "quá chậm), Cloudflare reject NextAuth set-cookie, hoặc proxy "
+                        "strip cookie. Tăng số lần retry hoặc đổi proxy."
+                    )
+                log(f"[session-req] consume_callback {time.monotonic() - _t_cc:.2f}s")
 
             elif not continue_url:
                 # Try reauthorize (session cookie may already be set)
@@ -986,9 +1082,20 @@ async def get_session_pure_request(
                         redir_url = loc if loc.startswith("http") else urljoin(auth_url2, loc)
                         callback_url, _ = _step_follow_redirects(session, redir_url, log)
                         if callback_url:
-                            _consume_callback(session, callback_url, log)
+                            _consume_callback_verified(callback_url)
                 except Exception as e:
                     log(f"[session-req] reauthorize failed: {e}")
+
+            # Pre-check: nếu session cookie vẫn chưa có ở đây, /api/auth/session
+            # CHẮC CHẮN sẽ trả response WARNING_BANNER (unauthenticated). Fail fast
+            # với message rõ ràng thay vì để user thấy raw banner JSON.
+            if not _has_session_cookie():
+                raise SessionError(
+                    "login flow completed nhưng cookie __Secure-next-auth.session-token "
+                    "không được set. /api/auth/session sẽ trả WARNING_BANNER "
+                    "(unauthenticated). Nguyên nhân khả dĩ: callback code expire, "
+                    "Cloudflare reject, redirect chain bị cắt, hoặc proxy strip cookie."
+                )
 
             # Step 9: Get FULL /api/auth/session JSON (same as browser mode)
             _t_sess = time.monotonic()
@@ -1009,6 +1116,23 @@ async def get_session_pure_request(
                 raise SessionError(f"/api/auth/session JSON parse failed: {e}")
 
             if not isinstance(session_data, dict) or not session_data.get("accessToken"):
+                # Detect "warning-only" response: server trả banner cảnh báo
+                # nhưng KHÔNG có session payload → user vẫn unauthenticated.
+                keys = sorted(session_data.keys()) if isinstance(session_data, dict) else []
+                only_warning = (
+                    isinstance(session_data, dict)
+                    and "WARNING_BANNER" in session_data
+                    and not any(k in session_data for k in ("user", "accessToken", "expires"))
+                )
+                if only_warning:
+                    raise SessionError(
+                        "login chưa thực sự authenticated — /api/auth/session chỉ trả "
+                        "WARNING_BANNER, không có user/accessToken/expires. "
+                        "Session cookie đã set nhưng NextAuth không recognize "
+                        "(có thể cookie sai domain/path, hoặc Cloudflare strip cookie "
+                        "ở request /api/auth/session). "
+                        f"keys={keys}"
+                    )
                 raise SessionError(
                     f"login completed but /api/auth/session has no accessToken: {str(session_data)[:200]}"
                 )

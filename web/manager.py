@@ -3765,7 +3765,7 @@ def get_link_manager(job_repo: "JobRepository | None" = None) -> LinkJobManager:
 # Pattern clone từ SessionJobManager nhưng:
 #   - Worker chạy upi_runner.run_upi_qr_probe (login + checkout + confirm + approve loop).
 #   - Hardcoded: PROMO, PROXY_FROM_STEP, DO_CONFIRM, DO_APPROVE, APPROVE_DELAY,
-#     APPROVE_PROXY_BATCH, APPROVE_BACKEND_EXCEPTION_FAILS, CONFIRM_VARIANTS.
+#     APPROVE_PROXY_BATCH, APPROVE_BACKEND_EXCEPTION_CONSECUTIVE, CONFIRM_VARIANTS.
 #   - Configurable: max_concurrent, job_timeout, approve_retries.
 #   - Multi-mode → KHÔNG stagger giữa start (yêu cầu UI: "multi thì chạy luôn ko cần delay").
 #   - In-memory only (không persist DB) — UPI jobs ngắn hạn, user chạy lại được.
@@ -3789,6 +3789,7 @@ class UpiJob:
     qr_path: str | None = None
     qr_source: str | None = None
     qr_reason: str | None = None
+    qr_expires_at: int | None = None
     amount: int = 0
     return_url: str | None = None
     checkout_session: str | None = None
@@ -3814,6 +3815,7 @@ class UpiJob:
             "has_qr": bool(self.qr_path),
             "qr_source": self.qr_source,
             "qr_reason": self.qr_reason,
+            "qr_expires_at": self.qr_expires_at,
             "has_upi_uri": self.has_upi_uri,
             "has_qr_image_url": self.has_qr_image_url,
             "backend_exception_count": self.backend_exception_count,
@@ -4104,6 +4106,7 @@ class UpiJobManager:
         job.qr_path = None
         job.qr_source = None
         job.qr_reason = None
+        job.qr_expires_at = None
         job.amount = 0
         job.return_url = None
         job.checkout_session = None
@@ -4122,6 +4125,41 @@ class UpiJobManager:
         self._ensure_workers()
         self._job_queue.put_nowait(job_id)
         return True
+
+    # ── Telegram notify ─────────────────────────────────────────────────
+    async def _notify_telegram(self, job: UpiJob) -> None:
+        """Gửi QR + combo qua Telegram (best-effort). Không raise ra ngoài.
+
+        Log mọi nhánh skip/fail vào job log để dễ debug khi user "không thấy
+        tin về" — tránh silent fallback.
+        """
+        from .telegram_notifier import TelegramNotifyError, get_telegram_notifier
+
+        notifier = get_telegram_notifier()
+        if not notifier.enabled:
+            self._job_log(job, "[tg]   skip            —  toggle 'Gửi Telegram' đang tắt")
+            return
+        if not notifier.configured:
+            self._job_log(job, "[tg]   skip            —  bot_token/chat_id chưa cấu hình (Settings → Telegram)")
+            return
+        try:
+            sent = await notifier.notify_upi_qr(
+                email=job.email,
+                password=job.password,
+                secret=job.secret,
+                amount=job.amount,
+                qr_path=job.qr_path,
+                qr_expires_at=job.qr_expires_at,
+                checkout_session=job.checkout_session,
+                return_url=job.return_url,
+                log=lambda msg: self._job_log(job, msg),
+            )
+            if sent:
+                self._broadcast_job(job)
+        except TelegramNotifyError as exc:
+            self._job_log(job, f"[tg]   send            ✗  {exc}")
+        except Exception as exc:  # noqa: BLE001
+            self._job_log(job, f"[tg]   send            ✗  {type(exc).__name__}: {exc}")
 
     # ── Run job ─────────────────────────────────────────────────────────
     async def _run_job(self, job: UpiJob) -> None:
@@ -4162,6 +4200,7 @@ class UpiJobManager:
             job.qr_path = result.qr_path
             job.qr_source = result.qr_source
             job.qr_reason = result.qr_reason
+            job.qr_expires_at = result.qr_expires_at
             job.has_upi_uri = result.has_upi_uri
             job.has_qr_image_url = result.has_qr_image_url
             job.backend_exception_count = result.backend_exception_count
@@ -4177,6 +4216,11 @@ class UpiJobManager:
                 job.error = result.error or "unknown error"
             job.finished_at = time.time()
             self._broadcast_job(job)
+
+            # Telegram notify (best-effort) — chỉ khi success + có QR. Không
+            # break job nếu gửi fail; log vào job để user thấy.
+            if result.ok and job.qr_path:
+                await self._notify_telegram(job)
 
         except asyncio.TimeoutError:
             error_msg = f"timeout {self._job_timeout:.0f}s exceeded"

@@ -68,6 +68,8 @@ _EXACT_KEYS: frozenset[str] = frozenset([
     "autoreg.concurrency", "autoreg.poll_interval",
     "autoreg.logs_url", "autoreg.api_key",
     "upi.max_concurrent", "upi.job_timeout", "upi.approve_retries",
+    "upi.notify_enabled",
+    "telegram.bot_token", "telegram.chat_id",
     "ui.active_tab", "ui.link_mode",
     "web.auth_token",
 ])
@@ -76,6 +78,7 @@ _EXACT_KEYS: frozenset[str] = frozenset([
 _SENSITIVE_KEYS: frozenset[str] = frozenset([
     "proxy.pool", "autoreg.api_key",
     "mail_mode.worker_config",
+    "telegram.bot_token",
     "web.auth_token",
 ])
 
@@ -363,6 +366,36 @@ def _validate_type_constraint(key: str, value: Any) -> None:
         if not (1 <= value <= 2000):
             raise RepositoryError(
                 "set", ValueError(f"{key}: must be in [1, 2000], got {value}")
+            )
+        return
+
+    if key == "upi.notify_enabled":
+        if not isinstance(value, bool):
+            raise RepositoryError(
+                "set", TypeError(f"{key}: must be bool, got {type(value).__name__}")
+            )
+        return
+
+    # --- telegram namespace ---
+    if key == "telegram.bot_token":
+        if value is not None and not isinstance(value, str):
+            raise RepositoryError(
+                "set", TypeError(f"{key}: must be str or null, got {type(value).__name__}")
+            )
+        if isinstance(value, str) and len(value) > 200:
+            raise RepositoryError(
+                "set", ValueError(f"{key}: len must be <= 200, got {len(value)}")
+            )
+        return
+
+    if key == "telegram.chat_id":
+        if value is not None and not isinstance(value, str):
+            raise RepositoryError(
+                "set", TypeError(f"{key}: must be str or null, got {type(value).__name__}")
+            )
+        if isinstance(value, str) and len(value) > 64:
+            raise RepositoryError(
+                "set", ValueError(f"{key}: len must be <= 64, got {len(value)}")
             )
         return
 
