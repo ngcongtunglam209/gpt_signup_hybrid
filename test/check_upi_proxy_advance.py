@@ -26,13 +26,13 @@ def t01_syntax() -> int:
 
 
 def t02_threshold_value() -> int:
-    """Threshold = 15."""
+    """Threshold = 0 (DISABLED — backend_exception không bao giờ fatal-break)."""
     src = TARGET.read_text(encoding="utf-8")
-    needle = "APPROVE_BACKEND_EXCEPTION_CONSECUTIVE: int = 15"
+    needle = "APPROVE_BACKEND_EXCEPTION_CONSECUTIVE: int = 0"
     if needle not in src:
         print(f"[FAIL] TC-02 threshold :: thiếu {needle!r}", flush=True)
         return 1
-    print("[PASS] TC-02 threshold :: = 15", flush=True)
+    print("[PASS] TC-02 threshold :: = 0 (disabled)", flush=True)
     return 0
 
 
@@ -194,21 +194,25 @@ def t09_no_proxy_when_step_disabled() -> int:
 
 def t10_test_files_threshold_synced() -> int:
     """check_upi_module_imports.py + check_upi_runner_consecutive_fix.py
-    phải đã update sang 15."""
+    phải đã update sang 0 (disabled)."""
     files_to_check = [
         ROOT / "test" / "check_upi_module_imports.py",
         ROOT / "test" / "check_upi_runner_consecutive_fix.py",
     ]
+    legacy_needles = (
+        "APPROVE_BACKEND_EXCEPTION_CONSECUTIVE == 15",
+        "APPROVE_BACKEND_EXCEPTION_CONSECUTIVE: int = 15",
+        "APPROVE_BACKEND_EXCEPTION_CONSECUTIVE == 5\n",
+        "APPROVE_BACKEND_EXCEPTION_CONSECUTIVE: int = 5\"",
+    )
     for fp in files_to_check:
         src = fp.read_text(encoding="utf-8")
-        if "== 5" in src.replace("== 50", "").replace("== 500", ""):
-            # Loose check: tìm "APPROVE_BACKEND_EXCEPTION_CONSECUTIVE == 5"
-            if "APPROVE_BACKEND_EXCEPTION_CONSECUTIVE == 5\n" in src or \
-               "APPROVE_BACKEND_EXCEPTION_CONSECUTIVE: int = 5\"" in src:
-                print(f"[FAIL] TC-10 sync :: {fp.name} vẫn còn assert == 5",
+        for needle in legacy_needles:
+            if needle in src:
+                print(f"[FAIL] TC-10 sync :: {fp.name} vẫn còn legacy {needle!r}",
                       flush=True)
                 return 1
-    print("[PASS] TC-10 sync :: 2 file test đã update sang 15", flush=True)
+    print("[PASS] TC-10 sync :: 2 file test đã update sang 0 (disabled)", flush=True)
     return 0
 
 

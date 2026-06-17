@@ -34,12 +34,13 @@ def main() -> int:
         return 1
     print("[PASS] đã xoá hết tên cũ APPROVE_BACKEND_EXCEPTION_FAILS", flush=True)
 
-    # 3. Tên mới + value default = 15.
-    expected_constant = "APPROVE_BACKEND_EXCEPTION_CONSECUTIVE: int = 15"
+    # 3. Tên mới + value default = 0 (DISABLED — backend_exception không
+    # bao giờ fatal-break; loop chỉ dừng khi approved/hết retry).
+    expected_constant = "APPROVE_BACKEND_EXCEPTION_CONSECUTIVE: int = 0"
     if expected_constant not in src:
         print(f"[FAIL] thiếu constant {expected_constant!r}", flush=True)
         return 1
-    print("[PASS] APPROVE_BACKEND_EXCEPTION_CONSECUTIVE = 15 (default)", flush=True)
+    print("[PASS] APPROVE_BACKEND_EXCEPTION_CONSECUTIVE = 0 (disabled by default)", flush=True)
 
     # 4. Logic consecutive: phải có biến + reset block.
     expectations = [
@@ -47,8 +48,8 @@ def main() -> int:
         ("consecutive_backend_exception += 1", "increment trên backend_exception"),
         ("consecutive_backend_exception = 0", "reset on non-exception"),
         ("APPROVE_BACKEND_EXCEPTION_CONSECUTIVE > 0", "respect disable=0"),
-        ("consecutive backend_exception threshold", "log message"),
-        ("consecutive backend_exception reset", "log message reset"),
+        ("consecutive backend_exception threshold", "log message threshold"),
+        ("reset consec be_excpt", "log message reset"),
     ]
     for needle, label in expectations:
         count = src.count(needle)

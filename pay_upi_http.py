@@ -1,6 +1,6 @@
 """Pure-HTTP UPI payment flow (best-effort).
 
-KHÔNG dùng browser. Dùng curl_cffi (impersonate Firefox/Chrome TLS) cho
+KHÔNG dùng browser. Dùng curl_cffi (impersonate Chrome desktop Windows TLS) cho
 tất cả request. Login bằng `session_phase.get_session_pure_request`.
 
 Phạm vi proxy:
@@ -18,6 +18,9 @@ Phạm vi pure-HTTP:
           browser: `js_checksum`, `rv_timestamp`, `passive_captcha_token`.
           Script vẫn submit best-effort; nếu Stripe reject sẽ log đầy đủ.
     ✓  POST chatgpt.com/backend-api/payments/checkout/approve
+
+UA + TLS persona: import từ ``user_agent_profile`` (Windows Chrome 145) để
+đồng bộ với reg flow + sentinel — cùng device persona xuyên suốt 1 account.
 
 Cách chạy:
     python -m gpt_signup_hybrid.pay_upi_http \\
@@ -40,6 +43,13 @@ from typing import Any
 
 from .random_profile import random_india_profile
 from .session_phase import get_session_pure_request
+from .user_agent_profile import (
+    CURL_IMPERSONATE_PRIMARY as _UA_IMPERSONATE_PRIMARY,
+    SEC_CH_UA as _SEC_CH_UA,
+    SEC_CH_UA_MOBILE as _SEC_CH_UA_MOBILE,
+    SEC_CH_UA_PLATFORM as _SEC_CH_UA_PLATFORM,
+    WINDOWS_USER_AGENT as _WINDOWS_USER_AGENT,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -92,11 +102,8 @@ def _short_url(url: str, max_len: int = 90) -> str:
 # Constants
 # ─────────────────────────────────────────────────────────────────────
 
-_IMPERSONATE = "chrome136"
-_USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) "
-    "Gecko/20100101 Firefox/135.0"
-)
+_IMPERSONATE = _UA_IMPERSONATE_PRIMARY
+_USER_AGENT = _WINDOWS_USER_AGENT
 _STRIPE_VERSION = (
     "2025-03-31.basil; checkout_server_update_beta=v1; "
     "checkout_manual_approval_preview=v1"
@@ -308,6 +315,9 @@ async def _create_chatgpt_checkout(
         "Origin": "https://chatgpt.com",
         "Referer": "https://chatgpt.com/?promo_campaign=plus-1-month-free",
         "User-Agent": _USER_AGENT,
+        "sec-ch-ua": _SEC_CH_UA,
+        "sec-ch-ua-mobile": _SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": _SEC_CH_UA_PLATFORM,
         "x-openai-target-path": "/backend-api/payments/checkout",
         "x-openai-target-route": "/backend-api/payments/checkout",
         "OAI-Language": "en-IN",
@@ -375,6 +385,9 @@ async def _stripe_init(
         "Origin": "https://js.stripe.com",
         "Referer": "https://js.stripe.com/",
         "User-Agent": _USER_AGENT,
+        "sec-ch-ua": _SEC_CH_UA,
+        "sec-ch-ua-mobile": _SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": _SEC_CH_UA_PLATFORM,
         "Accept-Language": "en-IN,en;q=0.9",
     }
     log(f"  {_blue('[3/6]')} POST /v1/payment_pages/{{cs}}/init  {_dim('proxy=' + ('yes' if proxies else 'no'))}")
@@ -432,6 +445,9 @@ async def _stripe_elements_session(
         "Origin": "https://js.stripe.com",
         "Referer": "https://js.stripe.com/",
         "User-Agent": _USER_AGENT,
+        "sec-ch-ua": _SEC_CH_UA,
+        "sec-ch-ua-mobile": _SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": _SEC_CH_UA_PLATFORM,
         "Accept-Language": "en-IN,en;q=0.9",
     }
     log(f"  {_blue('[4/6]')} GET  /v1/elements/sessions  {_dim('proxy=' + ('yes' if proxies else 'no'))}")
@@ -588,6 +604,9 @@ async def _stripe_confirm_upi(
         "Origin": "https://js.stripe.com",
         "Referer": "https://js.stripe.com/",
         "User-Agent": _USER_AGENT,
+        "sec-ch-ua": _SEC_CH_UA,
+        "sec-ch-ua-mobile": _SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": _SEC_CH_UA_PLATFORM,
         "Accept-Language": "en-IN,en;q=0.9",
     }
     log(f"  {_blue('[5/6]')} POST /v1/payment_pages/{{cs}}/confirm  {_dim('proxy=' + ('yes' if proxies else 'no'))}")
@@ -634,6 +653,9 @@ async def _chatgpt_approve(
         "Origin": "https://chatgpt.com",
         "Referer": f"https://chatgpt.com/checkout/openai_llc/{session_id}",
         "User-Agent": _USER_AGENT,
+        "sec-ch-ua": _SEC_CH_UA,
+        "sec-ch-ua-mobile": _SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": _SEC_CH_UA_PLATFORM,
         "x-openai-target-path": "/backend-api/payments/checkout/approve",
         "x-openai-target-route": "/backend-api/payments/checkout/approve",
         "OAI-Language": "en-IN",

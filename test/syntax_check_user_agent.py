@@ -40,6 +40,12 @@ TARGET_FILES = [
     "models.py",
     "cli.py",
     "http_phase.py",
+    # UPI flow
+    "pay_upi_http.py",
+    "payment_link.py",
+    "stripe_token.py",
+    "record_pay_upi.py",
+    "web/upi_runner.py",
 ]
 
 
@@ -264,6 +270,72 @@ def step_sentinel_js_userAgentData() -> None:
     _log("[PASS]", f"TC-08 — JS file đầy đủ Client Hints API ({len(required_markers)} markers)")
 
 
+# ─── UPI flow audit: không còn UA Mac/Firefox hardcode + impersonate đồng bộ ─
+
+UPI_FILES = [
+    "pay_upi_http.py",
+    "payment_link.py",
+    "stripe_token.py",
+    "record_pay_upi.py",
+    "web/upi_runner.py",
+]
+
+# Patterns FORBIDDEN trong UPI source (UA Mac Firefox cũ + impersonate hardcode)
+UPI_FORBIDDEN_PATTERNS = [
+    ('Mozilla/5.0 (Macintosh', 'UA Mac không được phép trong UPI flow'),
+    ('Gecko/20100101 Firefox', 'UA Firefox không được phép trong UPI flow'),
+    ('Chrome/148.0', 'UA Chrome 148 hardcode (cũ) không được phép'),
+    ('impersonate="chrome136"', 'impersonate hardcode chrome136 phải đổi sang _IMPERSONATE'),
+    ('impersonate="firefox', 'impersonate firefox không được phép'),
+]
+
+
+def step_upi_no_legacy_hardcode() -> None:
+    _log("[STEP]", "TC-09 — UPI flow không còn UA/impersonate hardcode cũ")
+    for idx, fname in enumerate(UPI_FILES, 1):
+        src = (REPO_ROOT / fname).read_text(encoding="utf-8")
+        for pat, reason in UPI_FORBIDDEN_PATTERNS:
+            if pat in src:
+                _log("[FAIL]", f"TC-09.{idx} — {fname}: {reason} (found {pat!r})")
+                sys.exit(1)
+        _log("[PASS]", f"TC-09.{idx} — {fname} sạch hardcode cũ")
+
+
+def step_upi_imports_user_agent_profile() -> None:
+    _log("[STEP]", "TC-10 — UPI flow import user_agent_profile")
+    expected_imports = {
+        "pay_upi_http.py": "from .user_agent_profile import",
+        "payment_link.py": "from .user_agent_profile import",
+        "stripe_token.py": "from .user_agent_profile import",
+        "record_pay_upi.py": "from .user_agent_profile import",
+        "web/upi_runner.py": "from ..user_agent_profile import",
+    }
+    for idx, (fname, marker) in enumerate(expected_imports.items(), 1):
+        src = (REPO_ROOT / fname).read_text(encoding="utf-8")
+        if marker not in src:
+            _log("[FAIL]", f"TC-10.{idx} — {fname} chưa import user_agent_profile")
+            sys.exit(1)
+        _log("[PASS]", f"TC-10.{idx} — {fname} đã wire profile")
+
+
+def step_upi_sec_ch_ua_present() -> None:
+    _log("[STEP]", "TC-11 — UPI request headers có sec-ch-ua family")
+    # Đếm số lần "sec-ch-ua" xuất hiện ở mỗi file (mỗi headers dict thật phải có 3 dòng)
+    expectations = {
+        "pay_upi_http.py": 5,        # 5 endpoint groups (chatgpt checkout/approve + 3 stripe)
+        "web/upi_runner.py": 5,      # mirror pay_upi_http
+        "payment_link.py": 1,        # 1 headers dict gốc (các call khác kế thừa)
+        "stripe_token.py": 1,        # 1 common_headers
+    }
+    for idx, (fname, min_count) in enumerate(expectations.items(), 1):
+        src = (REPO_ROOT / fname).read_text(encoding="utf-8")
+        count = src.count('"sec-ch-ua":')
+        if count < min_count:
+            _log("[FAIL]", f"TC-11.{idx} — {fname}: cần ≥{min_count} 'sec-ch-ua', got {count}")
+            sys.exit(1)
+        _log("[PASS]", f"TC-11.{idx} — {fname} có {count} sec-ch-ua header (≥{min_count})")
+
+
 # ─── Browser Camoufox os param ────────────────────────────────────────
 
 def step_camoufox_os_pinned() -> None:
@@ -295,6 +367,9 @@ def main() -> None:
     step_camoufox_os_pinned()
     step_sec_ch_ua_brand_parse()
     step_sentinel_js_userAgentData()
+    step_upi_no_legacy_hardcode()
+    step_upi_imports_user_agent_profile()
+    step_upi_sec_ch_ua_present()
     print("=" * 60, flush=True)
     print("[DONE] Tất cả check PASS — Option A hoàn tất.", flush=True)
 

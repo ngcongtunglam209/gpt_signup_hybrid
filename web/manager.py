@@ -3773,6 +3773,30 @@ def get_link_manager(job_repo: "JobRepository | None" = None) -> LinkJobManager:
 from .upi_runner import UpiQrError, UpiQrResult, run_upi_qr_probe  # noqa: E402
 
 _UPI_QR_DIR = Path(__file__).resolve().parents[1] / "runtime" / "upi_qr"
+
+
+def _extract_plan_from_session(session_data: dict[str, Any] | None) -> str | None:
+    """Lấy plan type từ /api/auth/session JSON.
+
+    ChatGPT trả plan ở 1 trong 2 vị trí (varies theo NextAuth version):
+        - top-level: ``accountPlan`` (e.g. "free", "plus")
+        - nested:    ``account.planType`` (e.g. "free", "plus", "team")
+
+    Trả str non-empty (lowercase-ed) hoặc None nếu cả 2 đều thiếu.
+    """
+    if not isinstance(session_data, dict):
+        return None
+    # 1. top-level accountPlan
+    top = session_data.get("accountPlan")
+    if isinstance(top, str) and top.strip():
+        return top.strip().lower()
+    # 2. account.planType
+    account = session_data.get("account")
+    if isinstance(account, dict):
+        pt = account.get("planType")
+        if isinstance(pt, str) and pt.strip():
+            return pt.strip().lower()
+    return None
 _DEFAULT_UPI_JOB_TIMEOUT = 1800.0  # 30 phút — đủ cho 500 retries × 3s + buffer
 _DEFAULT_UPI_APPROVE_RETRIES = 500
 
@@ -3802,6 +3826,15 @@ class UpiJob:
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None
+    # Auth artifacts giữ in-memory để endpoint check-session gọi /api/auth/session
+    # khi user request (sau khi QR hết hạn). KHÔNG serialize ra to_dict() —
+    # tránh leak credentials qua SSE/snapshot. Chỉ tồn tại trong RAM, mất khi
+    # restart server (UpiJob vốn không persist DB).
+    _access_token: str | None = field(default=None, repr=False)
+    _session_cookies: list[dict[str, Any]] | None = field(default=None, repr=False)
+    # Cache kết quả check-session gần nhất để frontend không phải re-fetch khi
+    # user mở lại UI / re-render. None = chưa check bao giờ.
+    plan_check: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -3822,6 +3855,8 @@ class UpiJob:
             "created_at": self.created_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
+            "plan_check": self.plan_check,
+            "can_check_plan": bool(self._session_cookies),
             "duration": (
                 (self.finished_at or time.time()) - self.started_at if self.started_at else None
             ),
@@ -4088,6 +4123,102 @@ class UpiJobManager:
         self._broadcast({"type": "remove", "job_id": job_id})
         return True
 
+    async def check_plan(self, job_id: str) -> dict[str, Any]:
+        """Gọi /api/auth/session bằng cookies đã lưu để biết plan hiện tại.
+
+        Dùng khi QR đã hết hạn — user muốn xác nhận giao dịch UPI có pump
+        account lên Plus chưa. Cookies được lưu vào job._session_cookies sau
+        khi step 1 (login) thành công, KHÔNG persist DB nên mất khi restart
+        server.
+
+        Trả dict với keys:
+            ok: bool
+            plan: str | None     (e.g. "plus", "free", "team")
+            is_plus: bool        (heuristic: plan chứa "plus")
+            expires: str | None  (ISO timestamp từ session.expires)
+            checked_at: int      (unix seconds)
+            error: str | None    (chỉ khi ok=False)
+
+        Không raise — fail-soft, lưu error message trong dict để frontend hiển
+        thị bên cạnh badge HẾT HẠN. Cache vào job.plan_check để các request
+        sau (re-render UI) không gọi lại.
+        """
+        job = self.jobs.get(job_id)
+        if job is None:
+            return {
+                "ok": False,
+                "plan": None,
+                "is_plus": False,
+                "expires": None,
+                "checked_at": int(time.time()),
+                "error": "job không tồn tại",
+            }
+
+        if not job._session_cookies:
+            result = {
+                "ok": False,
+                "plan": None,
+                "is_plus": False,
+                "expires": None,
+                "checked_at": int(time.time()),
+                "error": "không có session cookies (job chưa login thành công hoặc server đã restart)",
+            }
+            job.plan_check = result
+            self._broadcast_job(job)
+            return result
+
+        from ..session_phase import fetch_session_via_http, SessionError
+
+        try:
+            data = await fetch_session_via_http(
+                cookies=job._session_cookies,
+                proxy=None,  # cookies-based auth không kén IP
+                timeout=20.0,
+            )
+        except SessionError as exc:
+            self._job_log(job, f"[check-plan] session fail: {exc}")
+            result = {
+                "ok": False,
+                "plan": None,
+                "is_plus": False,
+                "expires": None,
+                "checked_at": int(time.time()),
+                "error": f"session error: {exc}",
+            }
+            job.plan_check = result
+            self._broadcast_job(job)
+            return result
+        except Exception as exc:  # noqa: BLE001
+            self._job_log(job, f"[check-plan] unexpected: {exc}")
+            result = {
+                "ok": False,
+                "plan": None,
+                "is_plus": False,
+                "expires": None,
+                "checked_at": int(time.time()),
+                "error": f"unexpected: {exc}",
+            }
+            job.plan_check = result
+            self._broadcast_job(job)
+            return result
+
+        plan = _extract_plan_from_session(data)
+        is_plus = bool(plan and "plus" in plan.lower())
+        expires_raw = data.get("expires") if isinstance(data, dict) else None
+        expires_str = expires_raw if isinstance(expires_raw, str) else None
+        result = {
+            "ok": True,
+            "plan": plan,
+            "is_plus": is_plus,
+            "expires": expires_str,
+            "checked_at": int(time.time()),
+            "error": None,
+        }
+        self._job_log(job, f"[check-plan] plan={plan or '?'} is_plus={is_plus}")
+        job.plan_check = result
+        self._broadcast_job(job)
+        return result
+
     async def retry_job(self, job_id: str) -> bool:
         job = self.jobs.get(job_id)
         if job is None:
@@ -4118,6 +4249,11 @@ class UpiJobManager:
         job.page_refresh_attempts = []
         job.started_at = None
         job.finished_at = None
+        # Reset auth artifacts + plan check — cookies/token cũ không còn ý nghĩa
+        # cho run mới (sẽ lấy lại từ login mới).
+        job._access_token = None
+        job._session_cookies = None
+        job.plan_check = None
         retry_line = f"[{datetime.now():%H:%M:%S}] -- retry --"
         job.log_lines.append(retry_line)
         self._broadcast_job(job)
@@ -4207,6 +4343,13 @@ class UpiJobManager:
             job.confirm_attempts = result.confirm_attempts
             job.approve_attempts = result.approve_attempts
             job.page_refresh_attempts = result.page_refresh_attempts
+            # Lưu auth artifacts (chỉ khi login OK — result luôn có khi tới
+            # đây). Ngay cả khi result.ok=False vì approve fail, login đã pass
+            # nên cookies + token vẫn dùng để check plan.
+            job._access_token = result.access_token
+            job._session_cookies = result.session_cookies
+            # Reset plan_check cũ (có thể còn từ retry trước).
+            job.plan_check = None
 
             if result.ok:
                 job.status = "success"

@@ -1709,6 +1709,21 @@ async def retry_upi_job(job_id: str) -> JSONResponse:
     return JSONResponse({"ok": ok})
 
 
+@app.post("/api/upi/jobs/{job_id}/check-session")
+async def check_upi_job_session(job_id: str) -> JSONResponse:
+    """Gọi /api/auth/session bằng cookies đã lưu để biết account còn Plus.
+
+    Frontend gọi khi badge "HẾT HẠN" xuất hiện (QR expired) — kiểm tra giao
+    dịch UPI có pump account lên Plus chưa. Trả luôn `plan_check` dict (không
+    raise) để UI render badge PLUS/FREE bên cạnh.
+    """
+    um = get_upi_manager()
+    if job_id not in um.jobs:
+        raise HTTPException(404, "job not found")
+    plan_check = await um.check_plan(job_id)
+    return JSONResponse(plan_check)
+
+
 @app.delete("/api/upi/jobs/{job_id}")
 async def delete_upi_job(job_id: str) -> JSONResponse:
     um = get_upi_manager()

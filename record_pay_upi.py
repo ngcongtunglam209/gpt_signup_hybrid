@@ -40,6 +40,7 @@ from typing import Any
 from .pay_upi_http import _ProxyPolicy, _create_chatgpt_checkout
 from .random_profile import random_india_profile
 from .session_phase import get_session_pure_request
+from .user_agent_profile import CURL_IMPERSONATE_PRIMARY as _IMPERSONATE
 from .web_recorder import (
     ACTION_INIT_SCRIPT,
     RADIX_FONT_FIX_SCRIPT,
@@ -554,7 +555,7 @@ async def run_hybrid(
         from curl_cffi.requests import AsyncSession
 
         # Session-level proxies=None — dùng per-request proxies kwarg.
-        async with AsyncSession(impersonate="chrome136") as sess:
+        async with AsyncSession(impersonate=_IMPERSONATE) as sess:
             checkout = await _create_chatgpt_checkout(
                 sess, access_token=access_token, log=lambda m: print(f"      {m}", flush=True),
                 proxies=checkout_proxies,

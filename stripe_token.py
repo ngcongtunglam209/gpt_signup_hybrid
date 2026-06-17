@@ -359,9 +359,11 @@ def extract_config_from_paths(
 # ─────────────────────────────────────────────────────────────────────
 
 
-_USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) "
-    "Gecko/20100101 Firefox/135.0"
+from .user_agent_profile import (
+    SEC_CH_UA as _SEC_CH_UA,
+    SEC_CH_UA_MOBILE as _SEC_CH_UA_MOBILE,
+    SEC_CH_UA_PLATFORM as _SEC_CH_UA_PLATFORM,
+    WINDOWS_USER_AGENT as _USER_AGENT,
 )
 _CACHE_ROOT = Path("runtime/cache/stripe_bundles")
 
@@ -399,6 +401,9 @@ async def fetch_bundles_live(
     """
     common_headers = {
         "User-Agent": _USER_AGENT,
+        "sec-ch-ua": _SEC_CH_UA,
+        "sec-ch-ua-mobile": _SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": _SEC_CH_UA_PLATFORM,
         "Accept": "*/*",
         "Accept-Language": "en-IN,en;q=0.9",
     }

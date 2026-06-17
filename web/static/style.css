@@ -3428,6 +3428,30 @@ body {
   color: var(--red, #f87171);
 }
 
+/* Plan badge — hiển thị bên cạnh "HẾT HẠN" sau khi check /api/auth/session.
+ * 3 trạng thái: PLUS (xanh, đậm), FREE (vàng/đỏ nhạt cảnh báo), ? (xám lỗi). */
+.upi-plan-badge {
+  margin-left: 6px;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  letter-spacing: 0.5px;
+}
+.upi-plan-badge.upi-plan-plus {
+  background: rgba(74, 222, 128, 0.18);
+  border-color: var(--green-dim, #4ade80);
+  color: var(--green, #4ade80);
+}
+.upi-plan-badge.upi-plan-free {
+  background: rgba(245, 158, 11, 0.16);
+  border-color: rgba(245, 158, 11, 0.6);
+  color: rgb(252, 184, 56);
+}
+.upi-plan-badge.upi-plan-err {
+  background: rgba(160, 160, 160, 0.12);
+  border-color: rgba(160, 160, 160, 0.5);
+  color: var(--muted, #9ca3af);
+}
+
 .upi-countdown {
   font-family: var(--font-mono);
 }

@@ -7,7 +7,8 @@ Flow:
     3. Nếu không → POST api.stripe.com/v1/payment_pages/{session_id}/init
        → stripe_hosted_url → replace host → return
 
-Dùng curl_cffi AsyncSession impersonate="chrome136" cho TLS fingerprint.
+UA + TLS persona: import từ ``user_agent_profile`` (Windows Chrome 145) — đồng
+bộ với reg + UPI flow để cùng device persona xuyên suốt 1 account.
 """
 from __future__ import annotations
 
@@ -19,6 +20,14 @@ from dataclasses import dataclass
 from urllib.parse import urlparse, urlunparse
 
 from curl_cffi.requests import AsyncSession
+
+from .user_agent_profile import (
+    CURL_IMPERSONATE_PRIMARY as _UA_IMPERSONATE_PRIMARY,
+    SEC_CH_UA as _SEC_CH_UA,
+    SEC_CH_UA_MOBILE as _SEC_CH_UA_MOBILE,
+    SEC_CH_UA_PLATFORM as _SEC_CH_UA_PLATFORM,
+    WINDOWS_USER_AGENT as _WINDOWS_USER_AGENT,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +96,7 @@ class GopayCheckoutContext:
 _CHECKOUT_URL = "https://chatgpt.com/backend-api/payments/checkout"
 _STRIPE_INIT_URL_TPL = "https://api.stripe.com/v1/payment_pages/{session_id}/init"
 _CF_MARKERS = ("cf-chl", "just a moment", "cloudflare")
-_IMPERSONATE = "chrome136"
+_IMPERSONATE = _UA_IMPERSONATE_PRIMARY
 _CHECKOUT_MAX_ATTEMPTS = 3
 _CHECKOUT_RETRY_DELAY_SECONDS = 0.5
 
@@ -712,12 +721,13 @@ async def get_gopay_midtrans_url(
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/x-www-form-urlencoded",
+        "Accept-Language": "en-US,en;q=0.9",
         "Origin": "https://pay.openai.com",
         "Referer": "https://pay.openai.com/",
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": _WINDOWS_USER_AGENT,
+        "sec-ch-ua": _SEC_CH_UA,
+        "sec-ch-ua-mobile": _SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": _SEC_CH_UA_PLATFORM,
     }
 
     proxies = {"http": proxy, "https": proxy} if proxy else None

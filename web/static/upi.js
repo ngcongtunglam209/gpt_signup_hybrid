@@ -70,6 +70,68 @@
     return { text: `${m}:${String(s).padStart(2, '0')}`, expired: false };
   }
 
+  // ── Plan check (sau khi QR hết hạn) ─────────────────────────────────
+  // Khi 1 job success có QR hết hạn → fire 1 lần POST check-session, nhận
+  // {ok, plan, is_plus, expires, error}. Server cache vào job.plan_check để
+  // các lần render sau giữ nguyên badge. Client cũng cache trong
+  // _planCheckInflight để tránh fire trùng lúc countdown vừa cross 0.
+  const _planCheckInflight = new Set();
+
+  function renderPlanBadge(j) {
+    if (!j || j.status !== 'success') return '';
+    const pc = j.plan_check;
+    if (!pc) return '';
+    if (!pc.ok) {
+      const errShort = (pc.error || 'check fail').slice(0, 80);
+      return `<span class="badge upi-plan-badge upi-plan-err"
+        title="${escHtml(errShort)}">PLAN ?</span>`;
+    }
+    const plan = (pc.plan || '').toString();
+    if (pc.is_plus) {
+      return `<span class="badge upi-plan-badge upi-plan-plus"
+        title="account.planType=${escHtml(plan)}">${escHtml(plan.toUpperCase() || 'PLUS')}</span>`;
+    }
+    const label = (plan || 'free').toUpperCase();
+    return `<span class="badge upi-plan-badge upi-plan-free"
+      title="account.planType=${escHtml(plan || 'free')}">${escHtml(label)}</span>`;
+  }
+
+  // Trigger check-session khi QR vừa expired lần đầu. Idempotent: server cache
+  // job.plan_check, client cache _planCheckInflight. Re-render sẽ pick state mới.
+  function triggerPlanCheck(jobId) {
+    if (!jobId) return;
+    if (_planCheckInflight.has(jobId)) return;
+    const j = state.jobs.get(jobId);
+    if (!j || j.status !== 'success') return;
+    if (j.plan_check) return;  // đã có kết quả từ server (cache hoặc render trước)
+    _planCheckInflight.add(jobId);
+    api(`/api/upi/jobs/${encodeURIComponent(jobId)}/check-session`, {
+      method: 'POST',
+    }).then((data) => {
+      // Apply trực tiếp lên job state để render ngay; server cũng broadcast
+      // job update qua SSE (plan_check field) — bên SSE handler sẽ overwrite.
+      const cur = state.jobs.get(jobId);
+      if (cur) {
+        cur.plan_check = data;
+        renderJobs();
+      }
+    }).catch((err) => {
+      console.warn('[upi] check-session failed:', err);
+      // Đặt fake plan_check để hiện badge "PLAN ?" + tooltip lỗi.
+      const cur = state.jobs.get(jobId);
+      if (cur) {
+        cur.plan_check = {
+          ok: false, plan: null, is_plus: false, expires: null,
+          checked_at: Math.floor(Date.now() / 1000),
+          error: err && err.message ? err.message : 'request failed',
+        };
+        renderJobs();
+      }
+    }).finally(() => {
+      _planCheckInflight.delete(jobId);
+    });
+  }
+
   // Định dạng thời điểm hết hạn theo timezone (VN / IN).
   function fmtExpiryAt(expiresAt, tz) {
     if (!expiresAt) return '-';
@@ -208,6 +270,7 @@
       const countdownBadge = (j.status === 'success' && j.qr_expires_at)
         ? `<span class="badge upi-countdown-badge" data-exp="${escHtml(String(j.qr_expires_at))}" title="QR hết hạn sau"></span>`
         : '';
+      const planBadge = renderPlanBadge(j);
       const errBadge = (j.status === 'error' && j.error)
         ? `<span class="upi-err-inline" title="${escHtml(j.error)}">${escHtml(j.error.slice(0, 60))}</span>`
         : '';
@@ -221,6 +284,7 @@
               <span class="job-email-text">${escHtml(j.email)}</span>
               ${amountBadge}
               ${countdownBadge}
+              ${planBadge}
               ${errBadge}
             </div>
           </div>
@@ -304,6 +368,13 @@
       const cd = fmtCountdown(exp);
       el.textContent = cd.text;
       el.classList.toggle('upi-countdown-expired', cd.expired);
+      // Vừa cross 0 → fire check-session (1 lần per job, server cache).
+      if (cd.expired) {
+        const row = el.closest('[data-id]');
+        if (row && row.dataset.id) {
+          triggerPlanCheck(row.dataset.id);
+        }
+      }
     });
     _tickModalCountdown();
   }

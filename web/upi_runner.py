@@ -7,8 +7,9 @@ account. Logic giống probe nhưng:
     - Hardcoded các knob theo yêu cầu UI:
         promo=True, proxy_from_step=3, do_confirm=True, do_approve=True,
         approve_delay=3.0, approve_proxy_batch=3,
-        approve_backend_exception_consecutive=5  (LIÊN TIẾP, reset khi gặp
-            non-exception result — tránh dừng sớm vì server flaky),
+        approve_backend_exception_consecutive=0  (DISABLED — 0 nghĩa là không
+            bao giờ fatal-break vì backend_exception flaky; loop chỉ dừng
+            khi approved hoặc hết approve_retries),
         confirm_variants=("qr_code", "empty", "flow_qr", "intent")
     - Configurable: approve_retries (caller truyền vào).
 
@@ -30,6 +31,8 @@ from pathlib import Path
 from time import monotonic
 from typing import Any, Callable
 
+from ..user_agent_profile import CURL_IMPERSONATE_PRIMARY as _IMPERSONATE
+
 # Hardcoded knobs — fix cứng theo spec UI (không expose ra Settings).
 PROMO: bool = True
 PROXY_FROM_STEP: int = 3
@@ -37,12 +40,15 @@ DO_CONFIRM: bool = True
 DO_APPROVE: bool = True
 APPROVE_DELAY: float = 3.0
 APPROVE_PROXY_BATCH: int = 3
-# Số lần `result=exception http=200` LIÊN TIẾP để dừng. Reset về 0 khi gặp
-# bất kỳ result khác (approved/blocked/unknown/error_type/...). Server đôi khi
-# flaky trả exception 1-2 lần rồi tự khỏi — đếm tổng (như cũ) sẽ làm job dừng
-# sớm dù user cấu hình approve_retries cao.
-# Set 0 để disable hoàn toàn (chỉ dừng khi approved hoặc hết retry).
-APPROVE_BACKEND_EXCEPTION_CONSECUTIVE: int = 15
+# Số lần `result=exception http=200` LIÊN TIẾP để fatal-break approve loop.
+# Default = 0 → DISABLED: backend_exception KHÔNG bao giờ làm dừng sớm; loop
+# chỉ dừng khi `approved=True` hoặc hết `approve_retries` user cấu hình.
+# Lý do: Stripe approve có thể trả exception flaky cả trăm lần liên tiếp rồi
+# tự khỏi — checkout đã pass (có cs_live_...), không có lý do gì hủy session
+# vì server-side hiccup. Logic advance proxy ở dưới vẫn hoạt động độc lập với
+# threshold này, nên vẫn skip qua proxy đang bị Stripe throttle bình thường.
+# Đặt > 0 chỉ khi cần kill switch chống loop vô tận trong môi trường test.
+APPROVE_BACKEND_EXCEPTION_CONSECUTIVE: int = 0
 CONFIRM_VARIANTS: tuple[str, ...] = ("qr_code", "empty", "flow_qr", "intent")
 
 LogFn = Callable[[str], None]
@@ -75,6 +81,10 @@ class UpiQrResult:
     error: str | None = None
     backend_exception_count: int = 0
     elapsed_seconds: float = 0.0
+    # Auth artifacts để re-check session sau khi QR hết hạn (in-memory, KHÔNG
+    # đưa vào to_dict() — caller giữ riêng, không leak ra JSON SSE/snapshot).
+    access_token: str | None = field(default=None, repr=False)
+    session_cookies: list[dict[str, Any]] | None = field(default=None, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -473,6 +483,11 @@ async def _create_chatgpt_checkout(
     proxies: dict[str, str] | None,
 ) -> dict[str, Any]:
     from ..pay_upi_http import _CHATGPT_CHECKOUT_URL, _USER_AGENT, PayUpiError
+    from ..user_agent_profile import (
+        SEC_CH_UA as _SEC_CH_UA,
+        SEC_CH_UA_MOBILE as _SEC_CH_UA_MOBILE,
+        SEC_CH_UA_PLATFORM as _SEC_CH_UA_PLATFORM,
+    )
 
     body: dict[str, Any] = {
         "entry_point": "all_plans_pricing_modal",
@@ -493,6 +508,9 @@ async def _create_chatgpt_checkout(
         "Origin": "https://chatgpt.com",
         "Referer": referer,
         "User-Agent": _USER_AGENT,
+        "sec-ch-ua": _SEC_CH_UA,
+        "sec-ch-ua-mobile": _SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": _SEC_CH_UA_PLATFORM,
         "x-openai-target-path": "/backend-api/payments/checkout",
         "x-openai-target-route": "/backend-api/payments/checkout",
         "OAI-Language": "en-IN",
@@ -523,6 +541,11 @@ async def _stripe_elements_session(
     from ..pay_upi_http import (
         _STRIPE_ELEMENTS_URL, _STRIPE_VERSION, _USER_AGENT, PayUpiError,
     )
+    from ..user_agent_profile import (
+        SEC_CH_UA as _SEC_CH_UA,
+        SEC_CH_UA_MOBILE as _SEC_CH_UA_MOBILE,
+        SEC_CH_UA_PLATFORM as _SEC_CH_UA_PLATFORM,
+    )
 
     params = {
         "client_betas[0]": "custom_checkout_server_updates_1",
@@ -549,6 +572,9 @@ async def _stripe_elements_session(
         "Origin": "https://js.stripe.com",
         "Referer": "https://js.stripe.com/",
         "User-Agent": _USER_AGENT,
+        "sec-ch-ua": _SEC_CH_UA,
+        "sec-ch-ua-mobile": _SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": _SEC_CH_UA_PLATFORM,
         "Accept-Language": "en-IN,en;q=0.9",
     }
     resp = await sess.get(
@@ -581,6 +607,11 @@ async def _stripe_confirm_upi_qr(
     from ..pay_upi_http import (
         _STRIPE_CONFIRM_URL, _STRIPE_VERSION, _USER_AGENT,
         _stripe_guid, _to_form,
+    )
+    from ..user_agent_profile import (
+        SEC_CH_UA as _SEC_CH_UA,
+        SEC_CH_UA_MOBILE as _SEC_CH_UA_MOBILE,
+        SEC_CH_UA_PLATFORM as _SEC_CH_UA_PLATFORM,
     )
 
     elements_session_id = elements_data.get("session_id")
@@ -677,6 +708,9 @@ async def _stripe_confirm_upi_qr(
         "Origin": "https://js.stripe.com",
         "Referer": "https://js.stripe.com/",
         "User-Agent": _USER_AGENT,
+        "sec-ch-ua": _SEC_CH_UA,
+        "sec-ch-ua-mobile": _SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": _SEC_CH_UA_PLATFORM,
         "Accept-Language": "en-IN,en;q=0.9",
     }
     resp = await sess.post(
@@ -710,6 +744,11 @@ async def _stripe_payment_page_refresh(
     from ..pay_upi_http import (
         _STRIPE_PAGE_URL, _STRIPE_VERSION, _USER_AGENT, _to_form,
     )
+    from ..user_agent_profile import (
+        SEC_CH_UA as _SEC_CH_UA,
+        SEC_CH_UA_MOBILE as _SEC_CH_UA_MOBILE,
+        SEC_CH_UA_PLATFORM as _SEC_CH_UA_PLATFORM,
+    )
 
     params = _to_form({
         "elements_session_client": {
@@ -734,6 +773,9 @@ async def _stripe_payment_page_refresh(
         "Origin": "https://js.stripe.com",
         "Referer": "https://js.stripe.com/",
         "User-Agent": _USER_AGENT,
+        "sec-ch-ua": _SEC_CH_UA,
+        "sec-ch-ua-mobile": _SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": _SEC_CH_UA_PLATFORM,
         "Accept-Language": "en-IN,en;q=0.9",
     }
     resp = await sess.get(
@@ -863,6 +905,11 @@ async def _chatgpt_approve_checkout(
     proxies: dict[str, str] | None,
 ) -> dict[str, Any]:
     from ..pay_upi_http import _CHATGPT_APPROVE_URL, _USER_AGENT
+    from ..user_agent_profile import (
+        SEC_CH_UA as _SEC_CH_UA,
+        SEC_CH_UA_MOBILE as _SEC_CH_UA_MOBILE,
+        SEC_CH_UA_PLATFORM as _SEC_CH_UA_PLATFORM,
+    )
 
     body = {"checkout_session_id": session_id, "processor_entity": "openai_llc"}
     headers = {
@@ -873,6 +920,9 @@ async def _chatgpt_approve_checkout(
         "Origin": "https://chatgpt.com",
         "Referer": f"https://chatgpt.com/checkout/openai_llc/{session_id}",
         "User-Agent": _USER_AGENT,
+        "sec-ch-ua": _SEC_CH_UA,
+        "sec-ch-ua-mobile": _SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": _SEC_CH_UA_PLATFORM,
         "x-openai-target-path": "/backend-api/payments/checkout/approve",
         "x-openai-target-route": "/backend-api/payments/checkout/approve",
         "OAI-Language": "en-IN",
@@ -950,7 +1000,8 @@ async def run_upi_qr_probe(
         ("approve_retries", approve_retries),
         ("delay", f"{APPROVE_DELAY:g}s"),
         ("batch", APPROVE_PROXY_BATCH),
-        ("be_consec", APPROVE_BACKEND_EXCEPTION_CONSECUTIVE),
+        ("be_consec", APPROVE_BACKEND_EXCEPTION_CONSECUTIVE
+                      if APPROVE_BACKEND_EXCEPTION_CONSECUTIVE > 0 else "off"),
         ("variants", ",".join(CONFIRM_VARIANTS)),
     )))
 
@@ -1056,7 +1107,7 @@ async def run_upi_qr_probe(
     upi_uri: str | None = None
     qr_expires_at: int | None = None
 
-    async with AsyncSession(impersonate="chrome136") as sess:
+    async with AsyncSession(impersonate=_IMPERSONATE) as sess:
         # Step 2 — checkout creation (DIRECT - chatgpt API).
         checkout = await _create_chatgpt_checkout(
             sess, access_token=access_token, log=_silent,
@@ -1385,6 +1436,17 @@ async def run_upi_qr_probe(
         backend_exception_count=backend_exception_count,
         error=error_msg,
         elapsed_seconds=elapsed,
+        # Lưu auth artifacts để caller (UpiJobManager) re-check session sau
+        # khi QR hết hạn. Cookies được get_session_pure_request inject vào
+        # session_data["__cookies"] (httpOnly cookie chatgpt.com). access_token
+        # giữ luôn cho future use (chưa cần ngay vì /api/auth/session dùng
+        # cookies, không Bearer).
+        access_token=access_token,
+        session_cookies=(
+            session_data.get("__cookies")
+            if isinstance(session_data, dict)
+            else None
+        ),
     )
 
 
