@@ -381,10 +381,64 @@
   // qua poller check_plan.
   // Error pane (đỏ): job status='error' && KHÔNG phải Plus (tránh double-count
   // case timeout-but-plus → đã hiển thị ở Output rồi).
-  // secretsCache: fetch riêng qua /api/upi/jobs/secrets (job.to_dict() KHÔNG
-  // expose password/secret để tránh leak qua SSE snapshot).
+  //
+  // 2 nguồn lookup secret theo thứ tự ưu tiên:
+  //   1. _pastedSecretsByEmail — parse trực tiếp từ textarea lúc user click
+  //      Run; có NGAY, không phụ thuộc network. Persist qua localStorage để
+  //      sống qua reload.
+  //   2. secretsCache — fetch async từ /api/upi/jobs/secrets (fallback khi
+  //      input bị clear hoặc reload mất localStorage).
+  // Ưu tiên (1) vì đảm bảo render đúng ngay lần đầu, KHÔNG phụ thuộc race
+  // condition fetch debounce 150ms.
   const secretsCache = new Map();
+  // Map<emailLower, {password, secret}> — pre-populated từ paste input.
+  const _pastedSecretsByEmail = new Map();
   let _secretsRefreshScheduled = false;
+
+  // localStorage key — persist pasted secrets qua reload (lifecycle ngắn,
+  // đến khi user clear input hoặc clear localStorage).
+  const LS_PASTED_SECRETS = 'gpt_reg.upi.pasted_secrets';
+
+  function _persistPastedSecrets() {
+    try {
+      const obj = {};
+      for (const [k, v] of _pastedSecretsByEmail.entries()) obj[k] = v;
+      localStorage.setItem(LS_PASTED_SECRETS, JSON.stringify(obj));
+    } catch (_) { /* quota — ignore */ }
+  }
+
+  function _loadPastedSecrets() {
+    try {
+      const raw = localStorage.getItem(LS_PASTED_SECRETS);
+      if (!raw) return;
+      const obj = JSON.parse(raw);
+      if (obj && typeof obj === 'object') {
+        for (const [k, v] of Object.entries(obj)) _pastedSecretsByEmail.set(k, v);
+      }
+    } catch (_) { /* corrupt — ignore */ }
+  }
+
+  // Parse input textarea, populate _pastedSecretsByEmail. Gọi NGAY khi user
+  // click Run (trước khi POST add_jobs) để cache có data trước khi SSE job
+  // event đầu tiên về. KHÔNG validate format ở đây — backend đã validate.
+  function _capturePastedSecrets(rawText) {
+    const lines = rawText.split('\n');
+    let added = 0;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const parts = trimmed.split('|').map((p) => p.trim());
+      if (parts.length < 2 || !parts[0].includes('@')) continue;
+      const email = parts[0].toLowerCase();
+      _pastedSecretsByEmail.set(email, {
+        password: parts[1] || '',
+        secret: parts[2] || '',
+      });
+      added += 1;
+    }
+    if (added > 0) _persistPastedSecrets();
+    return added;
+  }
 
   function scheduleSecretsRefresh() {
     if (_secretsRefreshScheduled) return;
@@ -411,6 +465,22 @@
     });
   }
 
+  function _resolveSecretsFor(j) {
+    // Lookup password+secret cho 1 job, ưu tiên pasted map (chắc chắn có
+    // ngay khi user click Run) → fallback secretsCache (fetch async).
+    const id = j.id;
+    const emailLow = (j.email || '').toLowerCase();
+    const pasted = _pastedSecretsByEmail.get(emailLow);
+    if (pasted && pasted.password) {
+      return { password: pasted.password, secret: pasted.secret || '' };
+    }
+    const cached = secretsCache.get(id);
+    if (cached && cached.password) {
+      return { password: cached.password, secret: cached.secret || '' };
+    }
+    return { password: '', secret: '' };
+  }
+
   function renderOutputs() {
     const successLines = [];
     const errorLines = [];
@@ -419,15 +489,19 @@
       if (!j) continue;
       const isPlus = !!(j.plan_check && j.plan_check.is_plus);
       if (isPlus) {
-        const sec = secretsCache.get(id) || {};
-        const password = sec.password || j.password || '';
-        const secret = sec.secret || '';
+        const { password, secret } = _resolveSecretsFor(j);
         // Format `email|password|secret_2fa` đồng nhất với Reg + format input
         // UPI. Nếu thiếu secret (acc không 2FA) → bỏ field thay vì để pipe trống
         // → giữ output paste-back được.
-        successLines.push(secret
-          ? `${j.email}|${password}|${secret}`
-          : `${j.email}|${password}`);
+        if (password) {
+          successLines.push(secret
+            ? `${j.email}|${password}|${secret}`
+            : `${j.email}|${password}`);
+        } else {
+          // Cả pasted map lẫn secretsCache đều không có → render placeholder
+          // để user thấy đang loading thay vì line trống `email|`.
+          successLines.push(`${j.email}  (đang tải secrets...)`);
+        }
       } else if (j.status === 'error' && j.error) {
         errorLines.push(`${j.email}  →  ${j.error || 'unknown'}`);
       }
@@ -763,6 +837,10 @@
   dom.btnRun.addEventListener('click', async () => {
     const combos = dom.comboInput.value.trim();
     if (!combos) { await Dialog.alert({ message: 'Paste accounts first.' }); return; }
+    // Pre-populate _pastedSecretsByEmail TRƯỚC khi POST add_jobs — đảm bảo
+    // khi SSE job event đầu tiên về, renderOutputs có ngay password/secret
+    // không phải đợi /api/upi/jobs/secrets fetch debounce 150ms.
+    _capturePastedSecrets(combos);
     dom.btnRun.disabled = true;
     try {
       const _modeMap = {
@@ -1026,6 +1104,11 @@
   });
 
   // ── Init ──────────────────────────────────────────────────────────
+  // Restore pasted secrets từ localStorage TRƯỚC khi load snapshot từ
+  // server — đảm bảo nếu user reload page mà server vẫn giữ jobs cached
+  // Plus, output render đúng email|password|secret từ ratchet local.
+  _loadPastedSecrets();
+
   const _saved = localStorage.getItem(LS_INPUT_UPI);
   if (_saved) dom.comboInput.value = _saved;
   updateComboCount();
