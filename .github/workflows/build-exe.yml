@@ -30,7 +30,9 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-          cache: 'pip'
+          # KHÔNG cache pip — cache cũ có thể hit từ commit trước (lúc đó
+          # requirements.txt có pyobjc-* fail trên Win) → fresh install mỗi
+          # run an toàn hơn (chậm thêm ~30-60s nhưng không silent skip).
 
       - name: Install deps + Playwright Chromium
         run: |
@@ -39,36 +41,48 @@ jobs:
           Write-Host "=== Python info ==="
           python --version
           Write-Host "Python path: $((Get-Command python).Source)"
+          python -m pip --version
           Write-Host ""
 
-          Write-Host "=== Upgrade pip ==="
+          Write-Host "=== Upgrade pip (qua python -m pip để tránh PATH ambiguous) ==="
           python -m pip install --upgrade pip
           if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed (exit $LASTEXITCODE)" }
           Write-Host ""
 
           Write-Host "=== Install requirements-build.txt ==="
           # KHÔNG dùng requirements.txt vì có pyobjc-* (Mac-only).
-          pip install --no-cache-dir -r requirements-build.txt
+          # python -m pip thay vì 'pip' → đảm bảo cùng interpreter với
+          # 'python -m playwright' phía dưới.
+          python -m pip install --no-cache-dir -r requirements-build.txt
           if ($LASTEXITCODE -ne 0) { throw "pip install requirements-build.txt failed (exit $LASTEXITCODE)" }
           Write-Host ""
 
           Write-Host "=== Install PyInstaller ==="
-          pip install --no-cache-dir pyinstaller==6.10.0
+          python -m pip install --no-cache-dir pyinstaller==6.10.0
           if ($LASTEXITCODE -ne 0) { throw "pip install pyinstaller failed (exit $LASTEXITCODE)" }
           Write-Host ""
 
-          Write-Host "=== Final pip list (filter relevant) ==="
-          pip list | Select-String -Pattern "playwright|curl-cffi|fastapi|uvicorn|pyinstaller|qrcode|pyotp" -CaseSensitive:$false
+          Write-Host "=== Force-reinstall playwright (defensive — ensure module có) ==="
+          python -m pip install --no-cache-dir --force-reinstall playwright==1.49.1
+          if ($LASTEXITCODE -ne 0) { throw "force-reinstall playwright failed (exit $LASTEXITCODE)" }
+          Write-Host ""
+
+          Write-Host "=== pip show playwright (verify metadata) ==="
+          python -m pip show playwright
+          if ($LASTEXITCODE -ne 0) { throw "pip show playwright failed — module không cài được" }
+          Write-Host ""
+
+          Write-Host "=== pip list filter relevant ==="
+          python -m pip list | Select-String -Pattern "playwright|curl-cffi|fastapi|uvicorn|pyinstaller|qrcode|pyotp" -CaseSensitive:$false
           Write-Host ""
 
           Write-Host "=== Verify imports ==="
           python -c "import playwright; print('playwright', playwright.__version__)"
-          if ($LASTEXITCODE -ne 0) { throw "import playwright FAILED — pip install bỏ sót package" }
-          python -c "import fastapi, uvicorn, curl_cffi, PyInstaller; print('fastapi/uvicorn/curl_cffi/PyInstaller OK')"
+          if ($LASTEXITCODE -ne 0) { throw "import playwright FAILED" }
+          python -c "import fastapi, uvicorn, curl_cffi, PyInstaller; print('core OK')"
           if ($LASTEXITCODE -ne 0) { throw "import core deps FAILED" }
           Write-Host ""
 
-          # Bundle Chromium toggle (đã cài playwright module ở trên).
           if ('${{ inputs.bundle_chromium }}' -eq 'true') {
             Write-Host "=== playwright install chromium ==="
             python -m playwright install chromium
