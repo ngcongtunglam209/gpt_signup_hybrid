@@ -32,30 +32,52 @@ jobs:
           python-version: '3.13'
           cache: 'pip'
 
-      - name: Install Python deps
+      - name: Install deps + Playwright Chromium
         run: |
           $ErrorActionPreference = 'Stop'
+
+          Write-Host "=== Python info ==="
+          python --version
+          Write-Host "Python path: $((Get-Command python).Source)"
+          Write-Host ""
+
+          Write-Host "=== Upgrade pip ==="
           python -m pip install --upgrade pip
-          if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed" }
-          pip install -r requirements-build.txt
-          if ($LASTEXITCODE -ne 0) { throw "pip install requirements-build.txt failed" }
-          pip install pyinstaller==6.10.0
-          if ($LASTEXITCODE -ne 0) { throw "pip install pyinstaller failed" }
-        shell: pwsh
+          if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed (exit $LASTEXITCODE)" }
+          Write-Host ""
 
-      - name: Verify deps installed
-        run: |
-          $ErrorActionPreference = 'Stop'
-          python -c "import playwright; import fastapi; import uvicorn; import curl_cffi; import PyInstaller; print('all OK')"
-          if ($LASTEXITCODE -ne 0) { throw "deps verify failed" }
-        shell: pwsh
+          Write-Host "=== Install requirements-build.txt ==="
+          # KHÔNG dùng requirements.txt vì có pyobjc-* (Mac-only).
+          pip install --no-cache-dir -r requirements-build.txt
+          if ($LASTEXITCODE -ne 0) { throw "pip install requirements-build.txt failed (exit $LASTEXITCODE)" }
+          Write-Host ""
 
-      - name: Install Playwright Chromium
-        if: ${{ inputs.bundle_chromium }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          python -m playwright install chromium
-          if ($LASTEXITCODE -ne 0) { throw "playwright install chromium failed" }
+          Write-Host "=== Install PyInstaller ==="
+          pip install --no-cache-dir pyinstaller==6.10.0
+          if ($LASTEXITCODE -ne 0) { throw "pip install pyinstaller failed (exit $LASTEXITCODE)" }
+          Write-Host ""
+
+          Write-Host "=== Final pip list (filter relevant) ==="
+          pip list | Select-String -Pattern "playwright|curl-cffi|fastapi|uvicorn|pyinstaller|qrcode|pyotp" -CaseSensitive:$false
+          Write-Host ""
+
+          Write-Host "=== Verify imports ==="
+          python -c "import playwright; print('playwright', playwright.__version__)"
+          if ($LASTEXITCODE -ne 0) { throw "import playwright FAILED — pip install bỏ sót package" }
+          python -c "import fastapi, uvicorn, curl_cffi, PyInstaller; print('fastapi/uvicorn/curl_cffi/PyInstaller OK')"
+          if ($LASTEXITCODE -ne 0) { throw "import core deps FAILED" }
+          Write-Host ""
+
+          # Bundle Chromium toggle (đã cài playwright module ở trên).
+          if ('${{ inputs.bundle_chromium }}' -eq 'true') {
+            Write-Host "=== playwright install chromium ==="
+            python -m playwright install chromium
+            if ($LASTEXITCODE -ne 0) { throw "playwright install chromium failed (exit $LASTEXITCODE)" }
+            Write-Host "Chromium installed at: $env:LOCALAPPDATA\ms-playwright"
+            Get-ChildItem "$env:LOCALAPPDATA\ms-playwright" -Directory | Select-Object Name
+          } else {
+            Write-Host "=== Skip Chromium download (bundle_chromium=false) ==="
+          }
         shell: pwsh
 
       - name: Build EXE
