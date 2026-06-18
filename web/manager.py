@@ -4473,6 +4473,22 @@ class UpiJobManager:
         self._job_queue.put_nowait(job_id)
         return True
 
+    async def retry_failed(self) -> int:
+        """Retry tất cả UPI jobs có status error hoặc cancelled.
+
+        Return số job đã retry thành công.
+        """
+        retried = 0
+        targets = [
+            jid for jid, job in self.jobs.items()
+            if job.status in ("error", "cancelled")
+        ]
+        for jid in targets:
+            ok = await self.retry_job(jid)
+            if ok:
+                retried += 1
+        return retried
+
     # ── Telegram notify ─────────────────────────────────────────────────
     async def _notify_telegram(self, job: UpiJob) -> None:
         """Gửi QR + combo qua Telegram (best-effort). Không raise ra ngoài.

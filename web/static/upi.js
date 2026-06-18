@@ -31,6 +31,7 @@
     errorPane:     $('upi-error-pane'),
     btnCopyError:  $('upi-btn-copy-error'),
     btnClearDone:  $('upi-btn-clear-done'),
+    btnRetryFailed:$('upi-btn-retry-failed'),
     // Modal
     modal:         $('upi-qr-modal'),
     modalImg:      $('upi-qr-modal-img'),
@@ -524,6 +525,41 @@
     }).catch((err) => Dialog.alert({ message: 'Open fail: ' + err.message }).catch(() => {}));
   });
 
+  // ── Highlight dòng input tương ứng với job đang chọn ──────────────
+  // Format combo UPI: email|password|secret — match phần email (lower).
+  function highlightInputLine(jobId) {
+    const j = state.jobs.get(jobId);
+    if (!j || !j.email) return;
+    const text = dom.comboInput.value;
+    if (!text) return;
+    const lines = text.split('\n');
+    const target = j.email.trim().toLowerCase();
+    let offset = 0;
+    let foundIndex = -1;
+    let start = 0;
+    let end = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const email = line.trim().split('|')[0].trim().toLowerCase();
+      if (email === target) {
+        foundIndex = i;
+        start = offset;
+        end = offset + line.length;
+        break;
+      }
+      offset += line.length + 1; // +1 cho '\n'
+    }
+    if (foundIndex === -1) return;
+    dom.comboInput.focus();
+    dom.comboInput.setSelectionRange(start, end);
+    // Scroll dòng được chọn vào giữa khung textarea
+    const cs = getComputedStyle(dom.comboInput);
+    const lineHeight = parseFloat(cs.lineHeight) || 16;
+    const padTop = parseFloat(cs.paddingTop) || 0;
+    const targetTop = padTop + foundIndex * lineHeight;
+    dom.comboInput.scrollTop = Math.max(0, targetTop - dom.comboInput.clientHeight / 2);
+  }
+
   // ── Job list actions ──────────────────────────────────────────────
   dom.jobList.addEventListener('click', (e) => {
     const actionBtn = e.target.closest('[data-action]');
@@ -552,6 +588,7 @@
       state.activeJobId = row.dataset.id;
       renderJobs();
       renderLog(state.activeJobId);
+      highlightInputLine(state.activeJobId);
     }
   });
 
@@ -603,6 +640,16 @@
   dom.btnClearDone.addEventListener('click', async () => {
     try { await api('/api/upi/jobs/clear-finished', { method: 'POST' }); }
     catch (err) { await Dialog.alert({ message: err.message }); }
+  });
+
+  dom.btnRetryFailed.addEventListener('click', async () => {
+    if (!(await Dialog.confirm({ message: 'Retry tất cả jobs error & cancelled?' }))) return;
+    try {
+      const res = await api('/api/upi/jobs/retry-failed', { method: 'POST' });
+      console.log('[upi] retry-failed:', res.retried);
+    } catch (err) {
+      await Dialog.alert({ message: 'Error: ' + err.message });
+    }
   });
 
   dom.approveRetries.addEventListener('change', async () => {

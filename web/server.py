@@ -1768,6 +1768,14 @@ async def clear_finished_upi_jobs() -> JSONResponse:
     return JSONResponse({"removed": removed})
 
 
+@app.post("/api/upi/jobs/retry-failed")
+async def retry_failed_upi_jobs() -> JSONResponse:
+    """Retry tất cả UPI jobs có status error hoặc cancelled."""
+    um = get_upi_manager()
+    retried = await um.retry_failed()
+    return JSONResponse({"retried": retried})
+
+
 @app.get("/api/upi/config")
 async def get_upi_config() -> JSONResponse:
     um = get_upi_manager()
