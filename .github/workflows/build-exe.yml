@@ -1,0 +1,114 @@
+name: Build Windows EXE + Installer
+
+# Manual trigger — không tự build mỗi push để không tốn CI minutes.
+# Vào Actions tab → "Build Windows EXE + Installer" → Run workflow → set
+# `hours_valid` rồi click Run. Sau ~10-15 phút artifact sẵn sàng download.
+on:
+  workflow_dispatch:
+    inputs:
+      hours_valid:
+        description: 'Số giờ valid kể từ lúc build xong (default 24)'
+        required: false
+        default: '24'
+        type: string
+      bundle_chromium:
+        description: 'Bundle Chromium vào exe (off = exe nhỏ hơn nhưng cần internet lần đầu)'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller==6.10.0
+        shell: pwsh
+
+      - name: Install Playwright Chromium
+        if: ${{ inputs.bundle_chromium }}
+        run: |
+          python -m playwright install chromium
+        shell: pwsh
+
+      - name: Build EXE
+        run: |
+          $extra = @()
+          if (-not [System.Convert]::ToBoolean('${{ inputs.bundle_chromium }}')) {
+            $extra += '--no-bundle-chromium'
+          }
+          python scripts/build_exe.py --hours ${{ inputs.hours_valid }} @extra
+        shell: pwsh
+
+      - name: Verify EXE
+        run: |
+          if (-not (Test-Path "dist/GSH.exe")) {
+            Write-Error "GSH.exe not found"; exit 1
+          }
+          $size = (Get-Item "dist/GSH.exe").Length / 1MB
+          Write-Host ("EXE size: {0:F1} MB" -f $size)
+        shell: pwsh
+
+      - name: Install Inno Setup
+        run: |
+          choco install innosetup --no-progress -y
+        shell: pwsh
+
+      - name: Build Installer
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" scripts\installer.iss
+          if (-not (Test-Path "dist/GSH-Setup.exe")) {
+            Write-Error "GSH-Setup.exe not found"; exit 1
+          }
+          $size = (Get-Item "dist/GSH-Setup.exe").Length / 1MB
+          Write-Host ("Installer size: {0:F1} MB" -f $size)
+        shell: pwsh
+
+      - name: Upload Installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GSH-Setup-${{ github.sha }}
+          path: dist/GSH-Setup.exe
+          retention-days: 14
+
+      - name: Upload Raw EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GSH-EXE-${{ github.sha }}
+          path: dist/GSH.exe
+          retention-days: 7
+
+      - name: Build Summary
+        run: |
+          $exeSize = (Get-Item "dist/GSH.exe").Length / 1MB
+          $setupSize = (Get-Item "dist/GSH-Setup.exe").Length / 1MB
+          $hours = '${{ inputs.hours_valid }}'
+          $now = [DateTimeOffset]::Now.ToUnixTimeSeconds()
+          $expire = $now + ([int]$hours * 3600)
+          $expireDt = [DateTimeOffset]::FromUnixTimeSeconds($expire).ToString("yyyy-MM-dd HH:mm:ss UTC")
+          @"
+          ## Build Summary
+
+          | Item | Value |
+          |------|-------|
+          | EXE size | $($exeSize.ToString('F1')) MB |
+          | Installer size | $($setupSize.ToString('F1')) MB |
+          | Valid hours | $hours |
+          | Expires at | $expireDt |
+          | Bundle Chromium | ${{ inputs.bundle_chromium }} |
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+        shell: pwsh

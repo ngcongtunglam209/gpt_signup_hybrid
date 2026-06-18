@@ -96,3 +96,8 @@ plans
 test/accounts_cleaned.txt
 test/check_clean_credentials.py
 rust_upi_bot/target
+
+# PyInstaller build artifacts
+_expire_const.py
+playwright-browsers/
+*.spec.bak
