@@ -77,7 +77,10 @@ jobs:
           Write-Host ""
 
           Write-Host "=== Verify imports ==="
-          python -c "import playwright; print('playwright', playwright.__version__)"
+          # KHÔNG dùng playwright.__version__ (không tồn tại — playwright là
+          # namespace package). Dùng importlib.metadata + import sub-module
+          # thật để chạm site-packages thực tế.
+          python -c "import playwright; from playwright.async_api import async_playwright; from importlib.metadata import version; print('playwright', version('playwright'), '— async_api OK')"
           if ($LASTEXITCODE -ne 0) { throw "import playwright FAILED" }
           python -c "import fastapi, uvicorn, curl_cffi, PyInstaller; print('core OK')"
           if ($LASTEXITCODE -ne 0) { throw "import core deps FAILED" }
