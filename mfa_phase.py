@@ -189,6 +189,54 @@ async def _enroll_totp(
     return data, access_token
 
 
+async def _enroll_totp_with_retry(
+    session: AsyncSession,
+    *,
+    access_token: str,
+    cookies: list[dict[str, Any]] | None,
+    log,
+    max_attempts: int = 3,
+) -> tuple[dict[str, Any], str]:
+    """Wrap ``_enroll_totp`` với outer retry — toàn bộ enroll fail → retry lại.
+
+    Phân biệt 2 loại lỗi:
+      - **Conflict** (server đã có active factor) → KHÔNG retry, propagate ngay
+        để caller dùng pending_enrollment / Get Session flow.
+      - **Lỗi khác** (HTTP 4xx ngoài conflict, 5xx, network, timeout) → retry tới
+        ``max_attempts`` lần với backoff giữa các lần.
+
+    Khác với ``_post_with_retry`` (chỉ retry 5xx + transient ở mức HTTP), wrapper
+    này retry ở mức **logical operation** — bao gồm cả refresh-token, response
+    parse, secret-validation. Mỗi attempt là một enroll hoàn chỉnh độc lập.
+    """
+    last_exc: MfaError | None = None
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            log(f"[mfa] enroll retry {attempt}/{max_attempts}")
+        try:
+            return await _enroll_totp(
+                session, access_token=access_token, cookies=cookies, log=log,
+            )
+        except MfaError as exc:
+            msg = str(exc).lower()
+            # Conflict: server đã có active factor → fail-fast, không retry
+            if any(m in msg for m in _ENROLL_CONFLICT_MARKERS):
+                raise
+            last_exc = exc
+            log(f"[mfa] enroll attempt {attempt}/{max_attempts} failed: {exc}")
+            if attempt < max_attempts:
+                backoff = _BACKOFF_SECONDS[
+                    min(attempt - 1, len(_BACKOFF_SECONDS) - 1)
+                ]
+                log(f"[mfa] enroll retry trong {backoff:.0f}s...")
+                await asyncio.sleep(backoff)
+
+    # Hết số lần retry — propagate lỗi cuối cùng
+    raise MfaError(
+        f"enroll failed sau {max_attempts} lần retry: {last_exc}"
+    ) from last_exc
+
+
 def _is_activate_idempotent_response(status_code: int, body_text: str) -> bool:
     """True nếu activate response cho biết factor đã ở trạng thái active.
 
@@ -368,8 +416,9 @@ async def enable_2fa(
             )
         else:
             try:
-                enroll, active_token = await _enroll_totp(
+                enroll, active_token = await _enroll_totp_with_retry(
                     session, access_token=access_token, cookies=cookies, log=log,
+                    max_attempts=3,
                 )
             except MfaError as exc:
                 # Detect enroll conflict — server đã có active factor.

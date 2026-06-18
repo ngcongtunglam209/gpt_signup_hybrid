@@ -718,63 +718,111 @@ def _run_request_phase_sync(
             log(f"[request] sentinel worker init failed, dùng one-shot: {_e}")
             worker = None
 
-        # Step 1-3: Bootstrap with TLS fingerprint rotation on handshake failure.
-        # Pass login_hint=email so authorize routes to the correct account context.
-        session, device_id, auth_url = _bootstrap_with_tls_rotation(
-            request.proxy, log, login_hint=request.email,
-        )
-
+        # Step 1-5: Bootstrap + Register, có retry cho HTTP 409 invalid_state.
+        #
+        # Khi server trả 409 ``invalid_state`` ("Your sign-in session is no
+        # longer valid"), state machine OAuth đã desync (CSRF/auth_url/sentinel
+        # cũ không còn hợp lệ). Cách fix duy nhất là RE-BOOTSTRAP toàn bộ:
+        # session mới, CSRF mới, device_id mới, sentinel mới — KHÔNG được tái
+        # dùng artifact cũ. Retry tối đa 3 lần để tránh loop vô tận khi server
+        # đang gặp vấn đề thực sự.
+        max_register_attempts = 3
+        session = None
+        device_id = ""
         password = request.password or _default_password(request.email)
-
-        # Step 4: GET /create-account/password page to establish server signup state.
-        # HAR confirms browser does NOT call authorize/continue before user/register.
-        # Instead it relies on the authorize URL (with login_hint) + this page visit
-        # to set the state machine into "create account" mode.
-        try:
-            session.get(
-                "https://auth.openai.com/create-account/password",
-                headers=_common_headers("https://auth.openai.com/create-account"),
-                timeout=15,
-            )
-        except Exception:
-            pass
-
-        # Step 5: Sentinel (flow=username_password_create) + user/register
-        sentinel = _get_sentinel_token(
-            session, device_id, "username_password_create", log, worker=worker,
-        )
-
-        log("[request] [4/8] Registering account (password)...")
-        reg_headers = _common_headers("https://auth.openai.com/create-account/password")
-        reg_headers["Content-Type"] = "application/json"
-        if sentinel:
-            reg_headers["openai-sentinel-token"] = sentinel
-        if device_id:
-            reg_headers["oai-device-id"] = device_id
-
-        resp = session.post(
-            "https://auth.openai.com/api/accounts/user/register",
-            headers=reg_headers,
-            json={"password": password, "username": request.email},
-            timeout=30,
-        )
         reg_continue = ""
         reg_page_type = ""
-        if resp.status_code == 200:
-            reg_data = resp.json() if resp is not None else {}
-            reg_continue = (reg_data.get("continue_url") or "").strip()
-            reg_page_type = ((reg_data.get("page") or {}).get("type") or "").strip()
-            log(f"[request] Register OK → page_type={reg_page_type!r} continue_url={reg_continue[:80]!r}")
-            # LƯU Ý: page_type=email_otp_verification sau user/register LÀ HỢP LỆ cho
-            # account MỚI (server yêu cầu verify email vừa nhập). KHÔNG được coi là
-            # "đã tồn tại". Signal duy nhất cho email đã đăng ký là HTTP 400 invalid_auth_step.
-        elif resp.status_code == 400 and "invalid_auth_step" in (resp.text or ""):
-            raise RequestPhaseError(
-                f"email {request.email} đã được đăng ký (invalid_auth_step) "
-                f"— cần email mới để reg"
+
+        for register_attempt in range(1, max_register_attempts + 1):
+            # Đóng session cũ trước khi re-bootstrap (nếu có)
+            if session is not None:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+                session = None
+
+            if register_attempt > 1:
+                log(
+                    f"[request] Re-bootstrap mới "
+                    f"(lần {register_attempt}/{max_register_attempts}) "
+                    f"sau HTTP 409 invalid_state"
+                )
+
+            # Step 1-3: Bootstrap with TLS fingerprint rotation on handshake failure.
+            # Pass login_hint=email so authorize routes to the correct account context.
+            session, device_id, _auth_url = _bootstrap_with_tls_rotation(
+                request.proxy, log, login_hint=request.email,
             )
-        else:
+
+            # Step 4: GET /create-account/password page to establish server signup state.
+            # HAR confirms browser does NOT call authorize/continue before user/register.
+            # Instead it relies on the authorize URL (with login_hint) + this page visit
+            # to set the state machine into "create account" mode.
+            try:
+                session.get(
+                    "https://auth.openai.com/create-account/password",
+                    headers=_common_headers("https://auth.openai.com/create-account"),
+                    timeout=15,
+                )
+            except Exception:
+                pass
+
+            # Step 5: Sentinel (flow=username_password_create) + user/register
+            sentinel = _get_sentinel_token(
+                session, device_id, "username_password_create", log, worker=worker,
+            )
+
+            log("[request] [4/8] Registering account (password)...")
+            reg_headers = _common_headers("https://auth.openai.com/create-account/password")
+            reg_headers["Content-Type"] = "application/json"
+            if sentinel:
+                reg_headers["openai-sentinel-token"] = sentinel
+            if device_id:
+                reg_headers["oai-device-id"] = device_id
+
+            resp = session.post(
+                "https://auth.openai.com/api/accounts/user/register",
+                headers=reg_headers,
+                json={"password": password, "username": request.email},
+                timeout=30,
+            )
+
+            if resp.status_code == 200:
+                reg_data = resp.json() if resp is not None else {}
+                reg_continue = (reg_data.get("continue_url") or "").strip()
+                reg_page_type = ((reg_data.get("page") or {}).get("type") or "").strip()
+                log(f"[request] Register OK → page_type={reg_page_type!r} continue_url={reg_continue[:80]!r}")
+                # LƯU Ý: page_type=email_otp_verification sau user/register LÀ HỢP LỆ cho
+                # account MỚI (server yêu cầu verify email vừa nhập). KHÔNG được coi là
+                # "đã tồn tại". Signal duy nhất cho email đã đăng ký là HTTP 400 invalid_auth_step.
+                break  # success → exit retry loop
+
+            # 400 invalid_auth_step = email đã đăng ký rồi → fail-fast, KHÔNG retry
+            if resp.status_code == 400 and "invalid_auth_step" in (resp.text or ""):
+                raise RequestPhaseError(
+                    f"email {request.email} đã được đăng ký (invalid_auth_step) "
+                    f"— cần email mới để reg"
+                )
+
             body = (resp.text or "")[:300]
+
+            # 409 invalid_state = state machine desync → re-bootstrap fresh và retry
+            if resp.status_code == 409 and "invalid_state" in body:
+                log(
+                    f"[request] user/register HTTP 409 invalid_state "
+                    f"(lần {register_attempt}/{max_register_attempts}): {body[:200]}"
+                )
+                if register_attempt >= max_register_attempts:
+                    raise RequestPhaseError(
+                        f"user/register failed sau {max_register_attempts} lần retry "
+                        f"với HTTP 409 invalid_state - {body}"
+                    )
+                # backoff ngắn để server clear state cũ trước khi bootstrap lại
+                time.sleep(1.5)
+                continue
+
+            # Lỗi khác (5xx, 401, 422...) → fail-fast, không retry mù quáng
             raise RequestPhaseError(f"user/register failed: HTTP {resp.status_code} - {body}")
 
         # Step 6: Send OTP
@@ -878,6 +926,9 @@ def _run_request_phase_sync(
                 )
 
             # Wrong code → resend OTP (email mới) + poll code mới (loại code đã thử).
+            # Mirror logic của browser_phase: poll mini-timeout từng vòng, sleep giữa
+            # các poll khi worker trả lại code cũ, đếm stale_poll_count → resend lại
+            # sau N lần code cũ liên tiếp, dùng poll_all_codes catch mail delay.
             log(f"[request] OTP sai (lần {v_attempt}/{max_verify_attempts}) → resend + chờ code mới")
             retry_started_at = datetime.now(timezone.utc)
             try:
@@ -889,24 +940,100 @@ def _run_request_phase_sync(
             _retry_loop = _asyncio.new_event_loop()
             try:
                 new_code = ""
-                # Poll tới khi nhận code MỚI chưa từng thử (tránh nhận lại code fail).
+                pending_candidates: list[str] = []
+                stale_poll_count = 0
+                stale_poll_resend_threshold = 5  # 5 lần code cũ liên tiếp → resend lại
+                inner_resend_count = 0
+                inner_max_resends = 2  # tối đa resend thêm 2 lần trong vòng retry này
+                resend_after_seconds = 30.0  # mini-timeout per poll call
+                poll_interval = max(5.0, request.otp_poll_interval_seconds)
+
                 _poll_deadline = time.monotonic() + request.otp_timeout_seconds
                 while time.monotonic() < _poll_deadline:
-                    candidate = _retry_loop.run_until_complete(
-                        mail_provider.poll_otp(
-                            recipient=request.source_email or request.email,
-                            started_at=retry_started_at,
-                            timeout_seconds=max(1.0, _poll_deadline - time.monotonic()),
-                            poll_interval_seconds=request.otp_poll_interval_seconds,
-                            log=log,
+                    # Pop pending trước nếu có (sau khi nhận code mới fetch_all)
+                    while pending_candidates:
+                        c = pending_candidates.pop(0)
+                        if c not in tried_codes:
+                            new_code = c
+                            break
+                    if new_code:
+                        break
+
+                    remaining = _poll_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    mini_timeout = min(resend_after_seconds, remaining)
+
+                    try:
+                        candidate = _retry_loop.run_until_complete(
+                            mail_provider.poll_otp(
+                                recipient=request.source_email or request.email,
+                                started_at=retry_started_at,
+                                timeout_seconds=mini_timeout,
+                                poll_interval_seconds=poll_interval,
+                                log=log,
+                            )
                         )
-                    )
+                    except TimeoutError:
+                        candidate = ""
+
                     if candidate and candidate not in tried_codes:
-                        new_code = candidate
+                        # Nhận code mới → fetch all để catch mail delay (worker iCloud
+                        # có thể có nhiều mail OTP cùng lúc, nên thử lần lượt).
+                        time.sleep(2.0)
+                        all_codes: list[str] = []
+                        if hasattr(mail_provider, "poll_all_codes"):
+                            try:
+                                all_codes = _retry_loop.run_until_complete(
+                                    mail_provider.poll_all_codes(
+                                        recipient=request.source_email or request.email,
+                                        started_at=retry_started_at,
+                                        log=log,
+                                    )
+                                )
+                            except Exception:
+                                all_codes = []
+                        fresh = [c for c in all_codes if c not in tried_codes]
+                        if not fresh:
+                            fresh = [candidate]
+                        elif candidate not in fresh:
+                            fresh.insert(0, candidate)
+                        if len(fresh) > 1:
+                            log(f"[request] nhận {len(fresh)} OTP codes mới: {', '.join(fresh)}")
+                        new_code = fresh.pop(0)
+                        pending_candidates = fresh
                         break
-                    if not candidate:
-                        break
-                    log(f"[request] poll trả lại code đã thử ({candidate}) → chờ tiếp")
+
+                    if candidate and candidate in tried_codes:
+                        stale_poll_count += 1
+                        if (
+                            stale_poll_count >= stale_poll_resend_threshold
+                            and inner_resend_count < inner_max_resends
+                        ):
+                            inner_resend_count += 1
+                            stale_poll_count = 0
+                            log(
+                                f"[request] poll {stale_poll_resend_threshold} lần chỉ "
+                                f"code cũ → resend lại ({inner_resend_count}/{inner_max_resends})"
+                            )
+                            try:
+                                if not _step_resend_otp(session, device_id, log):
+                                    _step_send_otp(session, device_id, log)
+                            except Exception as exc:
+                                log(f"[request] resend lại lỗi: {exc}")
+                            retry_started_at = datetime.now(timezone.utc)
+                            time.sleep(2.0)
+                        else:
+                            log(
+                                f"[request] poll trả lại code đã thử ({candidate}) → "
+                                f"chờ tiếp ({stale_poll_count}/{stale_poll_resend_threshold})"
+                            )
+                            time.sleep(poll_interval)
+                        continue
+
+                    # candidate rỗng = mini-timeout hết mà không có mail nào → loop tiếp
+                    # (vẫn còn deadline). Sleep ngắn để tránh spam khi worker trả rỗng.
+                    time.sleep(poll_interval)
             finally:
                 _retry_loop.close()
 
