@@ -28,6 +28,16 @@ import sys
 import time
 from pathlib import Path
 
+# Force UTF-8 stdout/stderr trên Windows — default cp1252 không encode được
+# unicode chars (vd '->', '*', emoji). Phòng trường hợp print log có
+# unicode (lib khác có thể inject) → crash console writer.
+if sys.platform.startswith("win"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 — stdio reconfigure best-effort
+        pass
+
 DEFAULT_HOURS = 24  # Default valid window khi không truyền --hours / --expires-at
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -58,7 +68,7 @@ def _bundle_playwright_browsers() -> bool:
     if sys.platform.startswith("win"):
         local_appdata = os.environ.get("LOCALAPPDATA")
         if not local_appdata:
-            print("[build] LOCALAPPDATA missing — skip Chromium bundle", flush=True)
+            print("[build] LOCALAPPDATA missing -- skip Chromium bundle", flush=True)
             return False
         src_root = Path(local_appdata) / "ms-playwright"
     else:
@@ -68,8 +78,8 @@ def _bundle_playwright_browsers() -> bool:
             src_root = Path.home() / "Library" / "Caches" / "ms-playwright"
 
     if not src_root.is_dir():
-        print(f"[build] Chromium source not found at {src_root} — "
-              f"chạy `playwright install chromium` trước", flush=True)
+        print(f"[build] Chromium source not found at {src_root} -- "
+              f"chay `playwright install chromium` truoc", flush=True)
         return False
 
     # Tìm chromium-* và ffmpeg-* (Playwright cần ffmpeg cho video record).
@@ -167,7 +177,7 @@ def main() -> int:
     if expires_at <= build_time:
         print(
             f"[build] FAIL: expires_at ({expires_at}) <= build_time "
-            f"({build_time}) — exe sẽ expired ngay khi tạo.",
+            f"({build_time}) -- exe se expired ngay khi tao.",
             file=sys.stderr,
         )
         return 1
@@ -200,7 +210,9 @@ def main() -> int:
 
     if out_exe.is_file():
         size_mb = out_exe.stat().st_size / 1_048_576
-        print(f"[build] OK → {out_exe} ({size_mb:.1f} MB)", flush=True)
+        # ASCII '->' thay vì '→' — Windows console default cp1252 không
+        # encode được U+2192 → crash UnicodeEncodeError.
+        print(f"[build] OK -> {out_exe} ({size_mb:.1f} MB)", flush=True)
 
     return 0
 
