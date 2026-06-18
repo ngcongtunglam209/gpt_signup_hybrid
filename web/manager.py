@@ -526,6 +526,10 @@ class JobManager:
         self._auto_retry: bool = False
         self._auto_retry_max: int = 3
         self._auto_retry_delay: float = 15.0
+        # Toggle áp dụng proxy pool cho job (per-Reg). False = job chạy direct
+        # (no proxy) — bỏ qua acquire ở _begin_job_proxy / rerun / 2FA branch.
+        # Default True để giữ behavior cũ.
+        self._use_proxy: bool = True
         # Stagger: tránh nhiều browser khởi tạo cùng 1 lúc → random 5-10s giữa các start
         self._stagger_lock = asyncio.Lock()
         self._last_start_ts: float = 0.0
@@ -653,12 +657,13 @@ class JobManager:
         ``_active_proxy`` = concrete URL (replay cùng IP); ``_active_proxy_line`` =
         raw line (mark_dead key, F-J). Knob load 1 lần/job → cache ``_proxy_knobs``
         (F-H). acquire_live_proxy tự log live/rotate/dead qua ``log``.
+
+        Toggle ``self._use_proxy`` = False → skip acquire, set transient fields
+        = None để runner build session direct (no proxy).
         """
         knobs = getattr(job, "_proxy_knobs", None) or _current_proxy_knobs()
         job._proxy_knobs = knobs  # type: ignore[attr-defined]
-        url, line = await _resolve_job_proxy(log, knobs=knobs)
-        job._active_proxy = url  # type: ignore[attr-defined]
-        job._active_proxy_line = line  # type: ignore[attr-defined]
+        url, _line = await self._resolve_proxy_for_job(job, log)
         return url
 
     def _note_proxy_failure(self, job: "Job", exc_or_msg) -> None:
@@ -714,6 +719,40 @@ class JobManager:
         if delay is not None:
             self._auto_retry_delay = max(5.0, min(delay, 120.0))
 
+    @property
+    def use_proxy(self) -> bool:
+        return self._use_proxy
+
+    def set_use_proxy(self, value: bool) -> None:
+        """Bật/tắt áp dụng proxy pool cho job mới. Job đang chạy KHÔNG bị ảnh
+        hưởng (đã acquire proxy lúc start). Ảnh hưởng job mới + retry attempt."""
+        self._use_proxy = bool(value)
+
+    async def _resolve_proxy_for_job(
+        self, job: "Job", log
+    ) -> tuple[str | None, str | None]:
+        """Wrapper gate `_use_proxy` trước khi acquire proxy.
+
+        Tắt proxy → return (None, None), set transient fields = None để
+        runner build session direct (không proxy). Bật proxy → delegate
+        ``_resolve_job_proxy`` (probe/round_robin/random như cũ).
+
+        Set ``job._active_proxy`` (URL) + ``job._active_proxy_line`` (raw —
+        mark_dead key) ở cả 2 nhánh để `_note_proxy_failure` hoạt động đúng.
+        """
+        if not self._use_proxy:
+            job._active_proxy = None  # type: ignore[attr-defined]
+            job._active_proxy_line = None  # type: ignore[attr-defined]
+            if log:
+                log("[proxy] disabled — chạy direct (no proxy)")
+            return None, None
+        url, line = await _resolve_job_proxy(
+            log, knobs=getattr(job, "_proxy_knobs", None)
+        )
+        job._active_proxy = url  # type: ignore[attr-defined]
+        job._active_proxy_line = line  # type: ignore[attr-defined]
+        return url, line
+
     def apply_settings(self, settings: dict) -> None:
         """Hydrate fields from settings dict (startup boot). Only set if key present."""
         if "reg.headless" in settings:
@@ -730,6 +769,8 @@ class JobManager:
             # clamp xuống thay vì bỏ qua, giữ behavior nhất quán với set_config.
             if val >= 1:
                 self._max = max(1, min(val, 2))
+        if "reg.use_proxy" in settings:
+            self._use_proxy = bool(settings["reg.use_proxy"])
         _hydrate_proxy_pool_from_settings(settings)
         if "reg.post_reg_get_session" in settings:
             self._post_reg_get_session = bool(settings["reg.post_reg_get_session"])
@@ -1232,13 +1273,10 @@ class JobManager:
         last_err: Exception | None = None
         # Acquire proxy live 1 lần TRƯỚC loop (F-H/F-M): reuse cho cả 2 attempt,
         # KHÔNG re-acquire mỗi attempt (tránh 2×max_tries probe). Set transient fields
-        # để _note_proxy_failure mark_dead đúng raw line.
-        rerun_url, rerun_line = await _resolve_job_proxy(
-            lambda m: self._job_log(job, m),
-            knobs=getattr(job, "_proxy_knobs", None),
+        # để _note_proxy_failure mark_dead đúng raw line. Helper gate `use_proxy`.
+        rerun_url, rerun_line = await self._resolve_proxy_for_job(
+            job, lambda m: self._job_log(job, m),
         )
-        job._active_proxy = rerun_url  # type: ignore[attr-defined]
-        job._active_proxy_line = rerun_line  # type: ignore[attr-defined]
         # 2 attempts × 30s timeout × 1.5s sleep
         for attempt in range(1, 3):
             try:
@@ -1475,12 +1513,9 @@ class JobManager:
                 self._session_repo, email=job.email, log=log,
             )
             # Branch B resumable: KHÔNG chạy _begin_job_proxy → acquire 1 lần ở đây
-            # (giữ proxy invariant trên resume, F-T). Set transient fields cho mark_dead.
-            twofa_url, twofa_line = await _resolve_job_proxy(
-                log, knobs=getattr(job, "_proxy_knobs", None),
-            )
-            job._active_proxy = twofa_url  # type: ignore[attr-defined]
-            job._active_proxy_line = twofa_line  # type: ignore[attr-defined]
+            # (giữ proxy invariant trên resume, F-T). Helper gate `use_proxy` +
+            # set transient fields cho mark_dead.
+            twofa_url, _twofa_line = await self._resolve_proxy_for_job(job, log)
             try:
                 mfa_result = await enable_2fa(
                     access_token=access_token,

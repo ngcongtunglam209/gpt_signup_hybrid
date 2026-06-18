@@ -122,6 +122,7 @@ async def on_startup():
         "auto_retry": manager.auto_retry,
         "auto_retry_max": manager.auto_retry_max,
         "auto_retry_delay": manager.auto_retry_delay,
+        "use_proxy": manager.use_proxy,
         "jobs": manager.list_jobs(),
     }])
 
@@ -272,6 +273,10 @@ class SetConfigRequest(BaseModel):
     auto_retry: bool | None = None
     auto_retry_max: int | None = Field(default=None, ge=1, le=10)
     auto_retry_delay: float | None = Field(default=None, ge=5, le=120)
+    use_proxy: bool | None = Field(
+        default=None,
+        description="Bật/tắt áp dụng proxy pool cho Reg jobs. False = chạy direct.",
+    )
 
 
 @app.get("/api/jobs")
@@ -437,6 +442,7 @@ async def get_config() -> JSONResponse:
         "auto_retry": manager.auto_retry,
         "auto_retry_max": manager.auto_retry_max,
         "auto_retry_delay": manager.auto_retry_delay,
+        "use_proxy": manager.use_proxy,
     })
 
 
@@ -501,6 +507,8 @@ async def set_config(payload: SetConfigRequest) -> JSONResponse:
             max_retries=payload.auto_retry_max,
             delay=payload.auto_retry_delay,
         )
+    if payload.use_proxy is not None:
+        manager.set_use_proxy(payload.use_proxy)
 
     # ── Write-through to Settings_Store (R6.1, R6.2, R6.7) ──
     from db.repositories import RepositoryError
@@ -526,6 +534,8 @@ async def set_config(payload: SetConfigRequest) -> JSONResponse:
         settings_dict["reg.auto_retry_max"] = payload.auto_retry_max
     if payload.auto_retry_delay is not None:
         settings_dict["reg.auto_retry_delay"] = int(payload.auto_retry_delay)
+    if payload.use_proxy is not None:
+        settings_dict["reg.use_proxy"] = payload.use_proxy
 
     response_body = {
         "max_concurrent": manager.max_concurrent,
@@ -538,6 +548,7 @@ async def set_config(payload: SetConfigRequest) -> JSONResponse:
         "auto_retry": manager.auto_retry,
         "auto_retry_max": manager.auto_retry_max,
         "auto_retry_delay": manager.auto_retry_delay,
+        "use_proxy": manager.use_proxy,
     }
 
     if settings_dict:

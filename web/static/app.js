@@ -135,6 +135,7 @@
     mode: 'multi',
     headless: true,
     debug: false,
+    useProxy: true,
     mailModes: [],            // [{id, label, input_placeholder, input_help, config_schema}]
     currentMailMode: 'outlook',
   };
@@ -162,6 +163,7 @@
     modeSelect: $('mode'),
     headlessToggle: $('headless-toggle'),
     debugToggle: $('debug-toggle'),
+    proxyToggle: $('proxy-toggle'),
     inputHint: $('input-hint'),
     mailModeSelect: $('mail-mode-select'),
     regModeSelect: $('reg-mode-select'),
@@ -653,6 +655,20 @@
     }
   });
 
+  dom.proxyToggle.addEventListener('change', async () => {
+    const useProxy = dom.proxyToggle.checked;
+    try {
+      await api('/api/config', {
+        method: 'POST',
+        body: JSON.stringify({ use_proxy: useProxy }),
+      });
+      state.useProxy = useProxy;
+    } catch (err) {
+      console.error(err);
+      dom.proxyToggle.checked = state.useProxy;
+    }
+  });
+
   dom.jobTimeout.addEventListener('change', async () => {
     const val = parseInt(dom.jobTimeout.value, 10);
     if (isNaN(val) || val < 30 || val > 600) return;
@@ -758,6 +774,10 @@
       if (typeof data.debug === 'boolean') {
         state.debug = data.debug;
         dom.debugToggle.checked = data.debug;
+      }
+      if (typeof data.use_proxy === 'boolean') {
+        state.useProxy = data.use_proxy;
+        dom.proxyToggle.checked = data.use_proxy;
       }
       if (data.job_timeout) {
         dom.jobTimeout.value = data.job_timeout;
@@ -958,6 +978,10 @@
     if (typeof debug === 'boolean') state.debug = debug;
     dom.debugToggle.checked = state.debug;
 
+    const useProxy = Settings.get('reg.use_proxy');
+    if (typeof useProxy === 'boolean') state.useProxy = useProxy;
+    dom.proxyToggle.checked = state.useProxy;
+
     const defaultPassword = Settings.get('reg.default_password');
     if (defaultPassword) dom.defaultPassword.value = defaultPassword;
 
@@ -981,6 +1005,10 @@
       if (typeof cfg.debug === 'boolean') {
         state.debug = cfg.debug;
         dom.debugToggle.checked = cfg.debug;
+      }
+      if (typeof cfg.use_proxy === 'boolean') {
+        state.useProxy = cfg.use_proxy;
+        dom.proxyToggle.checked = cfg.use_proxy;
       }
       if (typeof cfg.job_timeout === 'number') {
         dom.jobTimeout.value = cfg.job_timeout;

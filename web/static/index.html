@@ -80,6 +80,11 @@
           <span class="input-label">Default password</span>
           <input type="text" id="default-password" placeholder="Leave blank for random" autocomplete="off" spellcheck="false" />
         </label>
+        <label class="toggle-wrap" title="Bật/tắt áp dụng proxy pool cho Reg jobs. Tắt = chạy direct (no proxy).">
+          <input type="checkbox" id="proxy-toggle" checked />
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="toggle-label">Proxy</span>
+        </label>
         <label class="input-group config-field-short">
           <span class="input-label">Timeout (s/job)</span>
           <input type="number" id="job-timeout" value="240" min="30" max="600" step="10" />
