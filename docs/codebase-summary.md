@@ -40,7 +40,9 @@ Generated: 2026-06-17 | Version: 2.0.0
 | **upi_runner.py** | 1124 | Async UPI QR probe (login → checkout → confirm → QR render) |
 | **icloud_routes.py** | 1257 | /api/icloud/* routes, AutoReg runner, HmeRunner delegation |
 | **mail_modes.py** | 319 | Mail provider registry (map mode name → constructor) |
-| **proxy_pool.py** | 170 | Proxy round-robin/random, mark-dead tracking |
+| **proxy_pool.py** | 170 | Proxy round-robin/random, mark-dead tracking, atomic pick/mark-dead |
+| **proxy_format.py** | 105 | {SID} placeholder parsing, materialize_proxy(), mask_proxy() for logging |
+| **proxy_health.py** | 265 | probe_proxy() L4 test, acquire_live_proxy() rotate loop, asyncio.Semaphore bound |
 | **runner_config_store.py** | 254 | Runtime settings store + validation |
 | **auth.py** | 115 | Bearer token verification (header/query/cookie/meta-tag) |
 | **sse_mux.py** | 105 | SSE multi-channel fan-out + snapshot |
@@ -113,6 +115,11 @@ Generated: 2026-06-17 | Version: 2.0.0
 │   ├─ SSE mux (sse_mux.py)
 │   └─ Static UI (static/*.js, index.html)
 │
+├─ Proxy Layer (all login flows)
+│   ├─ proxy_format.py (materialize_proxy: {SID} → concrete URL)
+│   ├─ proxy_health.py (acquire_live_proxy: probe-rotate loop)
+│   └─ [Used by: Get Session, Get Link, Reg flows; mode=probe in pool config]
+│
 ├─ Signup Entry (signup.py → run_signup)
 │   ├─ Phase 1: browser_phase.py or request_phase.py
 │   │   ├─ mail_providers.py (OTP polling)
@@ -122,6 +129,7 @@ Generated: 2026-06-17 | Version: 2.0.0
 │   └─ Phase 3: mfa_phase.py (TOTP enroll)
 │
 ├─ Session Entry (session_phase.py → get_session)
+│   ├─ [Routed via proxy_health.acquire_live_proxy if pool active]
 │   ├─ browser_phase.login_browser() or request_phase.get_session_pure_request()
 │   └─ [Camoufox + Playwright] / [curl_cffi]
 │
@@ -130,6 +138,7 @@ Generated: 2026-06-17 | Version: 2.0.0
 │   ├─ stripe_token.py → extract_config_live()
 │   ├─ pay_upi_http.py → _stripe_init / _stripe_confirm_upi
 │   └─ upi_runner.py → run_upi_qr_probe() (manager.py integration)
+│      └─ [Routed via proxy_health.acquire_live_proxy if pool active]
 │
 ├─ iCloud HME (icloud_hme/runner.py → HmeRunner)
 │   ├─ generator.py (HmeGenerator.generate)

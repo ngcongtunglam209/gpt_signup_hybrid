@@ -567,6 +567,7 @@
             <select id="proxy-pool-mode" class="hme-select-sm">
               <option value="round_robin">Round-robin</option>
               <option value="random">Random</option>
+              <option value="probe">Probe (health-check)</option>
             </select>
           </label>
           <span id="proxy-pool-summary" class="badge badge-muted" title="Tổng / live / dead">0 proxy</span>
@@ -575,7 +576,12 @@
 
       <div class="settings-section-body">
         <p class="settings-hint muted">
-          Mỗi dòng 1 proxy: <code>http://user:pass@host:port</code>. Khi chạy, tool xoay vòng (round-robin) hoặc chọn ngẫu nhiên (random) để tránh trùng IP. Proxy lỗi network sẽ tự bị loại khỏi vòng xoay. Để trống = chạy direct (không proxy).
+          Mỗi dòng 1 proxy, hỗ trợ 3 dạng:
+          <code>host:port:user:pass</code> ·
+          <code>host:port:user-SID{SID}:pass</code> (SID xoay IP) ·
+          <code>http://user:pass@host:port</code> (URL cũ vẫn nhận).
+          Token <code>{SID}</code> (hoặc <code>{sid}</code> — không phân biệt hoa/thường) sinh ngẫu nhiên mỗi lần dùng; mọi vị trí <code>{SID}</code> trong 1 dòng dùng <strong>cùng 1 token</strong>.
+          Tool xoay vòng (round-robin/random) để tránh trùng IP; proxy lỗi auth/host tự bị loại. Để trống = chạy direct.
         </p>
 
         <!-- Repeater rows -->

@@ -283,35 +283,73 @@ Combo Pool Status:
 ### Add Proxies via Web UI
 
 1. Go to **Settings** → **Proxy & Combos**
-2. Paste proxy URLs (1 per line):
+2. Paste proxy lines (1 per line):
    ```
    http://user:pass@proxy1.com:8080
    https://user:pass@proxy2.com:8080
-   socks5://proxy3.com:1080
+   host:port:user:pass
+   host:port:user-{SID}:pass
    ```
 3. Click **Add Proxies**
 4. Test: Click **Test Proxies** button
 
 ### Proxy Format
 
+**Standard URLs (backward-compatible):**
 ```
 [http|https|socks5]://[user:pass@]host:port
 ```
 
+**Simple line format (NEW):**
+```
+host:port
+host:port:user:pass
+host:port:user-{SID}:pass
+```
+
+The `{SID}` placeholder (case-insensitive: `{SID}` or `{sid}`) gets replaced with a random 8-character session ID on each use, enabling unlimited sticky sessions from a single proxy template.
+
 **Examples:**
 ```
-http://10.0.0.1:8080
+10.0.0.1:8080
+proxy.example.com:3128:user:pass
+proxy.example.com:3128:user-{SID}:mypass
 http://user:pass@proxy.example.com:3128
-https://proxy.example.com:8080
-socks5://proxy.example.com:1080
+https://user-{sid}:pass@proxy.example.com:8080
 ```
+
+### Proxy Configuration (7 Knobs)
+
+All proxy settings accessible via **Settings** tab (persist to SQLite, survives restart):
+
+| Setting | Default | Range | Notes |
+|---------|---------|-------|-------|
+| `proxy.probe_endpoint` | `https://api64.ipify.org` | HTTP(S) URL | L4 connectivity test endpoint |
+| `proxy.probe_timeout` | 6 sec | 3-15 | Timeout per probe attempt |
+| `proxy.max_tries` | 5 | 1-20 | Max SID rotations before direct fallback |
+| `proxy.sid_len` | 8 | 4-32 | Length of generated session ID |
+| `proxy.sid_retry_per_line` | 2 | 0-10 | Retries per proxy line (IP-level fail) |
+| `proxy.probe_concurrency` | 4 | 1-10 | Async semaphore bound (requires restart) |
+
+**Environment variables (.env):**
+```env
+PROXY_PROBE_ENDPOINT=https://api64.ipify.org
+PROXY_PROBE_TIMEOUT=6
+PROXY_MAX_TRIES=5
+PROXY_SID_LEN=8
+PROXY_SID_RETRY_PER_LINE=2
+PROXY_PROBE_CONCURRENCY=4
+```
+
+Priority: Settings store (UI) > `.env` > defaults.
 
 ### Proxy Pool Behavior
 
-- **Round-robin** (default): cycle through proxies sequentially
-- **Random:** pick random proxy per job
-- **Auto-mark dead:** fails 3× → skip for next 30 min
-- **Transparent retry:** job retries with next proxy on network error
+- **Health-check:** all 4 login flows (UPI, Session, Link, Reg) probe each proxy before use
+- **SID rotation:** if IP-level fail (timeout/conn-reset), rotate {SID} placeholder, retry same line
+- **Mark dead:** auth fail (407) or host-unresolved → skip entire raw line for session
+- **Fallback:** when pool empty or exhausted `max_tries` → DIRECT (no proxy)
+- **Concurrency:** up to `probe_concurrency` jobs probe in parallel (prevents thundering-herd)
 
 ---
 

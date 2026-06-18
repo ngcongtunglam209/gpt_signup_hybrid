@@ -565,11 +565,17 @@ async def _probe_one_proxy(proxy: str | None) -> dict[str, Any]:
     """
     import time as _time
     import httpx as _httpx
+    from .proxy_format import materialize_proxy
 
     timeout = _httpx.Timeout(connect=10.0, read=15.0, write=10.0, pool=10.0)
     client_kwargs: dict[str, Any] = {"timeout": timeout, "follow_redirects": False}
     if proxy:
-        client_kwargs["proxy"] = proxy
+        # Pool lưu raw line/template → materialize concrete URL cho httpx (F-D).
+        # `proxy` (raw line) giữ nguyên làm pool key cho mark_dead/mark_alive.
+        try:
+            client_kwargs["proxy"] = materialize_proxy(proxy)
+        except ValueError:
+            return {"proxy": proxy, "ok": False, "public_ip": None, "detail": "bad format"}
 
     public_ip: str | None = None
     ok = False
@@ -619,7 +625,13 @@ async def _probe_one_proxy(proxy: str | None) -> dict[str, Any]:
     if not ok:
         detail = last_err or "unreachable"
 
-    return {"proxy": proxy, "ok": ok, "public_ip": public_ip, "detail": detail}
+    # `detail`/`{exc!r}` có thể nhúng URL materialized (creds/SID) → sanitize trước
+    # khi trả UI (F-E). `proxy` giữ raw line (UI match theo string + đã ở textarea).
+    from .proxy_format import sanitize_proxy_text
+    return {
+        "proxy": proxy, "ok": ok, "public_ip": public_ip,
+        "detail": sanitize_proxy_text(detail),
+    }
 
 
 class SaveProxyPoolRequest(BaseModel):
@@ -629,7 +641,7 @@ class SaveProxyPoolRequest(BaseModel):
     )
     rotation_mode: str = Field(
         default="round_robin",
-        description="round_robin | random",
+        description="round_robin | random | probe",
     )
 
 
@@ -662,7 +674,7 @@ async def save_proxy_pool(payload: SaveProxyPoolRequest) -> JSONResponse:
     from ..db.repositories import RepositoryError
     from .proxy_pool import get_proxy_pool, normalize_proxies
 
-    mode = payload.rotation_mode if payload.rotation_mode in ("round_robin", "random") else "round_robin"
+    mode = payload.rotation_mode if payload.rotation_mode in ("round_robin", "random", "probe") else "round_robin"
     proxies = normalize_proxies(payload.proxies)
 
     # Reconfigure runtime trước (reset dead-set để proxy mới được thử lại).

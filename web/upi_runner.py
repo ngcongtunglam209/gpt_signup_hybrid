@@ -33,6 +33,18 @@ from time import monotonic
 from typing import Any, Callable
 
 from ..user_agent_profile import CURL_IMPERSONATE_PRIMARY as _IMPERSONATE
+from .proxy_format import materialize_proxy
+from .proxy_format import sanitize_proxy_text as _sanitize_proxy  # canonical (DRY, F-E)
+
+
+def _safe_materialize(line: str | None) -> str | None:
+    """materialize_proxy nhưng nuốt ValueError (format rác) → None (direct)."""
+    if not line:
+        return None
+    try:
+        return materialize_proxy(line)
+    except ValueError:
+        return None
 
 # Hardcoded knobs — fix cứng theo spec UI (không expose ra Settings).
 PROMO: bool = True
@@ -107,6 +119,9 @@ class UpiQrResult:
     # đưa vào to_dict() — caller giữ riêng, không leak ra JSON SSE/snapshot).
     access_token: str | None = field(default=None, repr=False)
     session_cookies: list[dict[str, Any]] | None = field(default=None, repr=False)
+    # Concrete proxy URL dùng cho login Step1 (= IP token-export replay, F-A).
+    # repr=False + KHÔNG vào to_dict() → không leak ra SSE/UI snapshot.
+    proxy_used: str | None = field(default=None, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -173,13 +188,9 @@ def _mask_email(email: str) -> str:
 
 
 def _mask_proxy(proxy: str | None) -> str:
-    if not proxy:
-        return "direct"
-    if "@" not in proxy:
-        return proxy
-    scheme, sep, rest = proxy.partition("://")
-    host_part = rest.rsplit("@", 1)[-1]
-    return f"{scheme}://***@{host_part}" if sep else "***@" + host_part
+    """Delegate canonical proxy_format.mask_proxy (DRY — hết circular)."""
+    from .proxy_format import mask_proxy
+    return mask_proxy(proxy)
 
 
 def _proxy_dict(proxy: str | None) -> dict[str, str] | None:
@@ -832,7 +843,9 @@ async def _stripe_payment_page_refresh_retry(
 ) -> dict[str, Any]:
     candidates = proxy_pool if proxy_pool else [None]
     last_attempt: dict[str, Any] | None = None
-    for index, proxy_url in enumerate(candidates, start=1):
+    for index, raw_proxy in enumerate(candidates, start=1):
+        # proxy_pool nay là RAW templates → materialize concrete URL cho curl_cffi.
+        proxy_url = _safe_materialize(raw_proxy)
         try:
             attempt = await _stripe_payment_page_refresh(
                 sess,
@@ -849,10 +862,10 @@ async def _stripe_payment_page_refresh_retry(
                 "ok": False,
                 "keys": [],
                 "error_type": type(exc).__name__,
-                "error": str(exc)[:300],
+                "error": _sanitize_proxy(str(exc))[:300],
                 "data": None,
             }
-        attempt["proxy"] = _mask_proxy(proxy_url)
+        attempt["proxy"] = _mask_proxy(raw_proxy)
         attempt["attempt"] = index
         last_attempt = attempt
         if attempt.get("ok"):
@@ -881,7 +894,7 @@ async def _download_qr_image(
         return {
             "downloaded": False,
             "error_type": type(exc).__name__,
-            "error": str(exc)[:300],
+            "error": _sanitize_proxy(str(exc))[:300],
         }
     if resp.status_code != 200:
         return {"downloaded": False, "status": resp.status_code}
@@ -1060,7 +1073,8 @@ async def run_upi_qr_probe(
     Args:
         email/password/secret: ChatGPT credentials. ``secret`` = TOTP secret nếu
             account có 2FA.
-        proxy_pool: list proxy URL (đã normalize) để xoay vòng. Empty = direct.
+        proxy_pool: list proxy line/template (raw, có thể chứa ``{SID}``). Empty
+            = direct mọi step.
         approve_retries: số lần retry approve (>=1).
         qr_out_path: PNG file path để lưu QR (sẽ tự tạo parent dir).
         log: callable(str) — mỗi dòng log gọi callback this.
@@ -1070,14 +1084,14 @@ async def run_upi_qr_probe(
         max_restarts: số lần restart tối đa trong 1 job. Hết quota → fatal
             break. 0 = disabled.
         proxy_from_step: 1-6, step bắt đầu áp proxy cho flow (đồng bộ
-            `pay_upi_http._ProxyPolicy` schema). Default lấy từ
-            ``PROXY_FROM_STEP`` constant để giữ backward-compat. Khi =1, step
-            1 (login) cũng route qua ``proxy_pool[0]``; ngược lại login
-            DIRECT.
+            ``pay_upi_http._ProxyPolicy`` schema). Default lấy từ
+            ``PROXY_FROM_STEP``. Khi =1, step 1 (login) cũng route qua
+            ``proxy_pool[0]``; ngược lại login DIRECT.
 
     Returns:
         UpiQrResult — luôn trả (kể cả khi fail), KHÔNG raise. Caller check
-        ``result.ok`` để biết success.
+        ``result.ok`` để biết success. ``proxy_used`` = concrete URL Stripe
+        Steps 2-5 dùng (= IP để check_plan replay sau).
     """
     if approve_retries < 1:
         raise UpiQrError(f"approve_retries phải >= 1, got {approve_retries}")
@@ -1095,7 +1109,10 @@ async def run_upi_qr_probe(
     started = monotonic()
     masked_email = _mask_email(email)
     masked_proxy_pool = [_mask_proxy(p) for p in proxy_pool]
-    first_proxy = proxy_pool[0] if proxy_pool else None
+    # Steps 2-5 dùng first_proxy = materialize raw_pool[0]. proxy_pool nay là
+    # RAW templates (lazy-materialize ở approve/refresh) → first_proxy là URL
+    # concrete với SID stable cho 1 job (không xoay giữa Step 2-5).
+    first_proxy = _safe_materialize(proxy_pool[0]) if proxy_pool else None
     masked_first_proxy = _mask_proxy(first_proxy)
 
     def _safe_log(msg: str) -> None:
@@ -1103,6 +1120,8 @@ async def run_upi_qr_probe(
         safe = msg.replace(email, masked_email)
         for raw, masked in zip(proxy_pool, masked_proxy_pool):
             safe = safe.replace(raw, masked)
+        if first_proxy:
+            safe = safe.replace(first_proxy, masked_first_proxy)
         log(safe)
 
     _safe_log(_fmt_step("upi", "account", "info",
@@ -1197,8 +1216,11 @@ async def run_upi_qr_probe(
         _safe_log(_fmt_step("1/6", "login", "fail", last_login_error or "unknown"))
         return UpiQrResult(
             ok=False, email=masked_email,
-            error=f"login fail: {last_login_error or 'unknown'}",
+            # Sanitize: last_login_error = str(SessionError) có thể nhúng proxy
+            # URL (curl error qua login_proxy) → job.error → SSE/UI.
+            error=_sanitize_proxy(f"login fail: {last_login_error or 'unknown'}"),
             elapsed_seconds=monotonic() - started,
+            proxy_used=first_proxy,
         )
 
     access_token = session_data.get("accessToken")
@@ -1208,6 +1230,7 @@ async def run_upi_qr_probe(
             ok=False, email=masked_email,
             error="login OK nhưng không có accessToken",
             elapsed_seconds=monotonic() - started,
+            proxy_used=first_proxy,
         )
     user_email = (session_data.get("user") or {}).get("email") or masked_email
     _safe_log(_fmt_step("1/6", "login", "ok", f"user={user_email}"))
@@ -1466,16 +1489,24 @@ async def run_upi_qr_probe(
             consecutive_network_error = 0      # reset đầu mỗi phase
 
             approve_started = monotonic()
+            # Cache materialized URL theo batch-index: sticky SID/IP trong 1
+            # batch, SID/IP tươi sang batch mới. Reset mỗi phase restart →
+            # phase mới spawn IP tươi (không reuse cache cũ).
+            _approve_mat_cache: dict[int, str | None] = {}
             while approve_index_total < approve_retries:
                 approve_index_total += 1
                 proxy_virtual_attempt += 1
-                approve_proxy = _proxy_url_for_retry(
+                raw_approve_proxy = _proxy_url_for_retry(
                     proxy_pool,
                     from_step=proxy_from_step,
                     step=6,
                     attempt=proxy_virtual_attempt,
                     per_proxy_attempts=APPROVE_PROXY_BATCH,
                 )
+                batch_idx = (proxy_virtual_attempt - 1) // APPROVE_PROXY_BATCH
+                if batch_idx not in _approve_mat_cache:
+                    _approve_mat_cache[batch_idx] = _safe_materialize(raw_approve_proxy)
+                approve_proxy = _approve_mat_cache[batch_idx]  # concrete URL (no {SID})
                 try:
                     approve_attempt = await _chatgpt_approve_checkout(
                         sess,
@@ -1491,7 +1522,7 @@ async def run_upi_qr_probe(
                         "result": None,
                         "keys": [],
                         "error_type": type(exc).__name__,
-                        "error": str(exc)[:300],
+                        "error": _sanitize_proxy(str(exc))[:300],
                         "data": None,
                     }
                 approve_attempt["variant"] = confirm_variant_used
@@ -1771,6 +1802,7 @@ async def run_upi_qr_probe(
             if isinstance(session_data, dict)
             else None
         ),
+        proxy_used=first_proxy,
     )
 
 

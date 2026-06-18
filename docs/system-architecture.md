@@ -77,6 +77,16 @@
 │  │   ├─ _stripe_confirm_upi (confirm UPI, retry variants)       │
 │  │   └─ constants (Stripe endpoints, headers)                   │
 │  │                                                               │
+│  ├─ proxy_format.py (proxy line parsing + SID materialization)  │
+│  │   ├─ materialize_proxy (replace {SID}/{sid} → concrete URL)  │
+│  │   ├─ gen_sid (random session ID generator)                   │
+│  │   └─ mask_proxy (redact credentials for logging)             │
+│  │                                                               │
+│  ├─ proxy_health.py (proxy health-check loop)                   │
+│  │   ├─ probe_proxy (L4 connectivity test)                      │
+│  │   ├─ acquire_live_proxy (SID-rotate until probe OK)          │
+│  │   └─ [asyncio.Semaphore bounded concurrency]                 │
+│  │                                                               │
 │  ├─ upi_runner.py (async UPI QR probe)                          │
 │  │   ├─ Login → get accessToken                                 │
 │  │   ├─ Fetch checkout → Stripe init                            │
@@ -362,6 +372,48 @@
               │  shows modal   │
               └────────────────┘
 ```
+
+### Proxy Health-Check Loop (All Login Flows)
+
+```
+┌──────────────────────┐
+│  Proxy pool          │  raw line/template
+│  (host:port:user:pass│  may contain {SID}/{sid}
+│   or {SID} template) │
+└──────┬───────────────┘
+       │
+       ▼
+┌──────────────────────────────────┐
+│  pick() → materialize_proxy()    │
+│  ├─ Replace {SID} → random      │
+│   └─ Return concrete URL        │
+└──────┬───────────────────────────┘
+       │
+       ▼
+┌──────────────────────────────────┐
+│  probe_proxy (async)             │
+│  ├─ HEAD https://api64.ipify.org │
+│  └─ Classify: 407 (auth) vs      │
+│     timeout (IP-level)           │
+└──────┬───────────────────────────┘
+       │
+       ├─ [OK] ────────────────────────────┐
+       │                                   │
+       ├─ [Auth fail] (407)                │ Use for login
+       │  └─ mark_dead(raw_line)           │ (all 4 flows:
+       │     loop → next SID               │  UPI, Session,
+       │                                   │  Link, Reg)
+       └─ [IP-level fail] (timeout)        │
+          └─ rotate SID, retry same line   │
+             (up to sid_retry_per_line)    ▼
+                                    return (url, line)
+             [if exhausted] → fallback (None, None) → DIRECT
+```
+
+**Concurrency guard:** `asyncio.Semaphore(N)` (N = `proxy.probe_concurrency`, default 4).
+Prevents thundering-herd when `HYBRID_MAX_CONCURRENT` = 10 jobs probe simultaneously.
+
+---
 
 ### iCloud HME Runner (Infinite Loop)
 

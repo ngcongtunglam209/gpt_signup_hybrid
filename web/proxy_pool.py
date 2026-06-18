@@ -1,4 +1,9 @@
-"""ProxyPool — xoay vòng nhiều proxy URL để tránh trùng IP khi chạy batch.
+"""ProxyPool — xoay vòng nhiều proxy line/template để tránh trùng IP khi chạy batch.
+
+Pool lưu **raw line/template** (``host:port:user:pass`` có thể chứa ``{SID}``),
+KHÔNG phải URL đã normalize. Mọi consumer lấy giá trị từ pool và feed cho
+curl_cffi/httpx/browser **PHẢI** ``materialize_proxy`` trước (xem ``proxy_format``).
+``pick``/``mark_dead`` dùng key = raw line.
 
 Single source of truth runtime cho danh sách proxy rotation. Được hydrate từ
 Settings Store (`proxy.pool` + `proxy.rotation_mode`) lúc startup
@@ -21,7 +26,7 @@ from __future__ import annotations
 import random
 import threading
 
-_VALID_MODES: tuple[str, ...] = ("round_robin", "random")
+_VALID_MODES: tuple[str, ...] = ("round_robin", "random", "probe")
 
 
 def normalize_proxies(proxies) -> list[str]:
@@ -90,6 +95,8 @@ class ProxyPool:
 
         round_robin: xoay tuần tự qua danh sách live.
         random: chọn ngẫu nhiên trong danh sách live.
+        probe: cũng dùng round_robin order; caller (``acquire_live_proxy``)
+            probe + SID-rotate trước khi cấp cho job (xem ``proxy_health``).
         """
         with self._lock:
             live = [p for p in self._entries if p not in self._dead]
@@ -144,14 +151,19 @@ class ProxyPool:
             return any(p not in self._dead for p in self._entries)
 
     def status(self) -> dict:
-        """Snapshot trạng thái pool cho UI (đếm + danh sách dead)."""
+        """Snapshot trạng thái pool cho UI (đếm + danh sách dead đã mask credential).
+
+        Dead-list mask qua ``proxy_format.mask_proxy`` để KHÔNG lộ user:pass/SID-pass
+        raw ra ``GET /api/proxy/pool`` (F-F).
+        """
+        from .proxy_format import mask_proxy
         with self._lock:
             live = [p for p in self._entries if p not in self._dead]
             return {
                 "mode": self._mode,
                 "total": len(self._entries),
                 "live": len(live),
-                "dead": sorted(self._dead),
+                "dead": sorted(mask_proxy(d) for d in self._dead),
             }
 
 

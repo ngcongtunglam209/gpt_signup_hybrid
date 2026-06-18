@@ -60,6 +60,8 @@ _EXACT_KEYS: frozenset[str] = frozenset([
     "reg.post_reg_link_region", "reg.auto_retry", "reg.auto_retry_max",
     "reg.auto_retry_delay", "reg.max_concurrent",
     "proxy.pool", "proxy.rotation_mode",
+    "proxy.probe_endpoint", "proxy.probe_timeout", "proxy.max_tries",
+    "proxy.sid_len", "proxy.sid_retry_per_line", "proxy.probe_concurrency",
     "mail_mode.current", "mail_mode.worker_config",
     "reg_mode.current",
     "hme.runner.action", "hme.runner.count_per_cycle",
@@ -201,11 +203,42 @@ def _validate_type_constraint(key: str, value: Any) -> None:
         return
 
     if key == "proxy.rotation_mode":
-        if not isinstance(value, str) or value not in ("round_robin", "random"):
+        if not isinstance(value, str) or value not in ("round_robin", "random", "probe"):
             raise RepositoryError(
                 "set", ValueError(
-                    f"{key}: must be str in {{\"round_robin\",\"random\"}}, got {value!r}"
+                    f"{key}: must be str in {{\"round_robin\",\"random\",\"probe\"}}, got {value!r}"
                 )
+            )
+        return
+
+    if key == "proxy.probe_endpoint":
+        if not isinstance(value, str) or not value.strip():
+            raise RepositoryError(
+                "set", ValueError(f"{key}: must be non-empty str, got {value!r}")
+            )
+        if not value.strip().lower().startswith("http"):
+            raise RepositoryError(
+                "set", ValueError(f"{key}: must be http(s) URL, got {value!r}")
+            )
+        return
+
+    if key in ("proxy.probe_timeout", "proxy.max_tries", "proxy.sid_len",
+               "proxy.sid_retry_per_line", "proxy.probe_concurrency"):
+        _ranges = {
+            "proxy.probe_timeout": (3, 15),
+            "proxy.max_tries": (1, 20),
+            "proxy.sid_len": (4, 32),
+            "proxy.sid_retry_per_line": (0, 10),
+            "proxy.probe_concurrency": (1, 10),
+        }
+        lo, hi = _ranges[key]
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise RepositoryError(
+                "set", TypeError(f"{key}: must be int, got {type(value).__name__}")
+            )
+        if not (lo <= value <= hi):
+            raise RepositoryError(
+                "set", ValueError(f"{key}: must be in [{lo}, {hi}], got {value}")
             )
         return
 

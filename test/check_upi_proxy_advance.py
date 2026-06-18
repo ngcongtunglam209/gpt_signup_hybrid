@@ -41,8 +41,8 @@ def t03_proxy_advance_block() -> int:
     src = TARGET.read_text(encoding="utf-8")
     needles = [
         "proxy_virtual_attempt = 0",
-        "_proxy_advance_enabled",
-        "if _proxy_advance_enabled:",
+        "_proxy_advance_enabled_static",
+        "if _proxy_advance_enabled_static:",
         "proxy_virtual_attempt = (current_batch + 1) * APPROVE_PROXY_BATCH",
     ]
     for n in needles:
@@ -216,6 +216,25 @@ def t10_test_files_threshold_synced() -> int:
     return 0
 
 
+def t11_batch_cache_materialize_coexist() -> int:
+    """Approve loop nay lazy-materialize raw_pool theo batch-index (F-O) — markers
+    cache phải coexist với advance logic (cùng dùng proxy_virtual_attempt/batch)."""
+    src = TARGET.read_text(encoding="utf-8")
+    needles = [
+        "_approve_mat_cache",
+        "batch_idx = (proxy_virtual_attempt - 1) // APPROVE_PROXY_BATCH",
+        "if batch_idx not in _approve_mat_cache:",
+        "_safe_materialize(raw_approve_proxy)",
+        "len(proxy_pool) > 1",  # advance gate giữ nguyên (raw_pool len)
+    ]
+    for n in needles:
+        if n not in src:
+            print(f"[FAIL] TC-11 batch-cache :: thiếu {n!r}", flush=True)
+            return 1
+    print("[PASS] TC-11 batch-cache materialize coexist với advance (F-O)", flush=True)
+    return 0
+
+
 def main() -> int:
     print("=== check_upi_proxy_advance ===", flush=True)
     tests = [
@@ -229,6 +248,7 @@ def main() -> int:
         t08_consecutive_exceptions_skip_multiple_proxies,
         t09_no_proxy_when_step_disabled,
         t10_test_files_threshold_synced,
+        t11_batch_cache_materialize_coexist,
     ]
     failures = 0
     for fn in tests:

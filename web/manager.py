@@ -13,13 +13,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from ..config import load_settings, runtime_session_dir
+from ..config import load_settings, proxy_env_defaults, runtime_session_dir
 from ..mail_providers import OutlookCombo, OutlookComboError
 from ..mfa_phase import MfaError, enable_2fa
 from ..models import SignupRequest, SignupResult
 from ..signup import run_signup
 from .._browser_retry import NETWORK_ERROR_MARKERS
 from .mail_modes import MailModeParseError, get_spec
+from .proxy_health import _acquire_kwargs, _load_proxy_knobs, acquire_live_proxy
 from .proxy_pool import get_proxy_pool
 
 if TYPE_CHECKING:
@@ -173,16 +174,13 @@ _OUTLOOK_COMBO_MODES = frozenset({"outlook", "dongvanfb"})
 
 
 def _mask_proxy(proxy: str | None) -> str:
-    """Mask user:pass trong proxy URL cho log. None/empty → 'direct'."""
-    if not proxy:
-        return "direct"
-    if "@" in proxy:
-        scheme_split = proxy.split("://", 1)
-        if len(scheme_split) == 2:
-            scheme, rest = scheme_split
-            _, _, host = rest.partition("@")
-            return f"{scheme}://***@{host}"
-    return proxy
+    """Mask user:pass trong proxy URL cho log — delegate canonical (DRY).
+
+    Canonical ``proxy_format.mask_proxy`` mask cả shape không scheme (``u:p@h:1``)
+    lẫn SID-username, chặt hơn impl cũ (không regression cho URL có scheme).
+    """
+    from .proxy_format import mask_proxy
+    return mask_proxy(proxy)
 
 
 def _is_proxy_network_error(exc_or_msg) -> bool:
@@ -200,19 +198,62 @@ def _is_proxy_network_error(exc_or_msg) -> bool:
     return any(marker in msg for marker in NETWORK_ERROR_MARKERS)
 
 
-def _resolve_job_proxy() -> str | None:
-    """Resolve proxy cho 1 job từ proxy pool (round_robin/random).
+# Proxy knob cache — set ở apply_settings (startup + on-change). Load 1 lần,
+# tránh đọc .env per acquire-retry. None = chưa hydrate → fallback defaults.
+_PROXY_KNOBS_CACHE: dict | None = None
 
-    - Pool có proxy live → pick 1 để tránh trùng IP giữa các job.
-    - Pool rỗng / hết proxy live → None (direct).
 
-    Proxy pool là nguồn cấu hình proxy DUY NHẤT (single source of truth) —
-    không còn proxy đơn riêng lẻ.
+def _hydrate_proxy_knobs_from_settings(settings: dict) -> None:
+    """Cache 6 proxy knob từ Settings store (UI) + .env defaults. Idempotent."""
+    global _PROXY_KNOBS_CACHE  # noqa: PLW0603
+    _PROXY_KNOBS_CACHE = _load_proxy_knobs(settings, env_defaults=proxy_env_defaults())
+
+
+def _current_proxy_knobs() -> dict:
+    """Knob hiện hành cho 1 job.
+
+    Đọc TƯƠI từ Settings store mỗi lần gọi (1 lần/job — caller cache trên
+    ``job._proxy_knobs``, retry reuse nên không đọc DB per-retry).
+    Store không sẵn → fallback cache (apply_settings) → default + .env.
+    """
+    try:
+        from ..db import get_engine, get_settings_repo
+        store = get_settings_repo(get_engine()).list()
+        return _load_proxy_knobs(store, env_defaults=proxy_env_defaults())
+    except Exception:  # noqa: BLE001 — DB chưa mở / lỗi → fallback
+        if _PROXY_KNOBS_CACHE is not None:
+            return _PROXY_KNOBS_CACHE
+        return _load_proxy_knobs({}, env_defaults=proxy_env_defaults())
+
+
+async def _resolve_job_proxy(log=None, *, knobs: dict | None = None) -> tuple[str | None, str | None]:
+    """Resolve proxy cho 1 job — gate theo ``pool.rotation_mode``.
+
+    - ``probe`` → ``acquire_live_proxy`` (health-check + SID-rotate). Url cho
+      replay cùng IP, raw line cho mark_dead key.
+    - ``round_robin`` / ``random`` → ``pool.pick()`` straight, materialize
+      ``{SID}`` placeholder nếu có. Format rác → mark_dead + return None.
+
+    Pool rỗng / toàn-dead / cạn max_tries → ``(None, None)`` (caller → direct).
     """
     pool = get_proxy_pool()
-    if pool.is_active():
-        return pool.pick()
-    return None
+    if pool.mode == "probe":
+        knobs = knobs or _current_proxy_knobs()
+        return await acquire_live_proxy(pool, log=log, **_acquire_kwargs(knobs))
+
+    # round_robin / random — pick straight, không probe.
+    line = pool.pick()
+    if not line:
+        return (None, None)
+    from .proxy_format import materialize_proxy
+    try:
+        url = materialize_proxy(line)
+    except ValueError:
+        if log:
+            log(f"[proxy] bad format {_mask_proxy(line)} — drop line")
+        pool.mark_dead(line)
+        return (None, None)
+    return (url, line)
 
 
 async def run_with_proxy_rotation(
@@ -244,6 +285,8 @@ async def run_with_proxy_rotation(
     Returns:
         Giá trị trả về của ``func`` ở lần thành công đầu tiên.
     """
+    from .proxy_format import materialize_proxy
+
     pool = get_proxy_pool()
     if not pool.is_active():
         return await func(None)
@@ -252,19 +295,27 @@ async def run_with_proxy_rotation(
     last_exc: Exception | None = None
 
     for _ in range(attempts):
-        proxy = pool.pick()
+        proxy = pool.pick()  # raw line/template
         if proxy is None:
             break  # hết proxy live
-        if log:
-            log(f"[proxy] dùng {_mask_proxy(proxy)}")
+        # Pool lưu raw line → materialize concrete URL trước khi feed curl_cffi (F-C).
         try:
-            return await func(proxy)
+            url = materialize_proxy(proxy)
+        except ValueError:
+            if log:
+                log(f"[proxy] bad format {_mask_proxy(proxy)} — loại khỏi pool")
+            pool.mark_dead(proxy)  # mark_dead key = raw line
+            continue
+        if log:
+            log(f"[proxy] dùng {_mask_proxy(url)}")
+        try:
+            return await func(url)
         except Exception as exc:  # noqa: BLE001
             if not _is_proxy_network_error(exc):
                 # Lỗi nghiệp vụ (Stripe decline, session expired...) → không retry.
                 raise
             last_exc = exc
-            if pool.mark_dead(proxy) and log:
+            if pool.mark_dead(proxy) and log:  # mark_dead key = raw line
                 log(f"[proxy] {_mask_proxy(proxy)} lỗi network — loại khỏi pool")
 
     if last_exc is not None:
@@ -282,6 +333,8 @@ def _hydrate_proxy_pool_from_settings(settings: dict) -> None:
     mode = settings.get("proxy.rotation_mode") if "proxy.rotation_mode" in settings else None
     if proxies is not None or mode is not None:
         get_proxy_pool().configure(proxies, mode=mode)
+    # Cache 7 proxy health/acquire knob (UI store > .env > default) — load 1 lần.
+    _hydrate_proxy_knobs_from_settings(settings)
 
 
 def _seed_proxy_pool_from_env() -> None:
@@ -594,25 +647,27 @@ class JobManager:
             raise ValueError("job_timeout phải trong [30, 600]")
         self._job_timeout = float(seconds)
 
-    def _begin_job_proxy(self, job: "Job", log) -> str | None:
-        """Resolve proxy cho 1 job từ proxy pool (round_robin/random).
+    async def _begin_job_proxy(self, job: "Job", log) -> str | None:
+        """Resolve proxy live qua health-check; set transient fields cho job.
 
-        Lưu vào ``job._active_proxy`` (transient) để error handler mark-dead
-        đúng proxy. Log proxy đang dùng (đã mask credential).
+        ``_active_proxy`` = concrete URL (replay cùng IP); ``_active_proxy_line`` =
+        raw line (mark_dead key, F-J). Knob load 1 lần/job → cache ``_proxy_knobs``
+        (F-H). acquire_live_proxy tự log live/rotate/dead qua ``log``.
         """
-        proxy = _resolve_job_proxy()
-        job._active_proxy = proxy  # type: ignore[attr-defined]
-        if proxy:
-            log(f"[proxy] using {_mask_proxy(proxy)}")
-        return proxy
+        knobs = getattr(job, "_proxy_knobs", None) or _current_proxy_knobs()
+        job._proxy_knobs = knobs  # type: ignore[attr-defined]
+        url, line = await _resolve_job_proxy(log, knobs=knobs)
+        job._active_proxy = url  # type: ignore[attr-defined]
+        job._active_proxy_line = line  # type: ignore[attr-defined]
+        return url
 
     def _note_proxy_failure(self, job: "Job", exc_or_msg) -> None:
-        """Mark proxy chết nếu lỗi là network/proxy → loại khỏi vòng xoay."""
-        proxy = getattr(job, "_active_proxy", None)
-        if proxy and _is_proxy_network_error(exc_or_msg):
-            if get_proxy_pool().mark_dead(proxy):
+        """Mark proxy line chết nếu lỗi network → key = raw line (_active_proxy_line, F-J)."""
+        line = getattr(job, "_active_proxy_line", None)
+        if line and _is_proxy_network_error(exc_or_msg):
+            if get_proxy_pool().mark_dead(line):
                 self._job_log(
-                    job, f"[proxy] {_mask_proxy(proxy)} lỗi network — loại khỏi pool"
+                    job, f"[proxy] {_mask_proxy(line)} lỗi network — loại khỏi pool"
                 )
 
     @property
@@ -1173,12 +1228,21 @@ class JobManager:
 
         url: str | None = None
         last_err: Exception | None = None
+        # Acquire proxy live 1 lần TRƯỚC loop (F-H/F-M): reuse cho cả 2 attempt,
+        # KHÔNG re-acquire mỗi attempt (tránh 2×max_tries probe). Set transient fields
+        # để _note_proxy_failure mark_dead đúng raw line.
+        rerun_url, rerun_line = await _resolve_job_proxy(
+            lambda m: self._job_log(job, m),
+            knobs=getattr(job, "_proxy_knobs", None),
+        )
+        job._active_proxy = rerun_url  # type: ignore[attr-defined]
+        job._active_proxy_line = rerun_line  # type: ignore[attr-defined]
         # 2 attempts × 30s timeout × 1.5s sleep
         for attempt in range(1, 3):
             try:
                 url = await asyncio.wait_for(
                     get_checkout_url(
-                        access_token, proxy=_resolve_job_proxy(), region=region_resolved,
+                        access_token, proxy=rerun_url, region=region_resolved,
                     ),
                     timeout=30.0,
                 )
@@ -1408,11 +1472,18 @@ class JobManager:
             on_enroll_cb = _make_on_enroll_callback(
                 self._session_repo, email=job.email, log=log,
             )
+            # Branch B resumable: KHÔNG chạy _begin_job_proxy → acquire 1 lần ở đây
+            # (giữ proxy invariant trên resume, F-T). Set transient fields cho mark_dead.
+            twofa_url, twofa_line = await _resolve_job_proxy(
+                log, knobs=getattr(job, "_proxy_knobs", None),
+            )
+            job._active_proxy = twofa_url  # type: ignore[attr-defined]
+            job._active_proxy_line = twofa_line  # type: ignore[attr-defined]
             try:
                 mfa_result = await enable_2fa(
                     access_token=access_token,
                     cookies=sdata.get("cookies"),
-                    proxy=_resolve_job_proxy(),
+                    proxy=twofa_url,
                     pending_enrollment=pending,
                     on_enroll=on_enroll_cb,
                     log=log,
@@ -1626,7 +1697,7 @@ class JobManager:
                 self._job_log(job, msg)
 
             log(f"[mode] {job.mail_mode}")
-            job_proxy = self._begin_job_proxy(job, log)
+            job_proxy = await self._begin_job_proxy(job, log)
 
             # Build SignupRequest qua registry spec
             spec = get_spec(job.mail_mode)
@@ -2583,21 +2654,23 @@ class SessionJobManager:
         job = self.jobs.get(job_id)
         return list(job.log_lines) if job else []
 
-    def _begin_job_proxy(self, job: SessionJob, log) -> str | None:
-        """Resolve proxy cho 1 job từ proxy pool (round_robin/random)."""
-        proxy = _resolve_job_proxy()
-        job._active_proxy = proxy  # type: ignore[attr-defined]
-        if proxy:
-            log(f"[proxy] using {_mask_proxy(proxy)}")
-        return proxy
+    async def _begin_job_proxy(self, job: SessionJob, log) -> str | None:
+        """Resolve proxy live qua health-check; set _active_proxy (URL) +
+        _active_proxy_line (raw, mark_dead key F-J); cache _proxy_knobs (F-H)."""
+        knobs = getattr(job, "_proxy_knobs", None) or _current_proxy_knobs()
+        job._proxy_knobs = knobs  # type: ignore[attr-defined]
+        url, line = await _resolve_job_proxy(log, knobs=knobs)
+        job._active_proxy = url  # type: ignore[attr-defined]
+        job._active_proxy_line = line  # type: ignore[attr-defined]
+        return url
 
     def _note_proxy_failure(self, job: SessionJob, exc_or_msg) -> None:
-        """Mark proxy chết nếu lỗi là network/proxy → loại khỏi vòng xoay."""
-        proxy = getattr(job, "_active_proxy", None)
-        if proxy and _is_proxy_network_error(exc_or_msg):
-            if get_proxy_pool().mark_dead(proxy):
+        """Mark proxy line chết nếu lỗi network → key = raw line (_active_proxy_line, F-J)."""
+        line = getattr(job, "_active_proxy_line", None)
+        if line and _is_proxy_network_error(exc_or_msg):
+            if get_proxy_pool().mark_dead(line):
                 self._job_log(
-                    job, f"[proxy] {_mask_proxy(proxy)} lỗi network — loại khỏi pool"
+                    job, f"[proxy] {_mask_proxy(line)} lỗi network — loại khỏi pool"
                 )
 
     async def _run_job(self, job: SessionJob) -> None:
@@ -2636,7 +2709,7 @@ class SessionJobManager:
             def log(msg: str) -> None:
                 self._job_log(job, msg)
 
-            job_proxy = self._begin_job_proxy(job, log)
+            job_proxy = await self._begin_job_proxy(job, log)
 
             # Get Session fix cứng dùng pure_request (HTTP-only, không browser).
             from ..session_phase import get_session_pure_request
@@ -3539,21 +3612,23 @@ class LinkJobManager:
         job = self.jobs.get(job_id)
         return list(job.log_lines) if job else []
 
-    def _begin_job_proxy(self, job: LinkJob, log) -> str | None:
-        """Resolve proxy cho 1 job từ proxy pool (round_robin/random)."""
-        proxy = _resolve_job_proxy()
-        job._active_proxy = proxy  # type: ignore[attr-defined]
-        if proxy:
-            log(f"[proxy] using {_mask_proxy(proxy)}")
-        return proxy
+    async def _begin_job_proxy(self, job: LinkJob, log) -> str | None:
+        """Resolve proxy live qua health-check; set _active_proxy (URL) +
+        _active_proxy_line (raw, mark_dead key F-J); cache _proxy_knobs (F-H)."""
+        knobs = getattr(job, "_proxy_knobs", None) or _current_proxy_knobs()
+        job._proxy_knobs = knobs  # type: ignore[attr-defined]
+        url, line = await _resolve_job_proxy(log, knobs=knobs)
+        job._active_proxy = url  # type: ignore[attr-defined]
+        job._active_proxy_line = line  # type: ignore[attr-defined]
+        return url
 
     def _note_proxy_failure(self, job: LinkJob, exc_or_msg) -> None:
-        """Mark proxy chết nếu lỗi là network/proxy → loại khỏi vòng xoay."""
-        proxy = getattr(job, "_active_proxy", None)
-        if proxy and _is_proxy_network_error(exc_or_msg):
-            if get_proxy_pool().mark_dead(proxy):
+        """Mark proxy line chết nếu lỗi network → key = raw line (_active_proxy_line, F-J)."""
+        line = getattr(job, "_active_proxy_line", None)
+        if line and _is_proxy_network_error(exc_or_msg):
+            if get_proxy_pool().mark_dead(line):
                 self._job_log(
-                    job, f"[proxy] {_mask_proxy(proxy)} lỗi network — loại khỏi pool"
+                    job, f"[proxy] {_mask_proxy(line)} lỗi network — loại khỏi pool"
                 )
 
     async def _run_job(self, job: LinkJob) -> None:
@@ -3592,7 +3667,7 @@ class LinkJobManager:
             def log(msg: str) -> None:
                 self._job_log(job, msg)
 
-            job_proxy = self._begin_job_proxy(job, log)
+            job_proxy = await self._begin_job_proxy(job, log)
 
             # ── Resolve access_token theo mode ──
             access_token: str | None = None
@@ -3891,10 +3966,13 @@ class UpiJob:
     # restart server (UpiJob vốn không persist DB).
     _access_token: str | None = field(default=None, repr=False)
     _session_cookies: list[dict[str, Any]] | None = field(default=None, repr=False)
-    # Proxy đã mint access_token (proxy_pool[0], PROXY_FROM_STEP=3 ≤ checkout).
-    # Lưu để replay Bearer entitlement-check qua đúng IP (tránh 403/correlation)
-    # + ghi vào token export. repr=False + KHÔNG vào to_dict() — không leak.
+    # Proxy concrete URL đã mint access_token (= IP login Step1, F-A). Lưu để
+    # replay Bearer entitlement-check qua đúng IP (tránh 403/correlation) + ghi
+    # vào token export. repr=False + KHÔNG vào to_dict() — không leak.
     _active_proxy: str | None = field(default=None, repr=False)
+    # Raw pool line (mark_dead key, F-J) + knob cache (load 1 lần/job, F-H).
+    _active_proxy_line: str | None = field(default=None, repr=False)
+    _proxy_knobs: dict | None = field(default=None, repr=False)
     # Cache kết quả check-session gần nhất để frontend không phải re-fetch khi
     # user mở lại UI / re-render. None = chưa check bao giờ.
     plan_check: dict[str, Any] | None = None
@@ -4443,12 +4521,18 @@ class UpiJobManager:
             def log(msg: str) -> None:
                 self._job_log(job, msg)
 
-            # Lấy proxy_pool từ singleton (hot-load — user vừa cập nhật là dùng ngay).
-            proxy_pool = list(get_proxy_pool().live_entries())
-            # Proxy mint token = first_proxy (runner dùng proxy_pool[0] từ
-            # PROXY_FROM_STEP=3 ≤ bước checkout). Lưu để entitlement-check replay
-            # qua đúng IP + ghi vào token export (H3).
-            job._active_proxy = proxy_pool[0] if proxy_pool else None
+            # UPI Step1 login luôn DIRECT (không qua proxy) — quyết định kiến
+            # trúc: login direct giảm captcha trên ChatGPT auth; proxy chỉ
+            # apply từ Step ``upi.proxy_from_step`` (default 3 — checkout).
+            # raw_pool (templates) dùng cho approve lazy-materialize-per-batch
+            # + giữ len>1 cho _proxy_advance_enabled. Hot-load: user vừa cập
+            # nhật là dùng ngay.
+            raw_pool = list(get_proxy_pool().live_entries())
+            # _active_proxy = first proxy materialized (= IP token-export
+            # replay cho entitlement-check). first_proxy lấy ở runner —
+            # ở đây chỉ cần record raw line đầu cho mark_dead.
+            job._active_proxy = None  # set lại sau khi runner mint token
+            job._active_proxy_line = raw_pool[0] if raw_pool else None
 
             _UPI_QR_DIR.mkdir(parents=True, exist_ok=True)
             qr_out_path = _UPI_QR_DIR / f"{job.id}.png"
@@ -4458,7 +4542,7 @@ class UpiJobManager:
                     email=job.email,
                     password=job.password,
                     secret=job.secret,
-                    proxy_pool=proxy_pool,
+                    proxy_pool=raw_pool,
                     approve_retries=self._approve_retries,
                     qr_out_path=qr_out_path,
                     log=log,
@@ -4488,6 +4572,9 @@ class UpiJobManager:
             # nên cookies + token vẫn dùng để check plan.
             job._access_token = result.access_token
             job._session_cookies = result.session_cookies
+            # Update _active_proxy = first_proxy concrete (Stripe Steps 2-5
+            # đã dùng) → check_plan replay qua đúng IP.
+            job._active_proxy = result.proxy_used
             # Reset plan_check cũ (có thể còn từ retry trước).
             job.plan_check = None
 
@@ -4547,13 +4634,12 @@ class UpiJobManager:
             self._broadcast_job(job)
         except Exception as exc:
             error_msg = f"{type(exc).__name__}: {exc}"
-            # Mark proxy chết nếu phù hợp.
+            # Mark proxy chết nếu lỗi network — key = raw line login đã dùng (F-J),
+            # KHÔNG live_entries()[0] (có thể không phải proxy login thực tế).
             if _is_proxy_network_error(exc):
-                pool = get_proxy_pool()
-                # Best-effort — runner đã ưu tiên proxy[0] khi cần.
-                for p in list(pool.live_entries())[:1]:
-                    if pool.mark_dead(p):
-                        self._job_log(job, f"[proxy] {_mask_proxy(p)} lỗi network — loại khỏi pool")
+                line = getattr(job, "_active_proxy_line", None)
+                if line and get_proxy_pool().mark_dead(line):
+                    self._job_log(job, f"[proxy] {_mask_proxy(line)} lỗi network — loại khỏi pool")
             job.status = "error"
             job.error = error_msg
             job.finished_at = time.time()

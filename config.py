@@ -402,6 +402,37 @@ def runtime_session_dir(settings: Settings) -> Path:
     return out
 
 
+# ─── Proxy health/acquire knobs (.env layer) ─────────────────────────
+# 6 knob cho SID-rotation + health-check. Default value canonical ở
+# web/proxy_health._DEFAULT_KNOBS; .env CHỈ override khi set. Settings store
+# (UI) ưu tiên cao hơn .env (xem proxy_health._load_proxy_knobs).
+_PROXY_ENV_TO_KEY: dict[str, str] = {
+    "PROXY_PROBE_ENDPOINT": "proxy.probe_endpoint",
+    "PROXY_PROBE_TIMEOUT": "proxy.probe_timeout",
+    "PROXY_MAX_TRIES": "proxy.max_tries",
+    "PROXY_SID_LEN": "proxy.sid_len",
+    "PROXY_SID_RETRY_PER_LINE": "proxy.sid_retry_per_line",
+    "PROXY_PROBE_CONCURRENCY": "proxy.probe_concurrency",
+}
+
+
+def proxy_env_defaults(root_dir: Path | None = None, env_file: str | Path = ".env") -> dict[str, str]:
+    """Trả raw value (store-key format) cho 6 proxy knob có set trong .env/env.
+
+    Sparse: key không set → bỏ qua (proxy_health dùng hardcoded default). Mọi
+    value đi qua validator của ``_load_proxy_knobs`` (reject→default) → .env sai
+    range KHÔNG làm crash, chỉ fallback default + warning.
+    """
+    root = Path(root_dir or os.environ.get("GPT_REG_ROOT") or Path.cwd()).resolve()
+    env = _load_env_file(root / env_file)
+    out: dict[str, str] = {}
+    for env_key, store_key in _PROXY_ENV_TO_KEY.items():
+        raw = _lookup_optional(env, env_key)
+        if raw is not None:
+            out[store_key] = raw
+    return out
+
+
 # ─── Profile dir management ──────────────────────────────────────────
 
 
