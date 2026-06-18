@@ -256,7 +256,10 @@ class AddJobsRequest(BaseModel):
 
 
 class SetConfigRequest(BaseModel):
-    max_concurrent: int | None = Field(default=None, ge=1, le=10)
+    # Bỏ le=10 — frontend mode dropdown share giữa các tab có option Multi (50).
+    # Handler tự clamp về giới hạn của tab tương ứng (Reg=10) trước khi apply,
+    # tránh trả 422 khi user chọn mode > 10 ở tab Reg.
+    max_concurrent: int | None = Field(default=None, ge=1)
     headless: bool | None = Field(default=None)
     debug: bool | None = Field(default=None)
     job_timeout: float | None = Field(default=None, ge=30, le=600)
@@ -444,7 +447,11 @@ async def set_config(payload: SetConfigRequest) -> JSONResponse:
     lm = get_link_manager()
     if payload.max_concurrent is not None:
         try:
-            manager.set_max_concurrent(payload.max_concurrent)
+            # Silent clamp về [1, 10] (Reg max). Frontend dùng mode dropdown
+            # chung cho mọi tab, có option Multi (50) → giá trị > 10 chỉ áp
+            # dụng đầy đủ cho tab UPI; tab Reg cap silently.
+            clamped = max(1, min(payload.max_concurrent, 10))
+            manager.set_max_concurrent(clamped)
         except ValueError as exc:
             raise HTTPException(400, str(exc))
     if payload.headless is not None:
@@ -829,7 +836,8 @@ class AddSessionJobsRequest(BaseModel):
 
 
 class SetSessionConfigRequest(BaseModel):
-    max_concurrent: int | None = Field(default=None, ge=1, le=10)
+    # Bỏ le=10 — handler clamp về 10 trước khi apply (xem set_session_config).
+    max_concurrent: int | None = Field(default=None, ge=1)
     job_timeout: float | None = Field(default=None, ge=30, le=600)
 
 
@@ -920,7 +928,9 @@ async def set_session_config(payload: SetSessionConfigRequest) -> JSONResponse:
     sm = get_session_manager()
     if payload.max_concurrent is not None:
         try:
-            sm.set_max_concurrent(payload.max_concurrent)
+            # Silent clamp về [1, 10] (Session max).
+            clamped = max(1, min(payload.max_concurrent, 10))
+            sm.set_max_concurrent(clamped)
         except ValueError as exc:
             raise HTTPException(400, str(exc))
     if payload.job_timeout is not None:
@@ -950,7 +960,8 @@ class AddLinkJobsRequest(BaseModel):
 
 
 class SetLinkConfigRequest(BaseModel):
-    max_concurrent: int | None = Field(default=None, ge=1, le=10)
+    # Bỏ le=10 — handler clamp về 10 trước khi apply (xem set_link_config).
+    max_concurrent: int | None = Field(default=None, ge=1)
     job_timeout: float | None = Field(default=None, ge=30, le=600)
     region: str | None = Field(
         default=None,
@@ -998,7 +1009,9 @@ async def set_link_config(payload: SetLinkConfigRequest) -> JSONResponse:
     lm = get_link_manager()
     if payload.max_concurrent is not None:
         try:
-            lm.set_max_concurrent(payload.max_concurrent)
+            # Silent clamp về [1, 10] (Link max).
+            clamped = max(1, min(payload.max_concurrent, 10))
+            lm.set_max_concurrent(clamped)
         except ValueError as exc:
             raise HTTPException(400, str(exc))
     if payload.job_timeout is not None:
@@ -1654,7 +1667,8 @@ class AddUpiJobsRequest(BaseModel):
 
 
 class SetUpiConfigRequest(BaseModel):
-    max_concurrent: int | None = Field(default=None, ge=1, le=50)
+    # Bỏ le=50 — handler clamp về 50 trước khi apply (xem set_upi_config).
+    max_concurrent: int | None = Field(default=None, ge=1)
     job_timeout: float | None = Field(default=None, ge=60, le=7200)
     approve_retries: int | None = Field(default=None, ge=1, le=2000)
     notify_enabled: bool | None = Field(default=None)
@@ -1835,8 +1849,11 @@ async def set_upi_config(payload: SetUpiConfigRequest) -> JSONResponse:
     settings_writes: dict[str, Any] = {}
     if payload.max_concurrent is not None:
         try:
-            um.set_max_concurrent(payload.max_concurrent)
-            settings_writes["upi.max_concurrent"] = payload.max_concurrent
+            # Silent clamp về [1, 50] (UPI max). Frontend mode dropdown share
+            # giữa các tab; UPI tự cap nếu user truyền giá trị lớn hơn.
+            clamped = max(1, min(payload.max_concurrent, 50))
+            um.set_max_concurrent(clamped)
+            settings_writes["upi.max_concurrent"] = clamped
         except ValueError as exc:
             raise HTTPException(400, str(exc))
     if payload.job_timeout is not None:
