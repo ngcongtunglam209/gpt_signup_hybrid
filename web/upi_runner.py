@@ -32,9 +32,36 @@ from pathlib import Path
 from time import monotonic
 from typing import Any, Callable
 
-from ..user_agent_profile import CURL_IMPERSONATE_PRIMARY as _IMPERSONATE
+from ..user_agent_profile import (
+    CURL_IMPERSONATE_PRIMARY as _IMPERSONATE,
+    CURL_IMPERSONATE_CANDIDATES as _IMPERSONATE_CHAIN,
+)
 from .proxy_format import materialize_proxy
 from .proxy_format import sanitize_proxy_text as _sanitize_proxy  # canonical (DRY, F-E)
+
+
+# ─── TLS error detection + rotating session ──────────────────────────
+# curl-impersonate (BoringSSL fork) thỉnh thoảng raise OPENSSL_internal:invalid
+# library sau khi 1 request lỗi network/proxy reset — internal SSL state bị
+# corrupt, mọi request kế trên cùng session đều fail. Fix: rotate impersonate
+# (đồng nghĩa fresh BoringSSL context) khi gặp pattern lỗi này.
+#
+# Pattern đồng bộ với request_phase._is_tls_error (chrome145 → chrome142 →
+# chrome136 fallback chain từ user_agent_profile).
+
+_TLS_ERROR_MARKERS: tuple[str, ...] = (
+    "curl: (35)", "tls connect error", "openssl_internal", "sslerror",
+    "curl: (56)", "curl: (7)", "ssl_error", "handshake",
+    "invalid library",
+)
+
+
+def _is_tls_error(exc: BaseException) -> bool:
+    """Detect curl_cffi TLS handshake / BoringSSL state errors → worth
+    rotating impersonate. Match pattern theo request_phase + thêm
+    'invalid library' (BoringSSL state corrupt sau lỗi proxy)."""
+    msg = str(exc).lower()
+    return any(m in msg for m in _TLS_ERROR_MARKERS)
 
 
 def _safe_materialize(line: str | None) -> str | None:
@@ -502,6 +529,109 @@ def _short(value: str | None, head: int = 12) -> str:
 
 def _silent(_: str) -> None:
     """Nuốt log — dùng để tắt log nội bộ của pay_upi_http khi runner tự log."""
+
+
+class _RotatingSession:
+    """AsyncSession wrapper với TLS rotation: auto retry mỗi request khi
+    BoringSSL raise lỗi state (`OPENSSL_internal:invalid library`, `(35) TLS
+    connect error`, ...) bằng cách close + recreate inner session với
+    impersonate kế trong chain (chrome145 → chrome142 → chrome136).
+
+    Khác với ``request_phase`` (rotate ở level higher per-flow): UPI cần rotate
+    per-request vì 1 session sống xuyên suốt restart loop, lỗi TLS giữa chừng
+    KHÔNG được phép giết job nếu fallback chain còn impersonate.
+
+    Forward các attribute/method khác qua ``__getattr__`` (vd cookies, headers).
+    Wrap ``post`` / ``get`` / ``request`` (3 verb dùng trong upi flow) bằng
+    retry layer.
+    """
+
+    def __init__(self, impersonate_chain: tuple[str, ...], *, log: LogFn):
+        if not impersonate_chain:
+            raise ValueError("impersonate_chain không được rỗng")
+        self._chain = list(impersonate_chain)
+        self._idx = 0
+        self._log = log
+        self._inner: Any = None
+
+    @staticmethod
+    def _AsyncSessionClass():
+        # Lazy import — tránh load curl_cffi khi module bị import context
+        # khác (vd PyInstaller analyze).
+        from curl_cffi.requests import AsyncSession
+        return AsyncSession
+
+    @property
+    def current_impersonate(self) -> str:
+        return self._chain[self._idx]
+
+    async def __aenter__(self) -> "_RotatingSession":
+        AsyncSessionCls = self._AsyncSessionClass()
+        self._inner = await AsyncSessionCls(
+            impersonate=self.current_impersonate
+        ).__aenter__()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._inner is not None:
+            try:
+                await self._inner.__aexit__(exc_type, exc, tb)
+            except Exception:  # noqa: BLE001 — cleanup best-effort
+                pass
+            self._inner = None
+
+    async def _rotate(self, exc: BaseException) -> bool:
+        """Close inner sess, advance impersonate index, recreate. Trả True
+        nếu rotation thành công, False nếu hết chain."""
+        if self._idx + 1 >= len(self._chain):
+            return False
+        try:
+            await self._inner.__aexit__(type(exc), exc, exc.__traceback__)
+        except Exception:  # noqa: BLE001
+            pass
+        self._inner = None
+        self._idx += 1
+        new_imp = self._chain[self._idx]
+        self._log(_fmt_step(
+            "upi", "tls rotate", "retry",
+            f"impersonate={new_imp} (lý do: {type(exc).__name__})",
+        ))
+        AsyncSessionCls = self._AsyncSessionClass()
+        self._inner = await AsyncSessionCls(impersonate=new_imp).__aenter__()
+        return True
+
+    async def _call_with_retry(self, method_name: str, *args, **kwargs):
+        """Gọi inner.<method_name>(*args, **kwargs). Catch TLS error → rotate
+        + retry. Hết chain → propagate exception cuối."""
+        while True:
+            method = getattr(self._inner, method_name)
+            try:
+                return await method(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                if not _is_tls_error(exc):
+                    raise
+                rotated = await self._rotate(exc)
+                if not rotated:
+                    raise
+
+    async def post(self, *args, **kwargs):
+        return await self._call_with_retry("post", *args, **kwargs)
+
+    async def get(self, *args, **kwargs):
+        return await self._call_with_retry("get", *args, **kwargs)
+
+    async def request(self, *args, **kwargs):
+        return await self._call_with_retry("request", *args, **kwargs)
+
+    def __getattr__(self, name: str):
+        # Forward các attr ít dùng (cookies, headers, ...) vào inner. Bỏ qua
+        # private fields của class này (Python sẽ tự lookup qua __dict__).
+        if name.startswith("_"):
+            raise AttributeError(name)
+        inner = self.__dict__.get("_inner")
+        if inner is None:
+            raise AttributeError(f"_RotatingSession chưa enter context: .{name}")
+        return getattr(inner, name)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -1147,7 +1277,7 @@ async def run_upi_qr_probe(
     )))
 
     # Lazy import → chỉ khi job thật sự chạy.
-    from curl_cffi.requests import AsyncSession
+    from curl_cffi.requests import AsyncSession  # noqa: F401 — kept for type hints
     from .. import stripe_token as _st
     from ..pay_upi_http import _stripe_init
     from ..random_profile import random_india_profile
@@ -1303,7 +1433,7 @@ async def run_upi_qr_probe(
         and len(proxy_pool) > 1
     )
 
-    async with AsyncSession(impersonate=_IMPERSONATE) as sess:
+    async with _RotatingSession(_IMPERSONATE_CHAIN, log=_safe_log) as sess:
         while True:
             phase_idx = restart_count + 1  # 1-based
             phase_tag = f" [p{phase_idx}]" if restart_enabled else ""
