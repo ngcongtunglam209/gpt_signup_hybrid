@@ -33,6 +33,7 @@
     btnCopySuccess:$('upi-btn-copy-success'),
     btnCopyError:  $('upi-btn-copy-error'),
     btnClearDone:  $('upi-btn-clear-done'),
+    btnClearAll:   $('upi-btn-clear-all'),
     btnRetryFailed:$('upi-btn-retry-failed'),
     btnRetryExpiredFree: $('upi-btn-retry-expired-free'),
     // Modal
@@ -887,6 +888,20 @@
     catch (err) { await Dialog.alert({ message: err.message }); }
   });
 
+  dom.btnClearAll.addEventListener('click', async () => {
+    if (!(await Dialog.confirm({
+      message: 'Xoá TẤT CẢ jobs UPI (mọi trạng thái)? Hành động không thể hoàn tác.',
+      danger: true,
+      confirmLabel: 'Xoá',
+    }))) return;
+    try {
+      const res = await api('/api/upi/jobs/clear-all', { method: 'POST' });
+      console.log('[upi] clear-all:', res.removed);
+    } catch (err) {
+      await Dialog.alert({ message: 'Error: ' + err.message });
+    }
+  });
+
   dom.btnRetryFailed.addEventListener('click', async () => {
     if (!(await Dialog.confirm({ message: 'Retry tất cả jobs error & cancelled?' }))) return;
     try {
@@ -1099,6 +1114,21 @@
     else if (data.type === 'remove') applyRemove(data.job_id);
     else if (data.type === 'clear_finished') {
       api('/api/upi/jobs').then(applySnapshot).catch(console.error);
+    }
+    else if (data.type === 'clear_all') {
+      // Cleanup mọi resource frontend trước khi reset state — tránh leak
+      // QR blob URL + timer poll plan + modal đang mở.
+      for (const jid of Array.from(state.jobs.keys())) {
+        revokeQrBlob(jid);
+        _stopPlanPoll(jid);
+      }
+      state.jobs.clear();
+      state.order = [];
+      state.activeJobId = null;
+      if (_modalActiveJobId) closeQrModal();
+      renderJobs();
+      renderOutputs();
+      renderLog(null);
     }
     else if (data.type === 'log') applyLog(data.job_id, data.line);
   });

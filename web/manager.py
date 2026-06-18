@@ -4368,6 +4368,46 @@ class UpiJobManager:
             self._broadcast({"type": "clear_finished", "removed": removed})
         return removed
 
+    async def clear_all(self) -> int:
+        """Xoá TẤT CẢ jobs (mọi status) khỏi memory.
+
+        UPI in-memory only (không persist DB), nên flow đơn giản hơn Reg:
+        drain queue → cancel running tasks → cleanup QR files → clear state →
+        broadcast SSE ``clear_all`` để UI tự dọn.
+        """
+        # Drain queue — tránh worker pick job mới
+        while not self._job_queue.empty():
+            try:
+                self._job_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        # Cancel tất cả running tasks
+        for _jid, task in list(self._tasks.items()):
+            if task and not task.done():
+                task.cancel()
+
+        # Cleanup QR file cho mọi job (không chỉ done) — clear_all xoá hết
+        # nên file QR cũng đi theo, tránh tích tụ trên đĩa.
+        for jid in list(self.order):
+            job = self.jobs.get(jid)
+            if job and job.qr_path:
+                try:
+                    Path(job.qr_path).unlink(missing_ok=True)
+                except OSError as exc:
+                    _log.warning(
+                        "UpiMgr: unlink QR %s failed: %s", job.qr_path, exc
+                    )
+
+        removed = len(self.jobs)
+        self.jobs.clear()
+        self.order.clear()
+        self._tasks.clear()
+
+        if removed:
+            self._broadcast({"type": "clear_all", "removed": removed})
+        return removed
+
     def remove_job(self, job_id: str) -> bool:
         job = self.jobs.get(job_id)
         if job is None:

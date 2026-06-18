@@ -1823,6 +1823,14 @@ async def clear_finished_upi_jobs() -> JSONResponse:
     return JSONResponse({"removed": removed})
 
 
+@app.post("/api/upi/jobs/clear-all")
+async def clear_all_upi_jobs() -> JSONResponse:
+    """Xoá TẤT CẢ UPI jobs (mọi trạng thái). Cancel running, cleanup QR files."""
+    um = get_upi_manager()
+    removed = await um.clear_all()
+    return JSONResponse({"removed": removed})
+
+
 @app.post("/api/upi/jobs/retry-failed")
 async def retry_failed_upi_jobs() -> JSONResponse:
     """Retry tất cả UPI jobs có status error hoặc cancelled."""
