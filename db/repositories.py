@@ -174,9 +174,9 @@ def _validate_type_constraint(key: str, value: Any) -> None:
             raise RepositoryError(
                 "set", TypeError(f"{key}: must be int, got {type(value).__name__}")
             )
-        if not (1 <= value <= 10):
+        if not (1 <= value <= 2):
             raise RepositoryError(
-                "set", ValueError(f"{key}: must be in [1, 10], got {value}")
+                "set", ValueError(f"{key}: must be in [1, 2], got {value}")
             )
         return
 

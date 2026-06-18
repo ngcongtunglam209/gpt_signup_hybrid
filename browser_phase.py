@@ -50,6 +50,24 @@ class BrowserPhaseError(Exception):
     """Phase 1 failed."""
 
 
+class AccountAlreadyExistsError(BrowserPhaseError):
+    """Server trả ``error_code: user_already_exists`` trên ``/about-you``.
+
+    Fatal: account đã tồn tại trong hệ thống OpenAI — KHÔNG retry submit
+    nữa, caller (signup runner) bỏ luôn account này, chuyển combo kế tiếp.
+    Dùng subclass để caller có thể phân biệt nếu cần (vd mark "duplicate"
+    riêng thay vì gộp chung "error"); mặc định caller chỉ catch
+    ``BrowserPhaseError`` → tự nhiên propagate.
+    """
+
+
+# Các error_code của /about-you mà server commit là vĩnh viễn (retry không
+# bao giờ pass). Detect → raise fatal, dừng retry submit ngay.
+_ABOUT_YOU_FATAL_ERROR_CODES: tuple[str, ...] = (
+    "user_already_exists",
+)
+
+
 # Cookies bắt buộc cho Phase 2 (chatgpt.com session).
 _REQUIRED_AUTH_COOKIES = (
     "oai-did",
@@ -1492,6 +1510,19 @@ async def _fill_about_you(page, *, name: str, birthdate: str, timeout_seconds: f
                     form_err = await _detect_about_you_form_error(page)
                     if form_err:
                         log(f"[browser] /about-you form error: {form_err}")
+                        # Fatal error_code (user_already_exists, …) → dừng luôn,
+                        # KHÔNG retry. Server đã commit kết quả, retry vô ích.
+                        err_lower = form_err.lower()
+                        for fatal_code in _ABOUT_YOU_FATAL_ERROR_CODES:
+                            if fatal_code in err_lower:
+                                if fatal_code == "user_already_exists":
+                                    raise AccountAlreadyExistsError(
+                                        f"/about-you: user_already_exists — "
+                                        f"account đã tồn tại, bỏ"
+                                    )
+                                raise BrowserPhaseError(
+                                    f"/about-you fatal error_code: {fatal_code}"
+                                )
                     # Re-check extras (checkbox/TOS xuất hiện sau render)
                     await _check_about_you_extras(page, log=log)
                     # Thử submit lại với chiến thuật escalating

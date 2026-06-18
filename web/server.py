@@ -256,9 +256,9 @@ class AddJobsRequest(BaseModel):
 
 
 class SetConfigRequest(BaseModel):
-    # Bỏ le=10 — frontend mode dropdown share giữa các tab có option Multi (50).
-    # Handler tự clamp về giới hạn của tab tương ứng (Reg=10) trước khi apply,
-    # tránh trả 422 khi user chọn mode > 10 ở tab Reg.
+    # Bỏ le=2 ở schema — frontend mode dropdown share giữa các tab có option
+    # Multi (50). Handler tự clamp về [1, 2] (giới hạn Reg) trước khi apply,
+    # tránh trả 422 khi user chọn mode > 2 ở tab Reg.
     max_concurrent: int | None = Field(default=None, ge=1)
     headless: bool | None = Field(default=None)
     debug: bool | None = Field(default=None)
@@ -445,13 +445,18 @@ async def set_config(payload: SetConfigRequest) -> JSONResponse:
     manager = get_manager()
     sm = get_session_manager()
     lm = get_link_manager()
+    # Clamp 1 lần — dùng cho cả manager apply và write-through Settings Store.
+    # Frontend dropdown share Multi (50) giữa các tab; tab Reg cap [1, 2] (yêu
+    # cầu sản phẩm: Reg multi tối đa 2 song song). Mọi giá trị > 2 (vd user
+    # chọn Multi 5/10/50) đều silent clamp xuống 2 — không trả 422 vì dropdown
+    # share giữa các tab.
+    max_concurrent_clamped: int | None = (
+        max(1, min(payload.max_concurrent, 2))
+        if payload.max_concurrent is not None else None
+    )
     if payload.max_concurrent is not None:
         try:
-            # Silent clamp về [1, 10] (Reg max). Frontend dùng mode dropdown
-            # chung cho mọi tab, có option Multi (50) → giá trị > 10 chỉ áp
-            # dụng đầy đủ cho tab UPI; tab Reg cap silently.
-            clamped = max(1, min(payload.max_concurrent, 10))
-            manager.set_max_concurrent(clamped)
+            manager.set_max_concurrent(max_concurrent_clamped)  # type: ignore[arg-type]
         except ValueError as exc:
             raise HTTPException(400, str(exc))
     if payload.headless is not None:
@@ -501,8 +506,8 @@ async def set_config(payload: SetConfigRequest) -> JSONResponse:
     from db.repositories import RepositoryError
 
     settings_dict: dict[str, Any] = {}
-    if payload.max_concurrent is not None:
-        settings_dict["reg.max_concurrent"] = payload.max_concurrent
+    if max_concurrent_clamped is not None:
+        settings_dict["reg.max_concurrent"] = max_concurrent_clamped
     if payload.headless is not None:
         settings_dict["reg.headless"] = payload.headless
     if payload.debug is not None:

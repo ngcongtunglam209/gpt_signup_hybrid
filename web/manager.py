@@ -619,8 +619,8 @@ class JobManager:
         return self._max
 
     def set_max_concurrent(self, n: int) -> None:
-        if n < 1 or n > 10:
-            raise ValueError("max_concurrent phải trong [1, 10]")
+        if n < 1 or n > 2:
+            raise ValueError("max_concurrent phải trong [1, 2]")
         self._max = n
         self._ensure_workers()
 
@@ -726,8 +726,10 @@ class JobManager:
             self._debug = bool(settings["reg.debug"])
         if "reg.max_concurrent" in settings:
             val = int(settings["reg.max_concurrent"])
-            if 1 <= val <= 10:
-                self._max = val
+            # Cap về 2 — Reg cap [1, 2]. Giá trị cũ trong DB > 2 vẫn silent
+            # clamp xuống thay vì bỏ qua, giữ behavior nhất quán với set_config.
+            if val >= 1:
+                self._max = max(1, min(val, 2))
         _hydrate_proxy_pool_from_settings(settings)
         if "reg.post_reg_get_session" in settings:
             self._post_reg_get_session = bool(settings["reg.post_reg_get_session"])

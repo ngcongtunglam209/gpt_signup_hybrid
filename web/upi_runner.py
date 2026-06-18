@@ -64,6 +64,14 @@ def _is_tls_error(exc: BaseException) -> bool:
     return any(m in msg for m in _TLS_ERROR_MARKERS)
 
 
+# Số lần tối đa recreate inner session (clear corrupt BoringSSL context) cho 1
+# request trước khi propagate exception. Bounded để proxy chết THẬT không loop
+# vô tận — approve loop sẽ tự advance proxy khi request raise. Recovery này chỉ
+# nhắm transient TLS state corruption, không phải proxy down.
+_TLS_RECREATE_MAX_PER_CALL: int = 4
+_TLS_RECREATE_BACKOFF: tuple[float, ...] = (0.5, 1.0, 2.0, 3.0)
+
+
 def _safe_materialize(line: str | None) -> str | None:
     """materialize_proxy nhưng nuốt ValueError (format rác) → None (direct)."""
     if not line:
@@ -415,6 +423,140 @@ def _render_qr_png(payload: str, out_path: Path) -> None:
     image.save(out_path)
 
 
+def _fmt_svg_num(v: float) -> str:
+    """Format số trong SVG attribute: bỏ trailing .0, else 2 chữ số thập phân."""
+    if v == int(v):
+        return str(int(v))
+    return f"{v:.2f}"
+
+
+def _overlay_email_on_qr(qr_path: Path, email: str) -> None:
+    """Vẽ email masked vào dưới ảnh QR (in-place).
+
+    Email mask dùng cùng logic với ``telegram_notifier._mask_email`` để 2 nguồn
+    hiển thị (Telegram caption + ảnh QR) đồng nhất.
+
+    Hỗ trợ PNG (PIL extend canvas) và SVG (parse XML, append ``<rect>``+``<text>``).
+    Detect format qua magic bytes — KHÔNG tin extension (Stripe có thể trả HTML
+    với URL ``.svg``, runner re-render PNG nhưng giữ extension cũ).
+
+    Raise nếu format không nhận diện được hoặc PIL/XML lỗi. Caller chịu trách
+    nhiệm catch + log nhẹ — overlay là enhancement, không block toàn bộ QR.
+    """
+    from .telegram_notifier import _mask_email
+
+    masked = _mask_email(email)
+    head = qr_path.read_bytes()[:32]
+    stripped = head.lstrip()
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        _overlay_email_on_png(qr_path, masked)
+    elif stripped.startswith(b"<?xml") or stripped.startswith(b"<svg"):
+        _overlay_email_on_svg(qr_path, masked)
+    else:
+        raise ValueError(
+            f"unsupported QR image format (magic={head[:8]!r})"
+        )
+
+
+def _overlay_email_on_png(qr_path: Path, masked: str) -> None:
+    """PIL: tạo canvas trắng cao hơn, paste QR + vẽ text masked center bottom."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    with Image.open(qr_path) as src_raw:
+        src = src_raw.convert("RGB")
+    qr_w, qr_h = src.size
+    band_h = max(int(qr_h * 0.12), 48)
+    pad_x = max(int(qr_w * 0.04), 12)
+
+    canvas = Image.new("RGB", (qr_w, qr_h + band_h), color="white")
+    canvas.paste(src, (0, 0))
+
+    # Font scalable (Pillow ≥ 10): load_default(size=N) — repo đã require
+    # qrcode[pil]==8.2 nên Pillow ≥ 10 chắc chắn có. Fail-fast nếu cũ.
+    font_size = max(int(band_h * 0.45), 18)
+    try:
+        font = ImageFont.load_default(size=font_size)
+    except TypeError as exc:
+        raise RuntimeError(
+            "Pillow ≥ 10 required for ImageFont.load_default(size=...)"
+        ) from exc
+
+    draw = ImageDraw.Draw(canvas)
+    bbox = draw.textbbox((0, 0), masked, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    max_w = qr_w - 2 * pad_x
+    if text_w > max_w and text_w > 0:
+        scale = max_w / text_w
+        font_size = max(int(font_size * scale), 12)
+        font = ImageFont.load_default(size=font_size)
+        bbox = draw.textbbox((0, 0), masked, font=font)
+        text_w = bbox[2] - bbox[0]
+        text_h = bbox[3] - bbox[1]
+    x = (qr_w - text_w) // 2 - bbox[0]
+    y = qr_h + (band_h - text_h) // 2 - bbox[1]
+    draw.text((x, y), masked, fill="black", font=font)
+
+    canvas.save(qr_path, format="PNG", optimize=True)
+
+
+def _overlay_email_on_svg(qr_path: Path, masked: str) -> None:
+    """Parse SVG XML, mở rộng viewBox + height, append band trắng + text."""
+    import xml.etree.ElementTree as ET
+
+    NS = "http://www.w3.org/2000/svg"
+    ET.register_namespace("", NS)
+    tree = ET.parse(qr_path)
+    root = tree.getroot()
+    if root.tag.split("}")[-1] != "svg":
+        raise ValueError(f"root element không phải <svg> (tag={root.tag})")
+
+    def _to_float(value: str | None, fallback: float) -> float:
+        if not value:
+            return fallback
+        cleaned = value.strip().replace("px", "")
+        try:
+            return float(cleaned)
+        except ValueError:
+            return fallback
+
+    width = _to_float(root.attrib.get("width"), 320.0)
+    height = _to_float(root.attrib.get("height"), 320.0)
+    vb_raw = root.attrib.get("viewBox") or f"0 0 {width} {height}"
+    parts = vb_raw.split()
+    if len(parts) != 4:
+        raise ValueError(f"viewBox không hợp lệ: {vb_raw!r}")
+    vx, vy, vw, vh = (float(p) for p in parts)
+
+    band_vh = max(vh * 0.12, 48.0)
+    band_h_px = max(height * 0.12, 48.0)
+
+    rect = ET.SubElement(root, f"{{{NS}}}rect")
+    rect.set("x", _fmt_svg_num(vx))
+    rect.set("y", _fmt_svg_num(vy + vh))
+    rect.set("width", _fmt_svg_num(vw))
+    rect.set("height", _fmt_svg_num(band_vh))
+    rect.set("fill", "white")
+
+    text = ET.SubElement(root, f"{{{NS}}}text")
+    text.set("x", _fmt_svg_num(vx + vw / 2))
+    text.set("y", _fmt_svg_num(vy + vh + band_vh * 0.65))
+    text.set("text-anchor", "middle")
+    text.set("font-family", "Arial, Helvetica, sans-serif")
+    text.set("font-size", _fmt_svg_num(band_vh * 0.45))
+    text.set("fill", "black")
+    text.text = masked
+
+    root.set(
+        "viewBox",
+        f"{_fmt_svg_num(vx)} {_fmt_svg_num(vy)} "
+        f"{_fmt_svg_num(vw)} {_fmt_svg_num(vh + band_vh)}",
+    )
+    root.set("height", _fmt_svg_num(height + band_h_px))
+
+    tree.write(qr_path, encoding="utf-8", xml_declaration=True)
+
+
 def _summarize_confirm(attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         {key: a.get(key) for key in (
@@ -532,18 +674,28 @@ def _silent(_: str) -> None:
 
 
 class _RotatingSession:
-    """AsyncSession wrapper với TLS rotation: auto retry mỗi request khi
-    BoringSSL raise lỗi state (`OPENSSL_internal:invalid library`, `(35) TLS
-    connect error`, ...) bằng cách close + recreate inner session với
-    impersonate kế trong chain (chrome145 → chrome142 → chrome136).
+    """AsyncSession wrapper tự hồi phục khi curl_cffi/BoringSSL raise lỗi TLS
+    state (`OPENSSL_internal:invalid library`, `(35) TLS connect error`, ...).
 
-    Khác với ``request_phase`` (rotate ở level higher per-flow): UPI cần rotate
-    per-request vì 1 session sống xuyên suốt restart loop, lỗi TLS giữa chừng
-    KHÔNG được phép giết job nếu fallback chain còn impersonate.
+    Root cause của `invalid library`: curl_cffi AsyncSession reuse pooled TLS
+    connection (keep-alive); khi 1 connection qua proxy xoay bị remote/proxy
+    reset giữa chừng, BoringSSL context của connection đó hỏng, mọi request
+    reuse kế tiếp đều fail (xác nhận: lexiforest/curl_cffi#352 — fix tương
+    đương `force_close=True` của aiohttp). Hai lớp phòng thủ:
 
-    Forward các attribute/method khác qua ``__getattr__`` (vd cookies, headers).
-    Wrap ``post`` / ``get`` / ``request`` (3 verb dùng trong upi flow) bằng
-    retry layer.
+      1. PREVENT — disable connection reuse (``FORBID_REUSE`` + ``FRESH_CONNECT``)
+         nên mỗi request mở connection TLS mới, KHÔNG bao giờ reuse pooled
+         connection đã hỏng. Đây là fix gốc, triệt tiêu corruption từ nguồn.
+      2. RECOVER — nếu vẫn dính lỗi TLS (vd handshake transient), recreate inner
+         session (fresh BoringSSL context) rồi retry. Ưu tiên advance impersonate
+         trong chain (chrome145 → chrome142 → chrome136); chain cạn vẫn recreate
+         với impersonate cuối (KHÔNG dead-end vĩnh viễn như bản cũ — bug khiến
+         session hỏng sau khi cạn chain rồi giết mọi request kế). Bounded
+         ``_TLS_RECREATE_MAX_PER_CALL`` lần/request + backoff để proxy chết THẬT
+         raise sớm, nhường approve loop xoay proxy.
+
+    Session sống xuyên suốt restart loop của 1 job. Forward attr khác (cookies,
+    headers) qua ``__getattr__``. Wrap ``post``/``get``/``request`` bằng retry.
     """
 
     def __init__(self, impersonate_chain: tuple[str, ...], *, log: LogFn):
@@ -561,18 +713,25 @@ class _RotatingSession:
         from curl_cffi.requests import AsyncSession
         return AsyncSession
 
+    @staticmethod
+    def _no_reuse_curl_options() -> dict:
+        """curl options tắt connection reuse → mỗi request 1 connection TLS
+        mới, không reuse pooled connection đã hỏng (root-cause fix)."""
+        from curl_cffi.const import CurlOpt
+        return {CurlOpt.FORBID_REUSE: 1, CurlOpt.FRESH_CONNECT: 1}
+
     @property
     def current_impersonate(self) -> str:
         return self._chain[self._idx]
 
-    async def __aenter__(self) -> "_RotatingSession":
+    async def _open_inner(self, impersonate: str) -> None:
         AsyncSessionCls = self._AsyncSessionClass()
         self._inner = await AsyncSessionCls(
-            impersonate=self.current_impersonate
+            impersonate=impersonate,
+            curl_options=self._no_reuse_curl_options(),
         ).__aenter__()
-        return self
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
+    async def _close_inner(self, exc_type=None, exc=None, tb=None) -> None:
         if self._inner is not None:
             try:
                 await self._inner.__aexit__(exc_type, exc, tb)
@@ -580,29 +739,35 @@ class _RotatingSession:
                 pass
             self._inner = None
 
-    async def _rotate(self, exc: BaseException) -> bool:
-        """Close inner sess, advance impersonate index, recreate. Trả True
-        nếu rotation thành công, False nếu hết chain."""
-        if self._idx + 1 >= len(self._chain):
-            return False
-        try:
-            await self._inner.__aexit__(type(exc), exc, exc.__traceback__)
-        except Exception:  # noqa: BLE001
-            pass
-        self._inner = None
-        self._idx += 1
+    async def __aenter__(self) -> "_RotatingSession":
+        await self._open_inner(self.current_impersonate)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self._close_inner(exc_type, exc, tb)
+
+    async def _recover(self, exc: BaseException) -> None:
+        """Close inner hỏng + recreate fresh session để clear corrupt BoringSSL
+        state. Advance impersonate nếu chain còn, ngược lại giữ impersonate cuối
+        (vẫn recreate — fresh context clear được state dù không đổi fingerprint)."""
+        await self._close_inner(type(exc), exc, exc.__traceback__)
+        advanced = self._idx + 1 < len(self._chain)
+        if advanced:
+            self._idx += 1
         new_imp = self._chain[self._idx]
         self._log(_fmt_step(
-            "upi", "tls rotate", "retry",
-            f"impersonate={new_imp} (lý do: {type(exc).__name__})",
+            "upi", "tls recover", "retry",
+            f"impersonate={new_imp}"
+            f"{'' if advanced else ' (chain cạn → recreate same)'}"
+            f"  lý do={type(exc).__name__}",
         ))
-        AsyncSessionCls = self._AsyncSessionClass()
-        self._inner = await AsyncSessionCls(impersonate=new_imp).__aenter__()
-        return True
+        await self._open_inner(new_imp)
 
     async def _call_with_retry(self, method_name: str, *args, **kwargs):
-        """Gọi inner.<method_name>(*args, **kwargs). Catch TLS error → rotate
-        + retry. Hết chain → propagate exception cuối."""
+        """Gọi inner.<method_name>(*args, **kwargs). Catch TLS error → recover
+        (recreate fresh session) + retry, bounded ``_TLS_RECREATE_MAX_PER_CALL``
+        lần. Hết quota → propagate để caller (approve loop) xoay proxy."""
+        recreate_count = 0
         while True:
             method = getattr(self._inner, method_name)
             try:
@@ -610,9 +775,13 @@ class _RotatingSession:
             except Exception as exc:  # noqa: BLE001
                 if not _is_tls_error(exc):
                     raise
-                rotated = await self._rotate(exc)
-                if not rotated:
+                if recreate_count >= _TLS_RECREATE_MAX_PER_CALL:
                     raise
+                await self._recover(exc)
+                await asyncio.sleep(_TLS_RECREATE_BACKOFF[
+                    min(recreate_count, len(_TLS_RECREATE_BACKOFF) - 1)
+                ])
+                recreate_count += 1
 
     async def post(self, *args, **kwargs):
         return await self._call_with_retry("post", *args, **kwargs)
@@ -1890,6 +2059,19 @@ async def run_upi_qr_probe(
                 qr_reason = f"qrcode render fail: {type(exc).__name__}: {exc}"
         else:
             qr_reason = "no upi:// URI or QR image URL found in any response"
+
+        # Overlay email masked lên ảnh QR (cùng logic mask với Telegram caption).
+        # Best-effort: lỗi overlay log riêng, KHÔNG bỏ qr_path — QR raw vẫn dùng
+        # được. Path canonical đã ghi đè in-place, nên Telegram + web modal +
+        # clipboard tự động dùng ảnh đã có watermark.
+        if qr_path:
+            try:
+                _overlay_email_on_qr(Path(qr_path), email)
+            except Exception as exc:  # noqa: BLE001
+                _safe_log(_fmt_step(
+                    "qr", "overlay", "fail",
+                    f"{type(exc).__name__}: {str(exc)[:200]}",
+                ))
 
         # QR final log + final summary
         if qr_path:
