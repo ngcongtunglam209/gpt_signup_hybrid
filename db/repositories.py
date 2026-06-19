@@ -100,6 +100,7 @@ def _validate_type_constraint(key: str, value: Any) -> None:
         _allowed_modes = (
             "single", "multi", "multi3", "multi5", "multi10",
             "multi20", "multi30", "multi50",
+            "multi100", "multi200",
         )
         if not isinstance(value, str) or value not in _allowed_modes:
             raise RepositoryError(
@@ -376,9 +377,9 @@ def _validate_type_constraint(key: str, value: Any) -> None:
             raise RepositoryError(
                 "set", TypeError(f"{key}: must be int, got {type(value).__name__}")
             )
-        if not (1 <= value <= 50):
+        if not (1 <= value <= 200):
             raise RepositoryError(
-                "set", ValueError(f"{key}: must be in [1, 50], got {value}")
+                "set", ValueError(f"{key}: must be in [1, 200], got {value}")
             )
         return
 

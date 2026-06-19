@@ -4086,8 +4086,8 @@ class UpiJobManager:
         return self._max
 
     def set_max_concurrent(self, n: int) -> None:
-        if n < 1 or n > 50:
-            raise ValueError("max_concurrent phải trong [1, 50]")
+        if n < 1 or n > 200:
+            raise ValueError("max_concurrent phải trong [1, 200]")
         self._max = n
         self._ensure_workers()
 
@@ -4141,7 +4141,7 @@ class UpiJobManager:
         _hydrate_proxy_pool_from_settings(settings)
         if "upi.max_concurrent" in settings:
             val = int(settings["upi.max_concurrent"])
-            if 1 <= val <= 50:
+            if 1 <= val <= 200:
                 self._max = val
         if "upi.job_timeout" in settings:
             val = float(settings["upi.job_timeout"])

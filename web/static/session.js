@@ -292,7 +292,7 @@
     dom.btnRun.disabled = true;
     try {
       // Sync config
-      const _modeMap = { single: 1, multi: 2, multi3: 3, multi5: 5, multi10: 10, multi20: 20, multi30: 30, multi50: 50 };
+      const _modeMap = { single: 1, multi: 2, multi3: 3, multi5: 5, multi10: 10, multi20: 20, multi30: 30, multi50: 50, multi100: 100, multi200: 200 };
       const target = _modeMap[document.getElementById('mode').value] || 1;
       await api('/api/session/config', {
         method: 'POST',

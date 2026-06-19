@@ -373,6 +373,12 @@ def validate_web_recorder_options(options: WebRecorderOptions) -> None:
         raise ValueError("--url must start with http:// or https://")
     if options.browser not in {"camoufox", "chrome", "chromium"}:
         raise ValueError("--browser must be one of: camoufox, chrome, chromium")
+    if options.proxy and not options.proxy.startswith(
+        ("http://", "https://", "socks5://", "socks5h://", "socks4://")
+    ):
+        raise ValueError(
+            "--proxy phải bắt đầu bằng http://, https://, socks5://, socks5h://, hoặc socks4://"
+        )
 
 
 async def fetch_otp(*, api_url: str, email: str, secret: str) -> str:

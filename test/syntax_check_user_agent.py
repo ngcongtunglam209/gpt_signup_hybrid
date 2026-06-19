@@ -304,11 +304,11 @@ def step_upi_no_legacy_hardcode() -> None:
 def step_upi_imports_user_agent_profile() -> None:
     _log("[STEP]", "TC-10 — UPI flow import user_agent_profile")
     expected_imports = {
-        "pay_upi_http.py": "from .user_agent_profile import",
-        "payment_link.py": "from .user_agent_profile import",
-        "stripe_token.py": "from .user_agent_profile import",
-        "record_pay_upi.py": "from .user_agent_profile import",
-        "web/upi_runner.py": "from ..user_agent_profile import",
+        "pay_upi_http.py": "from user_agent_profile import",
+        "payment_link.py": "from user_agent_profile import",
+        "stripe_token.py": "from user_agent_profile import",
+        "record_pay_upi.py": "from user_agent_profile import",
+        "web/upi_runner.py": "from user_agent_profile import",
     }
     for idx, (fname, marker) in enumerate(expected_imports.items(), 1):
         src = (REPO_ROOT / fname).read_text(encoding="utf-8")

@@ -972,8 +972,17 @@ async def get_session_pure_request(
                         pass
                     if _is_tls_error(e) and idx < len(_IMPERSONATE_CANDIDATES) - 1:
                         continue
+                    # Convert RequestPhaseError → SessionError tại boundary để
+                    # caller (upi_runner) chỉ cần catch SessionError. Trước fix
+                    # này, RequestPhaseError từ _step_auth_url leak qua loop login
+                    # retry và thành unhandled exception (không match
+                    # `except SessionError`).
+                    if isinstance(e, RequestPhaseError):
+                        raise SessionError(f"bootstrap failed: {e}") from e
                     raise
             if last_exc:
+                if isinstance(last_exc, RequestPhaseError):
+                    raise SessionError(f"bootstrap failed: {last_exc}") from last_exc
                 raise last_exc
             raise SessionError("bootstrap failed (no auth_url)")
 

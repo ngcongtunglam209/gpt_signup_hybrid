@@ -126,15 +126,15 @@ def t06_manager_validation_ranges():
     async def _run() -> None:
         mgr = get_upi_manager()
         mgr.set_max_concurrent(1)
-        mgr.set_max_concurrent(50)
+        mgr.set_max_concurrent(200)
         try:
             mgr.set_max_concurrent(0)
             raise AssertionError("expected reject 0")
         except ValueError:
             pass
         try:
-            mgr.set_max_concurrent(51)
-            raise AssertionError("expected reject 51")
+            mgr.set_max_concurrent(201)
+            raise AssertionError("expected reject 201")
         except ValueError:
             pass
         mgr.set_approve_retries(1)

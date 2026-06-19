@@ -187,11 +187,77 @@ def _common_headers(referer: str = "https://chatgpt.com/") -> dict[str, str]:
 # ─── Auth state machine steps ─────────────────────────────────────────
 
 
+def _prime_chatgpt_session(session, log: Callable) -> None:
+    """Prime chatgpt.com session bằng GET /auth/login (HTML SSR page).
+
+    Bug observed (verified qua test/diag_login_bootstrap.py):
+        Khi GET trực tiếp `/api/auth/csrf` với jar trống, NextAuth chatgpt.com
+        TRẢ về ``csrfToken`` JSON nhưng KHÔNG set cookie
+        ``__Host-next-auth.csrf-token`` đi kèm. Hệ quả: POST tiếp theo tới
+        ``/api/auth/signin/openai`` bị NextAuth reject với
+        ``{ url: "/api/auth/signin?csrf=true" }`` (CSRF mismatch — body có
+        token nhưng cookie thiếu/khác). Cascade thành HTTP 409 ``invalid_state``
+        khi state machine đi tiếp tới ``authorize/continue``.
+
+    Root cause: chatgpt.com chỉ set cookie csrf-token qua `/api/auth/csrf` KHI
+        jar đã có Cloudflare bot-management cookies (``__cf_bm``, ``_cfuvid``,
+        ``__cflb``). Browser thật luôn navigate qua trang HTML trước khi gọi
+        API → CF cookies tự có. Pure-request hit thẳng API → thiếu CF cookies
+        → server degrade response (giữ token nhưng bỏ Set-Cookie).
+
+    Fix: GET ``/auth/login`` HTML page TRƯỚC ``/api/auth/csrf``. CF middleware
+        sẽ set ``__cf_bm`` + ``__cflb`` + ``_cfuvid`` ở response này. Lần GET
+        ``/api/auth/csrf`` kế tiếp sẽ set csrf-token cookie chuẩn.
+
+    Idempotent: skip nếu jar đã có ``__cf_bm`` (đã prime trước đó trong cùng
+        session). An toàn gọi nhiều lần.
+    """
+    try:
+        if any(c.name == "__cf_bm" for c in session.cookies.jar):
+            return
+    except Exception:
+        # Cookie jar API không expose .jar → fall through, prime lại không hại.
+        pass
+
+    log("[request] [0/9] Priming chatgpt.com session (GET /auth/login)...")
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Referer": "https://chatgpt.com/",
+        "User-Agent": USER_AGENT,
+        "sec-ch-ua": SEC_CH_UA,
+        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "Connection": "keep-alive",
+    }
+    resp = session.get(
+        "https://chatgpt.com/auth/login",
+        headers=headers,
+        timeout=30,
+        allow_redirects=True,
+    )
+    if resp.status_code >= 400:
+        raise RequestPhaseError(
+            f"prime chatgpt session failed: HTTP {resp.status_code}"
+        )
+
+
 def _step_csrf(session, log: Callable) -> str:
     """Step 1: GET chatgpt.com/api/auth/csrf → csrfToken.
 
+    Tự động prime session qua ``_prime_chatgpt_session`` trước để đảm bảo
+    NextAuth set cookie ``__Host-next-auth.csrf-token`` cho lần POST
+    ``/api/auth/signin/openai`` kế tiếp (xem docstring _prime_chatgpt_session).
+
     Retry up to 3x on Cloudflare 403 (transient rate-limit), backoff 5s/10s.
     """
+    _prime_chatgpt_session(session, log)
     log("[request] [1/9] Fetching CSRF token...")
     headers = _common_headers("https://chatgpt.com/auth/login")
     resp = None
@@ -302,9 +368,43 @@ def _step_auth_url(session, csrf_token: str, log: Callable, device_id: str = "",
     )
     if resp.status_code != 200:
         raise RequestPhaseError(f"signin/openai failed: HTTP {resp.status_code}")
-    auth_url = resp.json().get("url", "")
+    try:
+        payload = resp.json()
+    except Exception as exc:
+        body_preview = (resp.text or "")[:400]
+        raise RequestPhaseError(
+            f"signin/openai: non-JSON response (HTTP {resp.status_code}): {body_preview}"
+        ) from exc
+    auth_url = payload.get("url", "") if isinstance(payload, dict) else ""
     if not auth_url:
-        raise RequestPhaseError("signin/openai: no URL in response")
+        raise RequestPhaseError(
+            f"signin/openai: no URL in response — payload={str(payload)[:300]}"
+        )
+
+    # Fail-fast: validate URL trỏ về auth.openai.com (OAuth provider thật).
+    # NextAuth trả URL dạng `<chatgpt.com>/api/auth/signin?csrf=true&...` khi
+    # CSRF validation fail (cookie `__Host-next-auth.csrf-token` không match
+    # body `csrfToken`). Trước đây code accept URL này → đem GET → landing
+    # trên chatgpt.com signin page → fallback gọi `authorize/continue` mà
+    # OpenAI chưa có OAuth session → cascade thành HTTP 409 `invalid_state`.
+    # Validate sớm để báo lỗi đúng chỗ + dump bằng chứng để debug.
+    if "auth.openai.com" not in auth_url:
+        # Dump cookies hiện có (mask value) để diagnose CSRF mismatch.
+        try:
+            cookie_summary = ", ".join(
+                sorted(
+                    f"{c.name}={'<set>' if c.value else '<empty>'}"
+                    for c in session.cookies.jar
+                )
+            )
+        except Exception:
+            cookie_summary = "<unavailable>"
+        raise RequestPhaseError(
+            "signin/openai trả URL không phải auth.openai.com — "
+            "NextAuth từ chối (CSRF/origin/anti-bot). "
+            f"Got: {auth_url[:200]}. Cookies: {cookie_summary[:300]}"
+        )
+
     log(f"[request] Auth URL: {auth_url[:80]}...")
     return auth_url
 

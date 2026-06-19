@@ -28,7 +28,7 @@ def main() -> int:
     src = TARGET.read_text(encoding="utf-8")
 
     expectations = [
-        ("from ..session_phase import SessionError, get_session_pure_request", "import SessionError"),
+        ("from session_phase import SessionError, get_session_pure_request", "import SessionError (absolute)"),
         ("LOGIN_MAX_ATTEMPTS = 3", "constant max attempts"),
         ("LOGIN_RETRY_DELAY = 3.0", "constant delay"),
         ("NON_RETRYABLE_PATTERNS", "non-retryable list"),

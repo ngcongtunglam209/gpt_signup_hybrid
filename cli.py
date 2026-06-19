@@ -394,6 +394,15 @@ def record_cmd(
         "--browser",
         help="Browser engine: camoufox, chrome hoặc chromium.",
     ),
+    proxy: str | None = typer.Option(
+        None,
+        "--proxy",
+        help=(
+            "Proxy URL để khớp môi trường thực (vd http://user:pass@host:port "
+            "hoặc socks5://user:pass@host:port). Bắt buộc khi muốn reproduce "
+            "đúng flow login dùng proxy ở runtime."
+        ),
+    ),
 ) -> None:
     """Record full DOM actions + HAR cho 1 web flow manual."""
     from web_recorder import (
@@ -416,6 +425,7 @@ def record_cmd(
         dry_run=dry_run,
         headless=headless,
         browser=browser,
+        proxy=proxy,
     )
 
     try:

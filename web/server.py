@@ -258,8 +258,8 @@ class AddJobsRequest(BaseModel):
 
 class SetConfigRequest(BaseModel):
     # Bỏ le=2 ở schema — frontend mode dropdown share giữa các tab có option
-    # Multi (50). Handler tự clamp về [1, 2] (giới hạn Reg) trước khi apply,
-    # tránh trả 422 khi user chọn mode > 2 ở tab Reg.
+    # tới Multi (200). Handler tự clamp về [1, 2] (giới hạn Reg) trước khi
+    # apply, tránh trả 422 khi user chọn mode > 2 ở tab Reg.
     max_concurrent: int | None = Field(default=None, ge=1)
     headless: bool | None = Field(default=None)
     debug: bool | None = Field(default=None)
@@ -452,10 +452,10 @@ async def set_config(payload: SetConfigRequest) -> JSONResponse:
     sm = get_session_manager()
     lm = get_link_manager()
     # Clamp 1 lần — dùng cho cả manager apply và write-through Settings Store.
-    # Frontend dropdown share Multi (50) giữa các tab; tab Reg cap [1, 2] (yêu
-    # cầu sản phẩm: Reg multi tối đa 2 song song). Mọi giá trị > 2 (vd user
-    # chọn Multi 5/10/50) đều silent clamp xuống 2 — không trả 422 vì dropdown
-    # share giữa các tab.
+    # Frontend dropdown share đến Multi (200) giữa các tab; tab Reg cap [1, 2]
+    # (yêu cầu sản phẩm: Reg multi tối đa 2 song song). Mọi giá trị > 2 (vd
+    # user chọn Multi 5/10/50/100/200) đều silent clamp xuống 2 — không trả
+    # 422 vì dropdown share giữa các tab.
     max_concurrent_clamped: int | None = (
         max(1, min(payload.max_concurrent, 2))
         if payload.max_concurrent is not None else None
@@ -1873,9 +1873,9 @@ async def set_upi_config(payload: SetUpiConfigRequest) -> JSONResponse:
     settings_writes: dict[str, Any] = {}
     if payload.max_concurrent is not None:
         try:
-            # Silent clamp về [1, 50] (UPI max). Frontend mode dropdown share
+            # Silent clamp về [1, 200] (UPI max). Frontend mode dropdown share
             # giữa các tab; UPI tự cap nếu user truyền giá trị lớn hơn.
-            clamped = max(1, min(payload.max_concurrent, 50))
+            clamped = max(1, min(payload.max_concurrent, 200))
             um.set_max_concurrent(clamped)
             settings_writes["upi.max_concurrent"] = clamped
         except ValueError as exc:
