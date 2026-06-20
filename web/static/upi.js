@@ -91,6 +91,8 @@
 
   // Track jobs đã auto-trigger (open QR + copy + recheck) khi countdown hết.
   // Tránh trigger lặp mỗi giây (updateCountdowns chạy mỗi 1s).
+  // Jobs đã expired lúc page load cũng được add vào set này (trong applySnapshot)
+  // để không auto-trigger cho expired cũ.
   const _autoTriggeredOnExpiry = new Set();
 
   // Auto-poll: tối đa 6 lần check THẬT, mỗi lần cách ~20s tính TỪ lúc lần
@@ -592,8 +594,6 @@
       el.textContent = cd.text;
       el.classList.toggle('upi-countdown-expired', cd.expired);
       // Vừa cross 0 → khởi động auto-poll (self-guard chống spawn trùng).
-      // KHÔNG gọi triggerPlanCheck trực tiếp: hàm này chạy mỗi giây nên sẽ
-      // flood; startPlanPoll dedupe theo _planPollState.
       if (cd.expired) {
         const row = el.closest('[data-id]');
         if (row && row.dataset.id) {
@@ -602,12 +602,18 @@
           // Auto open QR modal + copy QR + recheck — chỉ 1 lần per job.
           if (!_autoTriggeredOnExpiry.has(jobId)) {
             _autoTriggeredOnExpiry.add(jobId);
+            console.log('[upi] auto-trigger on expiry:', jobId);
             const j = state.jobs.get(jobId);
             if (j && j.has_qr) {
-              openQrModal(jobId);
-              copyQrToClipboard(jobId);
+              // Delay nhẹ để DOM ổn định sau renderJobs innerHTML replace
+              setTimeout(() => {
+                openQrModal(jobId);
+                copyQrToClipboard(jobId);
+                triggerPlanCheck(jobId, { force: true });
+              }, 300);
+            } else {
+              triggerPlanCheck(jobId, { force: true });
             }
-            triggerPlanCheck(jobId, { force: true });
           }
         }
       }
@@ -1107,6 +1113,11 @@
     for (const j of snap.jobs) {
       state.jobs.set(j.id, j);
       _maybePrefetchQr(j);
+      // Job đã expired trước khi page load → không auto-trigger open/copy/recheck
+      if (j.status === 'success' && j.qr_expires_at) {
+        const cd = fmtCountdown(j.qr_expires_at);
+        if (cd.expired) _autoTriggeredOnExpiry.add(j.id);
+      }
     }
     renderJobs();
     renderOutputs();

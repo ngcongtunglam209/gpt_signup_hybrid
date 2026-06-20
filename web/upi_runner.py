@@ -781,13 +781,15 @@ class _RotatingSession:
       1. PREVENT — disable connection reuse (``FORBID_REUSE`` + ``FRESH_CONNECT``)
          nên mỗi request mở connection TLS mới, KHÔNG bao giờ reuse pooled
          connection đã hỏng. Đây là fix gốc, triệt tiêu corruption từ nguồn.
-      2. RECOVER — nếu vẫn dính lỗi TLS (vd handshake transient), recreate inner
-         session (fresh BoringSSL context) rồi retry. Ưu tiên advance impersonate
-         trong chain (chrome145 → chrome142 → chrome136); chain cạn vẫn recreate
-         với impersonate cuối (KHÔNG dead-end vĩnh viễn như bản cũ — bug khiến
-         session hỏng sau khi cạn chain rồi giết mọi request kế). Bounded
-         ``_TLS_RECREATE_MAX_PER_CALL`` lần/request + backoff để proxy chết THẬT
-         raise sớm, nhường approve loop xoay proxy.
+      2. RECOVER — nếu vẫn dính lỗi TLS (vd handshake transient do proxy/mạng),
+         recreate inner session (fresh BoringSSL context + connection mới) rồi
+         retry. Trong 1 call có thể advance impersonate như hedge tạm; nhưng
+         KHÔNG degrade vĩnh viễn — mỗi call mới reset về fingerprint primary
+         (chain[0]) qua ``_reset_to_primary`` nên vài SSLError transient không
+         kéo session tụt xuống fingerprint cũ nhất mãi mãi (bug bản cũ: idx tăng
+         vĩnh viễn → kẹt chrome136). Bounded ``_TLS_RECREATE_MAX_PER_CALL``
+         lần/request + backoff để proxy chết THẬT raise sớm, nhường approve loop
+         xoay proxy.
 
     Session sống xuyên suốt restart loop của 1 job. Forward attr khác (cookies,
     headers) qua ``__getattr__``. Wrap ``post``/``get``/``request`` bằng retry.
@@ -841,10 +843,26 @@ class _RotatingSession:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self._close_inner(exc_type, exc, tb)
 
+    async def _reset_to_primary(self) -> None:
+        """Recreate inner session về fingerprint ưu tiên (chain[0]).
+
+        Gọi ở đầu mỗi call khi session đang bị degrade (``_idx != 0``). Lý do:
+        SSLError/curl-35 qua proxy là lỗi tầng kết nối (proxy chập / mạng), KHÔNG
+        phải fingerprint bị CF soi → 1 vài hiccup transient KHÔNG được phép kéo
+        session tụt xuống fingerprint cũ vĩnh viễn. Mỗi request mới bắt đầu lại
+        từ primary; rotation (nếu có) chỉ là hedge tạm trong phạm vi 1 call."""
+        self._idx = 0
+        await self._close_inner()
+        await self._open_inner(self._chain[0])
+
     async def _recover(self, exc: BaseException) -> None:
         """Close inner hỏng + recreate fresh session để clear corrupt BoringSSL
-        state. Advance impersonate nếu chain còn, ngược lại giữ impersonate cuối
-        (vẫn recreate — fresh context clear được state dù không đổi fingerprint)."""
+        state và mở connection TLS mới (root cause của SSLError transient là
+        connection, không phải fingerprint).
+
+        Trong cùng 1 call, advance impersonate như 1 hedge (phòng trường hợp
+        hiếm gặp 1 fingerprint cụ thể bị MITM/proxy chặn). KHÔNG degrade vĩnh
+        viễn: ``_call_with_retry`` reset về primary ở đầu call kế tiếp."""
         await self._close_inner(type(exc), exc, exc.__traceback__)
         advanced = self._idx + 1 < len(self._chain)
         if advanced:
@@ -854,14 +872,19 @@ class _RotatingSession:
             "upi", "tls recover", "retry",
             f"impersonate={new_imp}"
             f"{'' if advanced else ' (chain cạn → recreate same)'}"
-            f"  lý do={type(exc).__name__}",
+            f"  lý do={type(exc).__name__} (transient — proxy/mạng)",
         ))
         await self._open_inner(new_imp)
 
     async def _call_with_retry(self, method_name: str, *args, **kwargs):
         """Gọi inner.<method_name>(*args, **kwargs). Catch TLS error → recover
         (recreate fresh session) + retry, bounded ``_TLS_RECREATE_MAX_PER_CALL``
-        lần. Hết quota → propagate để caller (approve loop) xoay proxy."""
+        lần. Hết quota → propagate để caller (approve loop) xoay proxy.
+
+        Đầu mỗi call: nếu call trước đã degrade fingerprint (``_idx != 0``) thì
+        reset về primary trước — chống tụt vĩnh viễn xuống fingerprint cũ nhất."""
+        if self._idx != 0:
+            await self._reset_to_primary()
         recreate_count = 0
         while True:
             method = getattr(self._inner, method_name)

@@ -753,45 +753,97 @@ def _step_follow_redirects(session, start_url: str, log: Callable) -> tuple[str,
 
 
 def _consume_callback(session, callback_url: str, log: Callable) -> bool:
-    """GET callback URL to trigger NextAuth session cookie set.
+    """Follow callback redirect chain hop-by-hop để NextAuth set + capture
+    session-token cookie vào Python cookie jar.
 
-    Uses allow_redirects=True so curl follows the whole chain in one call
-    (connection reuse, far fewer round-trips than manual hop-by-hop).
+    QUAN TRỌNG — KHÔNG dùng ``allow_redirects=True``: khi libcurl tự follow
+    redirect, cookie ``__Secure-next-auth.session-token`` được set ở response
+    TRUNG GIAN (302 của ``/api/auth/callback/openai``) chỉ nằm trong cookie
+    store nội bộ của libcurl. curl_cffi chỉ sync Set-Cookie của response CUỐI
+    về ``session.cookies`` phía Python → cookie session-token bị mất khỏi jar
+    (dù request kế tiếp tới ``/api/auth/session`` vẫn gửi được nên accessToken
+    vẫn lấy được). Hệ quả: ``session_token`` rỗng dù account đã đăng nhập.
 
-    Returns True khi response chain set được session-token cookie. NextAuth
-    có thể chunk cookie thành ``.0`` / ``.1`` khi value dài (JWT > 4KB), nên
-    check cả 3 variants thay vì chỉ tên gốc — tránh log misleading
-    ``consumed=False`` trong khi cookie đã set thật sự (bug đã quan sát:
-    `verified=True` nhưng `consumed=False` cùng response).
+    Fix: follow từng hop với ``allow_redirects=False`` để curl_cffi sync
+    Set-Cookie của MỖI response về jar — giống ``_step_follow_redirects``.
+
+    NextAuth có thể chunk cookie thành ``.0`` / ``.1`` khi JWT > 4KB; dừng sớm
+    ngay khi ``_read_session_token_cookie`` ghép được token từ jar.
     """
     if not callback_url or "code=" not in callback_url:
         return False
+
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://auth.openai.com/",
+        "User-Agent": USER_AGENT,
+        "sec-ch-ua": SEC_CH_UA,
+        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
+    }
+
+    current = callback_url
     try:
-        session.get(
-            callback_url,
-            headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": "https://auth.openai.com/",
-                "User-Agent": USER_AGENT,
-                "sec-ch-ua": SEC_CH_UA,
-                "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
-                "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
-            },
-            timeout=30,
-            allow_redirects=True,
-        )
-        for name in (
-            "__Secure-next-auth.session-token",
-            "__Secure-next-auth.session-token.0",
-            "__Secure-next-auth.session-token.1",
-        ):
-            if session.cookies.get(name):
+        for _ in range(12):
+            resp = session.get(
+                current, headers=headers, timeout=30, allow_redirects=False,
+            )
+
+            # Cookie có thể được set ở bất kỳ hop nào → check ngay sau mỗi hop.
+            if _read_session_token_cookie(session):
                 return True
-        return False
+
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = (resp.headers.get("Location") or "").strip()
+                if not location:
+                    break
+                if location.startswith("/"):
+                    parsed = urlparse(current)
+                    location = f"{parsed.scheme}://{parsed.netloc}{location}"
+                current = location
+                continue
+            break
+
+        return bool(_read_session_token_cookie(session))
     except Exception as e:
         log(f"[request] Consume callback error: {e}")
         return False
+
+
+def _read_session_token_cookie(session) -> str:
+    """Đọc cookie ``__Secure-next-auth.session-token`` (kèm reassembly chunk).
+
+    NextAuth chunk session-token thành ``.0`` / ``.1`` / ... khi JWT > 4KB
+    (rất thường gặp với account ChatGPT vì payload lớn). curl_cffi
+    ``cookies.get("...session-token")`` chỉ trả cookie tên gốc → rỗng khi bị
+    chunk → ``session_token`` mất trắng dù account đã đăng nhập thật.
+
+    Mirror logic ``http_phase._extract_session_from_handoff``: ưu tiên cookie
+    tên gốc; nếu không có thì ghép các chunk ``.N`` theo thứ tự index tăng dần.
+    """
+    base = session.cookies.get("__Secure-next-auth.session-token", "") or ""
+    if base:
+        return base
+
+    chunks: dict[int, str] = {}
+    prefix = "__Secure-next-auth.session-token."
+    try:
+        for cookie in session.cookies:
+            name = getattr(cookie, "name", "") or ""
+            value = getattr(cookie, "value", "") or ""
+            if name.startswith(prefix) and value:
+                suffix = name[len(prefix):]
+                try:
+                    chunks[int(suffix)] = value
+                except ValueError:
+                    continue
+    except Exception:
+        return ""
+
+    if not chunks:
+        return ""
+    return "".join(chunks[k] for k in sorted(chunks))
 
 
 def _get_session_tokens(session, log: Callable) -> tuple[str, str, str]:
@@ -811,8 +863,8 @@ def _get_session_tokens(session, log: Callable) -> tuple[str, str, str]:
     user = data.get("user", {}) or {}
     user_id = user.get("id", "") or ""
 
-    # Session token from cookie
-    session_token = session.cookies.get("__Secure-next-auth.session-token", "") or ""
+    # Session token from cookie (reassembly chunk .0/.1 nếu NextAuth split JWT).
+    session_token = _read_session_token_cookie(session)
     return session_token, access_token, user_id
 
 

@@ -56,6 +56,8 @@ def materialize_proxy(line: str, *, sid_len: int = 8) -> str:
     - Credential được URL-encode (``quote(safe="")``) → password chứa ``@``/``:``/``/``
       không phá ``urlparse`` ở browser path.
     - URL form (có ``://``) → passthrough (chỉ thay SID, không re-parse/re-encode).
+    - Credential-at form ``user:pass@host:port`` (có ``@``, không ``://``) → prepend
+      ``http://`` passthrough (format phổ biến BrightData/CliProxy/Oxylabs).
 
     Raise ``ValueError`` nếu line rỗng hoặc không đủ ``host:port``.
     """
@@ -72,6 +74,23 @@ def materialize_proxy(line: str, *, sid_len: int = 8) -> str:
     # URL form: caller tự chuẩn → giữ nguyên (không re-encode để khỏi double-quote).
     if "://" in line:
         return line
+
+    # ── Credential-at form: `[user[:pass]@]host:port` ──────────────────────
+    # Nhiều proxy provider cung cấp format `user:pass@host:port` (KHÔNG có
+    # scheme `://`). Nếu có `@` → tách bằng `@` cuối cùng; phần SAU phải
+    # match `host:port` (port toàn digit) → prepend `http://` + passthrough.
+    # Nếu phần SAU @ KHÔNG match host:port → fallback colon-split path cũ
+    # (backward-compat cho edge case user@domain trong colon-form).
+    if "@" in line:
+        at_pos = line.rfind("@")
+        after_at = line[at_pos + 1:]
+        colon_pos = after_at.rfind(":")
+        if colon_pos > 0:
+            host = after_at[:colon_pos]
+            port = after_at[colon_pos + 1:]
+            if host and port and port.isdigit():
+                # Confirmed: `user[:pass]@host:port` form → prepend http://
+                return f"http://{line}"
 
     parts = line.split(":", 3)  # maxsplit=3 → pass giữ được dấu ':'
     n = len(parts)

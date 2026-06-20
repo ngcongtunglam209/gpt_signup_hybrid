@@ -4256,7 +4256,7 @@ class UpiJobManager:
                 self._approve_retries = val
         if "upi.approve_retry_delay" in settings:
             val = float(settings["upi.approve_retry_delay"])
-            if 5.0 <= val <= 60.0:
+            if 2.0 <= val <= 60.0:
                 self._approve_retry_delay = val
         if "upi.approve.restart_threshold" in settings:
             val = int(settings["upi.approve.restart_threshold"])
@@ -4838,7 +4838,13 @@ class UpiJobManager:
             # → rotate cursor) để 2 job UPI song song KHÔNG dùng cùng IP theo
             # lockstep. live_entries() cũ trả order cố định nên mode random vô
             # tác dụng với approve loop (consume pool theo batch index).
-            raw_pool = list(get_proxy_pool().ordered_for_job())
+            #
+            # acquire(): lease 1 proxy theo least-used → first_proxy của các job
+            # ĐANG chạy song song được rải đều (≤N job/N proxy = mỗi job 1 IP
+            # riêng; vượt N = tái dùng IP ít tải nhất). MUST release ở finally.
+            leased_proxy = get_proxy_pool().acquire()
+            job._leased_proxy = leased_proxy  # type: ignore[attr-defined]
+            raw_pool = list(get_proxy_pool().ordered_for_job(first=leased_proxy))
             # Debug log: nếu pool rỗng, log lý do — giúp user phân biệt giữa
             # "chưa cấu hình proxy" vs "proxy bị mark_dead". Mask cả raw line
             # để không leak credentials.
@@ -4998,6 +5004,15 @@ class UpiJobManager:
             self._broadcast_job(job)
         finally:
             self._tasks.pop(job.id, None)
+            # Trả lease proxy đã acquire ở đầu _run_job (least-used balancing).
+            # Best-effort: không để release fail chặn cleanup task.
+            leased = getattr(job, "_leased_proxy", None)
+            if leased:
+                try:
+                    get_proxy_pool().release(leased)
+                except Exception:  # noqa: BLE001
+                    pass
+                job._leased_proxy = None  # type: ignore[attr-defined]
 
     async def _post_timeout_check_plan(self, job_id: str) -> None:
         """Detached: gọi check_plan sau khi job timeout với auth artifacts.

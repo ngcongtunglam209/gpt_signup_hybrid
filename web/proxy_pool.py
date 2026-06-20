@@ -60,6 +60,17 @@ class ProxyPool:
         self._mode: str = "round_robin"
         self._dead: set[str] = set()
         self._cursor: int = 0
+        # Proxy line đứng đầu (first_proxy) của job GẦN NHẤT đã phát qua
+        # ``ordered_for_job``. Dùng cho ``random`` mode để đảm bảo job kế tiếp
+        # KHÔNG nhận lại cùng first_proxy (no-immediate-repeat) — random thuần
+        # cho phép trùng IP liên tiếp khiến user tưởng "kẹt 1 proxy".
+        self._last_first: str | None = None
+        # Lease count: số job ĐANG chạy giữ mỗi proxy (key=raw line). Dùng để
+        # chọn first_proxy theo "least-used" → rải đều giữa các job song song
+        # (≤N job với N proxy → mỗi job 1 IP riêng; vượt N → tái dùng IP ít
+        # tải nhất). acquire() tăng, release() giảm; entry về 0 thì xoá khỏi
+        # dict để introspection sạch.
+        self._leases: dict[str, int] = {}
 
     # ── Config ──────────────────────────────────────────────────────────
 
@@ -82,6 +93,13 @@ class ProxyPool:
                 self._dead = {d for d in self._dead if d in present}
                 if self._cursor >= len(normalized):
                     self._cursor = 0
+                # last_first không còn trong pool → reset để no-repeat không
+                # so sánh với entry đã gỡ.
+                if self._last_first is not None and self._last_first not in present:
+                    self._last_first = None
+                # Drop lease cho proxy đã gỡ khỏi pool (tránh dict phình + lệch
+                # least-used view với entry không còn tồn tại).
+                self._leases = {p: c for p, c in self._leases.items() if p in present}
 
     def reset_dead(self) -> None:
         """Xoá toàn bộ đánh dấu chết — cho mọi proxy cơ hội chạy lại."""
@@ -108,16 +126,62 @@ class ProxyPool:
             self._cursor += 1
             return url
 
-    def ordered_for_job(self) -> list[str]:
+    def acquire(self) -> str | None:
+        """Lease 1 proxy live cho 1 job, chọn theo **least-used** để rải đều.
+
+        Chiến lược (phương án "hạn chế trùng nhiều nhất có thể"):
+          1. Lọc proxy live (loại dead).
+          2. Chọn nhóm có lease count THẤP NHẤT (ít job đang dùng nhất).
+          3. Trong nhóm đó, ưu tiên KHÁC first_proxy job liền trước
+             (no-immediate-repeat), rồi random tie-break.
+          4. Tăng lease cho proxy được chọn + nhớ ``_last_first``.
+
+        → Khi số job song song ≤ số proxy live: mỗi job 1 IP riêng (lease=0
+        cho mỗi proxy mới). Vượt quá: job thừa nhận proxy ít tải nhất, không
+        chờ. Caller PHẢI gọi ``release()`` (finally) khi job kết thúc.
+
+        Pool rỗng / hết live → ``None`` (caller chạy direct).
+        """
+        with self._lock:
+            live = [p for p in self._entries if p not in self._dead]
+            if not live:
+                return None
+            min_load = min(self._leases.get(p, 0) for p in live)
+            candidates = [p for p in live if self._leases.get(p, 0) == min_load]
+            if len(candidates) > 1 and self._last_first in candidates:
+                filtered = [p for p in candidates if p != self._last_first]
+                if filtered:
+                    candidates = filtered
+            choice = random.choice(candidates)
+            self._leases[choice] = self._leases.get(choice, 0) + 1
+            self._last_first = choice
+            return choice
+
+    def release(self, line: str | None) -> None:
+        """Trả lease cho 1 proxy (gọi trong finally của job). Idempotent-safe."""
+        if not line:
+            return
+        with self._lock:
+            cur = self._leases.get(line, 0)
+            if cur <= 1:
+                self._leases.pop(line, None)
+            else:
+                self._leases[line] = cur - 1
+
+    def ordered_for_job(self, first: str | None = None) -> list[str]:
         """Trả list live entries đã sắp xếp theo ``mode`` cho consumer kiểu batch.
 
         Khác ``live_entries()`` (giữ order cố định): method này HONOR mode để
         các consumer tiêu thụ cả pool theo batch (vd UPI approve loop) không
         bị lockstep cùng IP khi chạy nhiều job song song.
 
-        - ``random``: trả copy đã shuffle → mỗi job order khác nhau.
-        - ``round_robin`` / ``probe``: rotate theo cursor → 2 job liên tiếp bắt
-          đầu ở proxy khác nhau (advance cursor 1 bước/job).
+        - ``first`` (raw line, thường lấy từ ``acquire()``): nếu còn live → ghim
+          làm phần tử [0] (= first_proxy login/checkout của job), phần còn lại
+          xáo trộn theo sau. Giúp first_proxy bám đúng proxy đã lease
+          (least-used) → distinct giữa các job song song. ``first`` không còn
+          live → bỏ qua, rơi về order theo ``mode``.
+        - ``random``: shuffle + **no-immediate-repeat** (first khác job trước).
+        - ``round_robin`` / ``probe``: rotate theo cursor (advance 1 bước/job).
 
         Pool rỗng / hết live → ``[]`` (caller chạy direct).
         """
@@ -125,12 +189,26 @@ class ProxyPool:
             live = [p for p in self._entries if p not in self._dead]
             if not live:
                 return []
+            # Ghim proxy đã lease lên đầu (path chính của UPI khi dùng acquire).
+            if first is not None and first in live:
+                rest = [p for p in live if p != first]
+                random.shuffle(rest)
+                self._last_first = first
+                return [first] + rest
             if self._mode == "random":
                 shuffled = live[:]
                 random.shuffle(shuffled)
+                # No-immediate-repeat: nếu còn >1 proxy mà first trùng job
+                # trước → swap phần tử [0] với 1 phần tử khác (cũng ngẫu nhiên)
+                # để IP đổi mà vẫn giữ tính random toàn cục.
+                if len(shuffled) > 1 and shuffled[0] == self._last_first:
+                    swap_idx = random.randint(1, len(shuffled) - 1)
+                    shuffled[0], shuffled[swap_idx] = shuffled[swap_idx], shuffled[0]
+                self._last_first = shuffled[0]
                 return shuffled
             offset = self._cursor % len(live)
             self._cursor += 1
+            self._last_first = live[offset]
             return live[offset:] + live[:offset]
 
     def mark_dead(self, url: str | None) -> bool:

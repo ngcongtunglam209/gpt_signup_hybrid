@@ -541,6 +541,10 @@ def signup_cmd(
     ),
     name: str = typer.Option("ChatGPT User", "--name", help="Tên hiển thị."),
     birthdate: str = typer.Option("2000-01-01", "--birthdate", help="YYYY-MM-DD, tuổi >= 13."),
+    reg_mode: str = typer.Option(
+        "browser", "--reg-mode",
+        help="Registration mode: 'browser' (Camoufox anti-detect) hoặc 'pure_request' (HTTP-only, curl_cffi).",
+    ),
     source_email: str | None = typer.Option(
         None, "--smail",
         help="Mailbox poll OTP (nếu khác email form).",
@@ -604,6 +608,13 @@ def signup_cmd(
 ) -> None:
     """Chạy 1 lần signup hybrid."""
     settings = load_settings()
+
+    if reg_mode not in ("browser", "pure_request"):
+        typer.echo(
+            f"Error: --reg-mode phải là 'browser' hoặc 'pure_request', got {reg_mode!r}.",
+            err=True,
+        )
+        raise typer.Exit(2)
 
     # Resolve combo từ file nếu cần
     if outlook_combo_file is not None:
@@ -707,6 +718,7 @@ def signup_cmd(
         email=email,
         name=name,
         birthdate=birthdate,
+        reg_mode=reg_mode,
         source_email=source_email,
         mail_provider=resolved_provider,
         email_logs_url=logs_url,

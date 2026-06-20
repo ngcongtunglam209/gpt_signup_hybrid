@@ -67,6 +67,8 @@ pub fn sanitize_proxy_text(text: &str) -> String {
 /// - Thay **mọi** `{SID}`/`{sid}` bằng **cùng 1 SID** (gen 1 lần/call).
 /// - Credential URL-encoded → password chứa `@`/`:`/`/` không phá `urlparse`.
 /// - URL form (có `://`) → passthrough (chỉ thay SID, không re-parse/re-encode).
+/// - Credential-at form `user:pass@host:port` (có `@`, không `://`) → prepend
+///   `http://` passthrough (format phổ biến của BrightData/CliProxy/Oxylabs).
 ///
 /// Trả `Err` nếu line rỗng hoặc không đủ `host:port`.
 pub fn materialize_proxy(line: &str, sid_len: usize) -> Result<String> {
@@ -87,6 +89,29 @@ pub fn materialize_proxy(line: &str, sid_len: usize) -> Result<String> {
     // URL form: caller tự chuẩn → giữ nguyên (không re-encode để khỏi double-quote).
     if line.contains("://") {
         return Ok(line);
+    }
+
+    // ── Credential-at form: `[user[:pass]@]host:port` ──────────────────────
+    // Nhiều proxy provider cung cấp format `user:pass@host:port` (KHÔNG có
+    // scheme `://`). Nếu có `@` → tách bằng `@` cuối cùng; phần SAU phải
+    // match `host:port` (port toàn digit) → prepend `http://` + passthrough.
+    // Nếu phần SAU @ KHÔNG match host:port → fallback colon-split path cũ
+    // (backward-compat cho edge case user@domain trong colon-form).
+    if let Some(at_pos) = line.rfind('@') {
+        let after_at = &line[at_pos + 1..];
+        // Check after_at = "host:port" — port phải toàn digits, > 0.
+        if let Some(colon) = after_at.rfind(':') {
+            let host = &after_at[..colon];
+            let port = &after_at[colon + 1..];
+            if !host.is_empty()
+                && !port.is_empty()
+                && port.chars().all(|c| c.is_ascii_digit())
+            {
+                // Confirmed: `user[:pass]@host:port` form → prepend http://
+                return Ok(format!("http://{}", line));
+            }
+        }
+        // after_at không match host:port → fall through vào colon-split path.
     }
 
     // maxsplit=3 → pass giữ được dấu ':'
@@ -237,5 +262,42 @@ mod tests {
     #[test]
     fn mask_empty_is_direct() {
         assert_eq!(mask_proxy(""), "direct");
+    }
+
+    // ── Credential-at form tests ─────────────────────────────────────────
+    #[test]
+    fn credential_at_form_user_pass() {
+        // Format phổ biến BrightData/CliProxy: user:pass@host:port
+        assert_eq!(
+            materialize_proxy("9g5r1200918-region-IN-sid-TsM3NwMX-t-120:kpra1kp6@sg.cliproxy.io:3010", 8).unwrap(),
+            "http://9g5r1200918-region-IN-sid-TsM3NwMX-t-120:kpra1kp6@sg.cliproxy.io:3010"
+        );
+    }
+
+    #[test]
+    fn credential_at_form_user_only() {
+        // user@host:port (no password)
+        assert_eq!(
+            materialize_proxy("myuser@proxy.example.com:8080", 8).unwrap(),
+            "http://myuser@proxy.example.com:8080"
+        );
+    }
+
+    #[test]
+    fn credential_at_form_with_sid() {
+        // user-{sid}:pass@host:port
+        let url = materialize_proxy("user-{sid}:pass@sg.cliproxy.io:3010", 8).unwrap();
+        assert!(url.starts_with("http://user-"));
+        assert!(url.ends_with("@sg.cliproxy.io:3010"));
+    }
+
+    #[test]
+    fn colon_form_user_with_at_in_pass() {
+        // host:port:user:p@ss — colon form nhưng pass chứa @ →
+        // rfind('@') → after_at = "ss" → không có ':' → fallback colon path
+        // → encode p@ss → %40
+        let url = materialize_proxy("h:80:u:p@ss", 8).unwrap();
+        assert!(url.contains("p%40ss"));
+        assert!(url.starts_with("http://u:"));
     }
 }
