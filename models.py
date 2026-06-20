@@ -86,6 +86,15 @@ class SignupRequest(BaseModel):
     # Polling chung
     otp_timeout_seconds: float = Field(default=180.0, ge=10, description="Thời gian tối đa đợi OTP về.")
     otp_poll_interval_seconds: float = Field(default=4.0, ge=0.5)
+    otp_resend_after_seconds: float = Field(
+        default=90.0,
+        ge=15,
+        description=(
+            "Đợi mail OTP bao lâu (giây) trước khi click Resend. "
+            "Mail provider thực tế (iCloud HME, Outlook) có thể delay 1-2 phút — "
+            "set quá thấp sẽ gây spam Resend, dễ bị OpenAI rate-limit."
+        ),
+    )
 
     # Form readiness wait
     sentinel_cookie_timeout_seconds: float = Field(

@@ -14,8 +14,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent))
 
-from gpt_signup_hybrid.web.proxy_format import mask_proxy, materialize_proxy  # noqa: E402
-from gpt_signup_hybrid.web.proxy_health import probe_proxy  # noqa: E402
+from gpt_signup_hybrid_new.web.proxy_format import mask_proxy, materialize_proxy  # noqa: E402
+from gpt_signup_hybrid_new.web.proxy_health import probe_proxy  # noqa: E402
 
 
 async def _main(args) -> int:

@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT.parent))
 
 def main() -> int:
     # Import từ module Python repository
-    from gpt_signup_hybrid.stripe_token import (
+    from gpt_signup_hybrid_new.stripe_token import (
         caesar_shift,
         stripe_encode,
         compute_js_checksum,

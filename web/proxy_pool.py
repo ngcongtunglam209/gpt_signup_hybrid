@@ -108,6 +108,31 @@ class ProxyPool:
             self._cursor += 1
             return url
 
+    def ordered_for_job(self) -> list[str]:
+        """Trả list live entries đã sắp xếp theo ``mode`` cho consumer kiểu batch.
+
+        Khác ``live_entries()`` (giữ order cố định): method này HONOR mode để
+        các consumer tiêu thụ cả pool theo batch (vd UPI approve loop) không
+        bị lockstep cùng IP khi chạy nhiều job song song.
+
+        - ``random``: trả copy đã shuffle → mỗi job order khác nhau.
+        - ``round_robin`` / ``probe``: rotate theo cursor → 2 job liên tiếp bắt
+          đầu ở proxy khác nhau (advance cursor 1 bước/job).
+
+        Pool rỗng / hết live → ``[]`` (caller chạy direct).
+        """
+        with self._lock:
+            live = [p for p in self._entries if p not in self._dead]
+            if not live:
+                return []
+            if self._mode == "random":
+                shuffled = live[:]
+                random.shuffle(shuffled)
+                return shuffled
+            offset = self._cursor % len(live)
+            self._cursor += 1
+            return live[offset:] + live[:offset]
+
     def mark_dead(self, url: str | None) -> bool:
         """Đánh dấu proxy chết → loại khỏi vòng xoay. True nếu vừa mới đánh dấu."""
         if not url:

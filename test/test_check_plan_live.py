@@ -9,7 +9,7 @@ Chạy:
     python test/test_check_plan_live.py        # (trong container/venv có deps)
 
 Monkeypatch: check_plan dùng `from ..session_phase import ...` (local import lúc
-gọi) nên gán attr lên module `gpt_signup_hybrid.session_phase` là đủ override.
+gọi) nên gán attr lên module `gpt_signup_hybrid_new.session_phase` là đủ override.
 """
 from __future__ import annotations
 
@@ -20,9 +20,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent))
 
-import gpt_signup_hybrid.session_phase as sp  # noqa: E402
-from gpt_signup_hybrid.session_phase import SessionError  # noqa: E402
-from gpt_signup_hybrid.web.manager import UpiJob, UpiJobManager  # noqa: E402
+import gpt_signup_hybrid_new.session_phase as sp  # noqa: E402
+from gpt_signup_hybrid_new.session_phase import SessionError  # noqa: E402
+from gpt_signup_hybrid_new.web.manager import UpiJob, UpiJobManager  # noqa: E402
 
 _REQUIRED_KEYS = {"ok", "plan", "is_plus", "expires", "checked_at", "error"}
 

@@ -530,13 +530,37 @@ pub async fn chatgpt_approve_checkout(
         .map(|s| s.to_string());
     let ok = resp.status == 200 && result.as_deref() == Some("approved");
     let keys = collect_keys(&data, 30);
+
+    // Phân loại lỗi non-200: phân biệt Cloudflare edge block vs OpenAI app
+    // error để debug/quản lý proxy. Body được trim còn 200 chars để tránh
+    // ngập log nhưng đủ để nhận dạng (cf-ray, error JSON detail...).
+    let (error_type, error) = if resp.status != 200 {
+        let body_lower = resp.body.to_lowercase();
+        let is_cf = body_lower.contains("cf-ray")
+            || body_lower.contains("cloudflare")
+            || body_lower.contains("just a moment")
+            || body_lower.contains("attention required")
+            || body_lower.contains("<!doctype html");
+        let etype = if is_cf {
+            format!("CFBlock{}", resp.status)
+        } else {
+            format!("HTTP{}", resp.status)
+        };
+        let body_short: String = resp.body.chars().take(200).collect::<String>()
+            .replace('\n', " ")
+            .replace('\r', " ");
+        (Some(etype), Some(body_short))
+    } else {
+        (None, None)
+    };
+
     Ok(ApproveAttempt {
         http_status: Some(resp.status),
         ok,
         result,
         keys,
-        error_type: None,
-        error: None,
+        error_type,
+        error,
         data: if resp.status == 200 { Some(data) } else { None },
     })
 }

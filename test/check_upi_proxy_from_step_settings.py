@@ -39,7 +39,7 @@ def _check(label: str, fn) -> None:
 
 
 def t01_whitelist():
-    from gpt_signup_hybrid.db.repositories import _EXACT_KEYS
+    from gpt_signup_hybrid_new.db.repositories import _EXACT_KEYS
     assert "upi.proxy_from_step" in _EXACT_KEYS, "key missing in _EXACT_KEYS"
     assert "upi.login_via_proxy" not in _EXACT_KEYS, (
         "upi.login_via_proxy không nên có (chỉ dùng 1 key proxy_from_step)"
@@ -47,7 +47,7 @@ def t01_whitelist():
 
 
 def t02_type_constraint():
-    from gpt_signup_hybrid.db.repositories import (
+    from gpt_signup_hybrid_new.db.repositories import (
         _validate_type_constraint, RepositoryError,
     )
     # Accept range
@@ -71,7 +71,7 @@ def t02_type_constraint():
 
 def t03_runner_signature():
     import inspect
-    from gpt_signup_hybrid.web.upi_runner import run_upi_qr_probe
+    from gpt_signup_hybrid_new.web.upi_runner import run_upi_qr_probe
     sig = inspect.signature(run_upi_qr_probe)
     assert "proxy_from_step" in sig.parameters, "thiếu kwarg proxy_from_step"
     p = sig.parameters["proxy_from_step"]
@@ -81,7 +81,7 @@ def t03_runner_signature():
 
 def t04_manager_hydration():
     import asyncio
-    from gpt_signup_hybrid.web.manager import UpiJobManager
+    from gpt_signup_hybrid_new.web.manager import UpiJobManager
 
     async def _run() -> None:
         mgr = UpiJobManager()
@@ -111,7 +111,7 @@ def t04_manager_hydration():
 
 
 def t05_pydantic_accept():
-    from gpt_signup_hybrid.web.server import SetUpiConfigRequest
+    from gpt_signup_hybrid_new.web.server import SetUpiConfigRequest
     req = SetUpiConfigRequest(proxy_from_step=1)
     assert req.proxy_from_step == 1
     req = SetUpiConfigRequest(proxy_from_step=6)
@@ -139,7 +139,7 @@ def t06_endpoint_writethrough():
 
 
 def t07_const_unchanged():
-    from gpt_signup_hybrid.web.upi_runner import PROXY_FROM_STEP
+    from gpt_signup_hybrid_new.web.upi_runner import PROXY_FROM_STEP
     assert PROXY_FROM_STEP == 3, (
         f"PROXY_FROM_STEP phải giữ = 3 (backward-compat), got {PROXY_FROM_STEP}"
     )

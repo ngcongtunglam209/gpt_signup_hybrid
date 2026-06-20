@@ -11,8 +11,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent))
 
-from gpt_signup_hybrid.db.engine import DatabaseEngine  # noqa: E402
-from gpt_signup_hybrid.db.repositories import (  # noqa: E402
+from gpt_signup_hybrid_new.db.engine import DatabaseEngine  # noqa: E402
+from gpt_signup_hybrid_new.db.repositories import (  # noqa: E402
     RepositoryError,
     SettingsRepository,
     _EXACT_KEYS,

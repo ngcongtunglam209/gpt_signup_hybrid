@@ -836,46 +836,52 @@ async def _drive_signup_flow(
 
         if screen == "otp":
             # Detect "incorrect code" error → thử code kế (nếu có) hoặc resend + poll
-            try:
-                err_el = page.locator('[role="alert"], [class*="error"]').first
-                err_text = await err_el.text_content(timeout=200)
-                if err_text and any(k in err_text.lower() for k in ("incorrect", "wrong", "invalid", "expired")):
-                    # Clear input trước
-                    try:
-                        otp_inp = page.locator('input[name="code"]').first
-                        await otp_inp.fill("")
-                    except Exception:
-                        pass
-                    # Nếu còn pending code (mail delay) → thử ngay, không resend
-                    if pending_codes:
-                        next_code = pending_codes.pop(0)
-                        log(f"[flow] OTP rejected: {err_text.strip()[:60]} — thử code kế: {next_code}")
-                        otp_selector = await _wait_otp_form(page, timeout_seconds=5.0, log=log)
-                        await _submit_otp(ctx, page, otp_code=next_code, otp_selector=otp_selector, log=log)
-                        tried_codes.add(next_code)
-                        otp_submitted = True
-                        _otp_submit_ts = time.monotonic()
-                        _otp_reclick_done = False
-                        _otp_js_submit_done = False
-                        _otp_api_done = False
+            # Gate bằng `otp_submitted`: chỉ check error sau khi đã submit ít nhất 1 OTP.
+            # Lý do: trang /email-verification fresh load có thể có element
+            # `[role="alert"]` hoặc class chứa "error" với text khớp keyword
+            # ("expired", "invalid"...) cho mục đích banner thông tin/validation hint
+            # → false positive trigger Resend → gửi mail OTP thứ 2 dù chưa submit code nào.
+            if otp_submitted:
+                try:
+                    err_el = page.locator('[role="alert"], [class*="error"]').first
+                    err_text = await err_el.text_content(timeout=200)
+                    if err_text and any(k in err_text.lower() for k in ("incorrect", "wrong", "invalid", "expired")):
+                        # Clear input trước
+                        try:
+                            otp_inp = page.locator('input[name="code"]').first
+                            await otp_inp.fill("")
+                        except Exception:
+                            pass
+                        # Nếu còn pending code (mail delay) → thử ngay, không resend
+                        if pending_codes:
+                            next_code = pending_codes.pop(0)
+                            log(f"[flow] OTP rejected: {err_text.strip()[:60]} — thử code kế: {next_code}")
+                            otp_selector = await _wait_otp_form(page, timeout_seconds=5.0, log=log)
+                            await _submit_otp(ctx, page, otp_code=next_code, otp_selector=otp_selector, log=log)
+                            tried_codes.add(next_code)
+                            otp_submitted = True
+                            _otp_submit_ts = time.monotonic()
+                            _otp_reclick_done = False
+                            _otp_js_submit_done = False
+                            _otp_api_done = False
+                            same_screen_count = 0
+                            await asyncio.sleep(2.0)
+                            continue
+                        # Không còn pending → resend
+                        log(f"[flow] OTP rejected: {err_text.strip()[:80]} — resend email & poll lại")
+                        try:
+                            resend_btn = page.locator('button:has-text("Resend"), a:has-text("Resend")').first
+                            await resend_btn.click(timeout=3000)
+                            log("[flow] clicked 'Resend email'")
+                        except Exception as exc:
+                            log(f"[flow] resend button not found: {exc}")
+                        # Reset state để poll code mới
+                        otp_submitted = False
+                        _otp_submit_ts = None
                         same_screen_count = 0
                         await asyncio.sleep(2.0)
-                        continue
-                    # Không còn pending → resend
-                    log(f"[flow] OTP rejected: {err_text.strip()[:80]} — resend email & poll lại")
-                    try:
-                        resend_btn = page.locator('button:has-text("Resend"), a:has-text("Resend")').first
-                        await resend_btn.click(timeout=3000)
-                        log("[flow] clicked 'Resend email'")
-                    except Exception as exc:
-                        log(f"[flow] resend button not found: {exc}")
-                    # Reset state để poll code mới
-                    otp_submitted = False
-                    _otp_submit_ts = None
-                    same_screen_count = 0
-                    await asyncio.sleep(2.0)
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
             if otp_submitted:
                 # Đã submit rồi, đợi page chuyển.
@@ -941,12 +947,12 @@ async def _drive_signup_flow(
             log(f"[flow] polling OTP (recipient={recipient}) since {poll_started.isoformat()}")
             
             # Poll OTP, skip codes đã thử.
-            # Nếu đợi >30s chưa có code mới → click Resend rồi poll tiếp.
+            # Nếu đợi >resend_after_seconds chưa có code mới → click Resend rồi poll tiếp.
             # iCloud có thể gửi mail mới trước, mail cũ delay → lấy nhiều codes
             # rồi thử lần lượt trước khi resend.
-            resend_after_seconds = 30.0
+            resend_after_seconds = float(request.otp_resend_after_seconds)
             resend_count = 0
-            max_resends = 3  # tối đa resend 3 lần trong 1 lượt OTP
+            max_resends = 2  # tối đa resend 2 lần — nhiều hơn dễ bị OpenAI rate-limit
             stale_poll_count = 0  # đếm lần poll liên tiếp chỉ nhận code cũ
             stale_poll_resend_threshold = 5  # sau 5 lần poll chỉ code cũ → resend
             while True:

@@ -123,6 +123,30 @@ def _is_tls_error(exc: BaseException) -> bool:
     return any(m in msg for m in markers)
 
 
+def _is_cloudflare_block_error(exc: BaseException) -> bool:
+    """Detect HTTP 403 từ chatgpt.com prime/csrf → Cloudflare bot-management
+    flag JA3/JA4 fingerprint cụ thể.
+
+    CF rate-limit / fingerprint-flag thường target 1 impersonate. Rotate sang
+    Chrome 142 / 136 (chain ``_IMPERSONATE_CANDIDATES``) thường bypass được.
+    Pattern này paralle với ``_is_tls_error`` — cùng trigger rotation chain
+    trong ``_bootstrap_with_tls_rotation`` / ``session_phase._do_bootstrap``.
+    """
+    msg = str(exc).lower()
+    if "http 403" not in msg:
+        return False
+    # Restrict marker để 403 từ endpoint khác (vd Stripe, OAuth) KHÔNG nhầm
+    # trigger rotation — chỉ chatgpt.com prime/csrf cần fingerprint rotation.
+    markers = ("prime chatgpt session", "csrf fetch")
+    return any(m in msg for m in markers)
+
+
+def _is_rotatable_error(exc: BaseException) -> bool:
+    """Bao trùm error đáng rotate impersonate fingerprint:
+    TLS handshake (curl_cffi) OR Cloudflare 403 fingerprint flag."""
+    return _is_tls_error(exc) or _is_cloudflare_block_error(exc)
+
+
 # ─── Sentinel ─────────────────────────────────────────────────────────
 
 
@@ -236,15 +260,27 @@ def _prime_chatgpt_session(session, log: Callable) -> None:
         "Upgrade-Insecure-Requests": "1",
         "Connection": "keep-alive",
     }
-    resp = session.get(
-        "https://chatgpt.com/auth/login",
-        headers=headers,
-        timeout=30,
-        allow_redirects=True,
-    )
-    if resp.status_code >= 400:
+    # Retry up to 3x on Cloudflare 403 (transient bot-management challenge),
+    # backoff 5s/10s — đồng bộ pattern `_step_csrf`. Cùng host (chatgpt.com)
+    # → cùng kiểu lỗi: CF middleware đôi khi trả 403 trước khi cấp __cf_bm,
+    # retry với jar warm sau 5-10s thường pass.
+    resp = None
+    for attempt in range(3):
+        resp = session.get(
+            "https://chatgpt.com/auth/login",
+            headers=headers,
+            timeout=30,
+            allow_redirects=True,
+        )
+        if resp.status_code == 403 and attempt < 2:
+            wait = (attempt + 1) * 5
+            log(f"[request] prime 403, retrying in {wait}s ({attempt + 1}/3)...")
+            time.sleep(wait)
+            continue
+        break
+    if resp is None or resp.status_code >= 400:
         raise RequestPhaseError(
-            f"prime chatgpt session failed: HTTP {resp.status_code}"
+            f"prime chatgpt session failed: HTTP {resp.status_code if resp else '?'}"
         )
 
 
@@ -303,7 +339,7 @@ def _bootstrap_with_tls_rotation(
         session = _create_session(proxy=proxy, impersonate=impersonate)
         try:
             if idx > 0:
-                log(f"[request] TLS rotation: retrying with impersonate={impersonate}")
+                log(f"[request] fingerprint rotation: retrying with impersonate={impersonate}")
             device_id = str(uuid.uuid4())
             csrf = _step_csrf(session, log)
             auth_url = _step_auth_url(session, csrf, log, device_id=device_id, login_hint=login_hint)
@@ -317,14 +353,17 @@ def _bootstrap_with_tls_rotation(
                 session.close()
             except Exception:
                 pass
-            if _is_tls_error(e) and idx < len(_IMPERSONATE_CANDIDATES) - 1:
+            # Rotate impersonate khi: TLS handshake fail HOẶC CF 403 flag JA3
+            # (cùng impersonate retry vô ích — phải đổi fingerprint Chrome).
+            if _is_rotatable_error(e) and idx < len(_IMPERSONATE_CANDIDATES) - 1:
                 continue
             raise
     # Exhausted all fingerprints
-    if last_exc and _is_tls_error(last_exc):
+    if last_exc and _is_rotatable_error(last_exc):
         raise RequestPhaseError(
-            "TLS handshake failed with all impersonate fingerprints — "
-            "network cannot reach chatgpt.com over HTTPS. Try a different proxy."
+            f"Bootstrap failed với mọi impersonate fingerprint "
+            f"({len(_IMPERSONATE_CANDIDATES)}× tried) — Cloudflare flag IP "
+            f"hoặc network không reach chatgpt.com. Last error: {last_exc}"
         ) from last_exc
     if last_exc:
         raise last_exc
@@ -1057,7 +1096,7 @@ def _run_request_phase_sync(
                 stale_poll_resend_threshold = 5  # 5 lần code cũ liên tiếp → resend lại
                 inner_resend_count = 0
                 inner_max_resends = 2  # tối đa resend thêm 2 lần trong vòng retry này
-                resend_after_seconds = 30.0  # mini-timeout per poll call
+                resend_after_seconds = float(request.otp_resend_after_seconds)
                 poll_interval = max(5.0, request.otp_poll_interval_seconds)
 
                 _poll_deadline = time.monotonic() + request.otp_timeout_seconds

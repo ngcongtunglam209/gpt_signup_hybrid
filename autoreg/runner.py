@@ -264,6 +264,8 @@ class AutoRegRunner:
             if self._cancel_event.is_set():
                 return
 
+            email_proxy: str | None = None
+            email_proxy_line: str | None = None
             try:
                 prefix = f"[{email}]" if max_attempts == 1 else f"[{email}][attempt {attempt}/{max_attempts}]"
                 await self._log("info", f"{prefix} Starting signup", {"email": email, "attempt": attempt})
@@ -272,7 +274,7 @@ class AutoRegRunner:
                 # Proxy lấy từ pool rotation (round_robin/random) để mỗi email
                 # tránh trùng IP. Pool rỗng → None (direct).
                 from web.manager import _resolve_job_proxy
-                email_proxy = _resolve_job_proxy()
+                email_proxy, email_proxy_line = await _resolve_job_proxy()
                 worker_config = self._resolve_worker_config(self._config)
                 spec = get_spec("worker")
                 parsed = spec.parse_line(email)
@@ -306,6 +308,8 @@ class AutoRegRunner:
 
                 if not result.success:
                     error_msg = result.error or "signup failed"
+                    # Loại proxy lỗi network khỏi pool (mark_dead key = raw line, F-J).
+                    self._note_proxy_failure(email_proxy_line, error_msg, prefix=prefix)
                     # Retry?
                     if attempt < max_attempts:
                         delay = self._config.auto_retry_delay * attempt
@@ -391,6 +395,8 @@ class AutoRegRunner:
                 raise
             except Exception as exc:
                 error_msg = f"{type(exc).__name__}: {exc}"
+                # Loại proxy lỗi network khỏi pool (mark_dead key = raw line, F-J).
+                self._note_proxy_failure(email_proxy_line, exc, prefix=prefix)
                 if attempt < max_attempts:
                     delay = self._config.auto_retry_delay * attempt
                     await self._log("warn", f"{prefix} {error_msg} — retry in {delay:.0f}s", {
@@ -405,6 +411,35 @@ class AutoRegRunner:
                 })
                 await self._mark_email_failed(email)
                 return
+
+    def _note_proxy_failure(self, line: str | None, exc_or_msg, *, prefix: str = "") -> None:
+        """Mark proxy line chết khi gặp lỗi network — key = raw pool line (F-J).
+
+        Idempotent: ``ProxyPool.mark_dead`` trả False nếu line đã chết / không
+        thuộc pool, nên gọi nhiều lần an toàn. Conservative: chỉ mark khi
+        ``_is_proxy_network_error`` confirm đúng pattern proxy/network, tránh
+        kill oan vì lỗi nghiệp vụ (Stripe decline, OTP wrong, captcha…).
+        """
+        if not line:
+            return
+        from web.manager import _is_proxy_network_error, _mask_proxy
+        from web.proxy_pool import get_proxy_pool
+
+        if not _is_proxy_network_error(exc_or_msg):
+            return
+        if not get_proxy_pool().mark_dead(line):
+            return
+        # Log fire-and-forget — đừng để logging fail chặn flow signup.
+        try:
+            asyncio.create_task(
+                self._log(
+                    "warn",
+                    f"{prefix} [proxy] {_mask_proxy(line)} lỗi network — loại khỏi pool",
+                    {"proxy": _mask_proxy(line)},
+                )
+            )
+        except RuntimeError:
+            pass
 
     async def _mark_email_failed(self, email: str) -> None:
         """Update icloud_emails status → 'disabled' để không bị pick lại.

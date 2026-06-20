@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent))
 
-from gpt_signup_hybrid.web.proxy_pool import ProxyPool  # noqa: E402
+from gpt_signup_hybrid_new.web.proxy_pool import ProxyPool  # noqa: E402
 
 
 def t01_dead_masked() -> int:

@@ -23,7 +23,7 @@ use crate::upi::qr::{download_qr_image, render_qr_png};
 use crate::upi::types::{
     ApproveAttemptSummary, ConfirmAttemptSummary, RefreshAttemptSummary, UpiAuth, UpiQrResult,
 };
-use anyhow::Result;
+use std::collections::HashSet;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -72,20 +72,7 @@ pub fn mask_email(email: &str) -> String {
 }
 
 pub fn mask_proxy(proxy: &str) -> String {
-    if proxy.is_empty() {
-        return "direct".into();
-    }
-    if !proxy.contains('@') {
-        return proxy.to_string();
-    }
-    if let Some(scheme_end) = proxy.find("://") {
-        let scheme = &proxy[..scheme_end];
-        let rest = &proxy[scheme_end + 3..];
-        if let Some(at) = rest.rfind('@') {
-            return format!("{}://***@{}", scheme, &rest[at + 1..]);
-        }
-    }
-    "***".into()
+    crate::proxy_format::mask_proxy(proxy)
 }
 
 fn proxy_for_step<'a>(
@@ -575,6 +562,10 @@ pub async fn run_upi_qr(
         }
         let mut consec_be: u32 = 0;
         let mut consec_net: u32 = 0;
+        // Log body chi tiết cho mỗi http status mới gặp trong approve loop —
+        // giúp phân biệt Cloudflare edge block (HTML, cf-ray) vs OpenAI app
+        // error (JSON detail) để chẩn đoán proxy reputation vs auth/session.
+        let mut seen_error_statuses: HashSet<u16> = HashSet::new();
 
         let approve_started = Instant::now();
         while approve_index_total < cfg.approve_retries {
@@ -629,6 +620,23 @@ pub async fn run_upi_qr(
                     .unwrap_or_else(|| "—".into()),
                 proxy_mask
             ));
+            // Lần đầu gặp 1 status code lỗi (>=400) → log thêm body short để
+            // chẩn đoán Cloudflare vs OpenAI. De-dup theo status để tránh spam
+            // khi 100 attempt đều cùng 403.
+            if !attempt.ok {
+                if let Some(status) = attempt.http_status {
+                    if status >= 400 && seen_error_statuses.insert(status) {
+                        if let Some(body) = attempt.error.as_deref() {
+                            log(&format!(
+                                "            first-seen http={} type={} body={}",
+                                status,
+                                attempt.error_type.as_deref().unwrap_or("-"),
+                                body
+                            ));
+                        }
+                    }
+                }
+            }
             if attempt.ok {
                 approved = true;
                 break;

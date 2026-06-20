@@ -6,7 +6,7 @@ account. Logic giống probe nhưng:
     - Trả dict result + log qua callback.
     - Hardcoded các knob theo yêu cầu UI:
         promo=True, proxy_from_step=3, do_confirm=True, do_approve=True,
-        approve_delay=3.0, approve_proxy_batch=3,
+        approve_delay=3.0, approve_proxy_batch=10,
         approve_backend_exception_consecutive=0  (DISABLED — 0 nghĩa là không
             bao giờ fatal-break vì backend_exception flaky; loop chỉ dừng
             khi approved hoặc hết approve_retries),
@@ -34,8 +34,25 @@ from typing import Any, Callable
 
 from user_agent_profile import (
     CURL_IMPERSONATE_PRIMARY as _IMPERSONATE,
-    CURL_IMPERSONATE_CANDIDATES as _IMPERSONATE_CHAIN,
 )
+
+# [FIX-CHROME142-FIRST-2026-06-20] — local override chain, ưu tiên chrome142
+# Lý do: CF Bot Management soi TLS hello của chrome145 (mới hơn) chặt hơn
+# chrome142 → approve loop dính 403 hit đầu mỗi proxy mới. Đặt 142 đầu chain
+# để _RotatingSession khởi tạo BoringSSL context với fingerprint 142, fallback
+# 145/136 khi TLS error.
+#
+# Scope: CHỈ trong upi_runner. KHÔNG đổi `CURL_IMPERSONATE_PRIMARY` toàn cục
+# vì sẽ ảnh hưởng signup/MFA/session_phase (đã verify chrome145 OK ở các flow
+# đó — đổi global = rủi ro side-effect rộng).
+#
+# REVERT: xoá block này + restore import:
+#     from user_agent_profile import (
+#         CURL_IMPERSONATE_PRIMARY as _IMPERSONATE,
+#         CURL_IMPERSONATE_CANDIDATES as _IMPERSONATE_CHAIN,
+#     )
+_IMPERSONATE_CHAIN: tuple[str, ...] = ("chrome142", "chrome145", "chrome136")
+
 from .proxy_format import materialize_proxy
 from .proxy_format import sanitize_proxy_text as _sanitize_proxy  # canonical (DRY, F-E)
 
@@ -127,7 +144,7 @@ PROXY_FROM_STEP: int = 3
 DO_CONFIRM: bool = True
 DO_APPROVE: bool = True
 APPROVE_DELAY: float = 5.0
-APPROVE_PROXY_BATCH: int = 3
+APPROVE_PROXY_BATCH: int = 10
 # Số lần `result=exception http=200` LIÊN TIẾP để fatal-break approve loop.
 # Default = 0 → DISABLED: backend_exception KHÔNG bao giờ làm dừng sớm; loop
 # chỉ dừng khi `approved=True` hoặc hết `approve_retries` user cấu hình.
@@ -1359,6 +1376,65 @@ async def _chatgpt_approve_checkout(
     }
 
 
+# [FIX-CF-WARMUP-2026-06-20] — GET chatgpt.com để CF set __cf_bm trước
+# khi gọi /approve. Lý do: hit đầu của 1 proxy mới luôn dính CF challenge
+# 403 (chưa có cookie __cf_bm). Sau warm-up, cookie nằm trong jar của
+# AsyncSession → approve request kế tiếp không bị 403 nữa.
+#
+# Best-effort: bất kỳ exception/non-200 đều nuốt + log warn, KHÔNG fail
+# approve loop (warm-up fail không có nghĩa proxy chết — cứ cho approve thử).
+#
+# Caller: gọi 1 lần mỗi khi sang batch proxy mới (xem call site trong
+# while-loop của approve, ở chỗ `if batch_idx not in _approve_mat_cache:`).
+#
+# REVERT: xoá hàm này + xoá `await _warm_cf_cookie(...)` ở call site.
+async def _warm_cf_cookie(
+    sess: Any,
+    *,
+    proxies: dict[str, str] | None,
+    log: LogFn,
+) -> None:
+    from pay_upi_http import _USER_AGENT
+    from user_agent_profile import (
+        SEC_CH_UA as _SEC_CH_UA,
+        SEC_CH_UA_MOBILE as _SEC_CH_UA_MOBILE,
+        SEC_CH_UA_PLATFORM as _SEC_CH_UA_PLATFORM,
+    )
+    headers = {
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-IN,en;q=0.9",
+        "User-Agent": _USER_AGENT,
+        "sec-ch-ua": _SEC_CH_UA,
+        "sec-ch-ua-mobile": _SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": _SEC_CH_UA_PLATFORM,
+        "sec-fetch-dest": "document",
+        "sec-fetch-mode": "navigate",
+        "sec-fetch-site": "none",
+        "sec-fetch-user": "?1",
+        "upgrade-insecure-requests": "1",
+    }
+    try:
+        resp = await sess.get(
+            "https://chatgpt.com/", headers=headers, timeout=15, proxies=proxies,
+        )
+        status = resp.status_code
+    except Exception as exc:  # noqa: BLE001
+        log(_fmt_step(
+            "6/6", "cf-warmup", "warn",
+            f"skip ({type(exc).__name__}: {str(exc)[:80]}) — approve sẽ tự xoay nếu 403",
+        ))
+        return
+    # 200/403 đều có Set-Cookie __cf_bm; chỉ flag warn cho status lạ.
+    icon = "ok" if status in (200, 403) else "warn"
+    log(_fmt_step(
+        "6/6", "cf-warmup", icon,
+        f"http={status}  proxy={_mask_proxy((proxies or {}).get('https'))}",
+    ))
+
+
 def _is_backend_exception(attempt: dict[str, Any]) -> bool:
     return attempt.get("http_status") == 200 and attempt.get("result") == "exception"
 
@@ -1975,6 +2051,14 @@ async def run_upi_qr_probe(
                 batch_idx = (proxy_virtual_attempt - 1) // APPROVE_PROXY_BATCH
                 if batch_idx not in _approve_mat_cache:
                     _approve_mat_cache[batch_idx] = _safe_materialize(raw_approve_proxy)
+                    # [FIX-CF-WARMUP-2026-06-20] proxy mới → warm CF cookie
+                    # trước approve đầu của batch (giảm 403 hit đầu).
+                    # REVERT: xoá block await này + xoá hàm _warm_cf_cookie.
+                    await _warm_cf_cookie(
+                        sess,
+                        proxies=_proxy_dict(_approve_mat_cache[batch_idx]),
+                        log=_safe_log,
+                    )
                 approve_proxy = _approve_mat_cache[batch_idx]  # concrete URL (no {SID})
                 try:
                     approve_attempt = await _chatgpt_approve_checkout(

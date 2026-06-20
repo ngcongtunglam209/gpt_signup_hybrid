@@ -60,6 +60,16 @@ impl Settings {
                 banned_by INTEGER,
                 banned_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
             );
+
+            -- Per-user proxy override. user_id PK → 1 user = 1 proxy line. Lưu
+            -- raw line/template (host:port[:user[:pass]] hoặc scheme URL) — mọi
+            -- consumer phải materialize trước khi feed reqwest. Proxy của user
+            -- KHÔNG share sang user khác (private per-user store).
+            CREATE TABLE IF NOT EXISTS user_proxies (
+                user_id INTEGER PRIMARY KEY,
+                raw     TEXT NOT NULL,
+                set_at  INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
+            );
             "#,
         )?;
         Ok(Self {
@@ -149,6 +159,21 @@ impl Settings {
             .optional()?
             .flatten();
         Ok(name)
+    }
+
+    /// chat_id đã lưu của user (cho DM trực tiếp). None nếu user chưa từng
+    /// kết nối bot. Với private chat, chat_id thường == user_id nhưng vẫn đọc
+    /// từ store để chính xác (group/forwarded edge case).
+    pub fn chat_id_for_user(&self, user_id: i64) -> Result<Option<i64>> {
+        let cid = self
+            .lock()
+            .query_row(
+                "SELECT chat_id FROM bot_users WHERE user_id = ?1",
+                params![user_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?;
+        Ok(cid)
     }
 
     /// (user_id, chat_id) của mọi user KHÔNG bị ban — danh sách đích broadcast.
@@ -249,5 +274,41 @@ impl Settings {
             out.push(r?);
         }
         Ok(out)
+    }
+
+    // ── user_proxies ──────────────────────────────────────────────────────
+    /// Set proxy raw line cho user (upsert). Caller PHẢI validate qua
+    /// `proxy_format::validate_and_mask` trước. `raw` lưu nguyên (template/SID
+    /// cho rotate sticky session ở consumer).
+    pub fn set_user_proxy(&self, user_id: i64, raw: &str) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO user_proxies(user_id, raw) VALUES(?1, ?2)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 raw    = excluded.raw,
+                 set_at = CAST(strftime('%s','now') AS INTEGER)",
+            params![user_id, raw],
+        )?;
+        Ok(())
+    }
+
+    /// Lấy raw proxy line của user (None nếu chưa set).
+    pub fn get_user_proxy(&self, user_id: i64) -> Result<Option<String>> {
+        let raw = self
+            .lock()
+            .query_row(
+                "SELECT raw FROM user_proxies WHERE user_id = ?1",
+                params![user_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(raw)
+    }
+
+    /// Xóa proxy của user. Trả `true` nếu có row bị xóa.
+    pub fn remove_user_proxy(&self, user_id: i64) -> Result<bool> {
+        let n = self
+            .lock()
+            .execute("DELETE FROM user_proxies WHERE user_id = ?1", params![user_id])?;
+        Ok(n > 0)
     }
 }

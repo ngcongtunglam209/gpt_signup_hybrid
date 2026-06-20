@@ -57,7 +57,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT.parent))
 
 try:
-    from gpt_signup_hybrid.user_agent_profile import (
+    from gpt_signup_hybrid_new.user_agent_profile import (
         CURL_IMPERSONATE_PRIMARY,
         SEC_CH_UA,
         SEC_CH_UA_MOBILE,
@@ -233,7 +233,7 @@ async def _probe_session(*, cookies: Any, proxy: str | None, impersonate: str) -
     """So sánh baseline: /api/auth/session (cookie-auth) → accountPlan/planType."""
     try:
         try:
-            from gpt_signup_hybrid.session_phase import fetch_session_via_http
+            from gpt_signup_hybrid_new.session_phase import fetch_session_via_http
         except ImportError:
             from session_phase import fetch_session_via_http  # type: ignore
         data = await fetch_session_via_http(

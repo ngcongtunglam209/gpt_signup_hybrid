@@ -30,7 +30,7 @@ def _check(label: str, fn) -> None:
 
 
 def t01_import_runner():
-    from gpt_signup_hybrid.web.upi_runner import (
+    from gpt_signup_hybrid_new.web.upi_runner import (
         run_upi_qr_probe,
         UpiQrResult,
         UpiQrError,
@@ -56,7 +56,7 @@ def t01_import_runner():
 
 
 def t02_import_manager():
-    from gpt_signup_hybrid.web.manager import UpiJob, UpiJobManager, get_upi_manager
+    from gpt_signup_hybrid_new.web.manager import UpiJob, UpiJobManager, get_upi_manager
     mgr = get_upi_manager()
     assert isinstance(mgr, UpiJobManager)
     assert mgr.max_concurrent == 1
@@ -72,7 +72,7 @@ def t02_import_manager():
 
 
 def t03_settings_keys_whitelist():
-    from gpt_signup_hybrid.db.repositories import _EXACT_KEYS, _validate_type_constraint
+    from gpt_signup_hybrid_new.db.repositories import _EXACT_KEYS, _validate_type_constraint
     for key in ("upi.max_concurrent", "upi.job_timeout", "upi.approve_retries"):
         assert key in _EXACT_KEYS, f"{key} chưa nằm trong _EXACT_KEYS"
     # Validate type constraint
@@ -101,7 +101,7 @@ def t03_settings_keys_whitelist():
 
 
 def t04_reg_mode_extended():
-    from gpt_signup_hybrid.db.repositories import _validate_type_constraint
+    from gpt_signup_hybrid_new.db.repositories import _validate_type_constraint
     for v in ("single", "multi", "multi3", "multi5", "multi10",
               "multi20", "multi30", "multi50"):
         _validate_type_constraint("reg.mode", v)
@@ -113,7 +113,7 @@ def t04_reg_mode_extended():
 
 
 def t05_ui_active_tab_includes_upi():
-    from gpt_signup_hybrid.db.repositories import _validate_type_constraint
+    from gpt_signup_hybrid_new.db.repositories import _validate_type_constraint
     _validate_type_constraint("ui.active_tab", "upi")
     _validate_type_constraint("ui.active_tab", "reg")
     _validate_type_constraint("ui.active_tab", "session")
@@ -121,7 +121,7 @@ def t05_ui_active_tab_includes_upi():
 
 def t06_manager_validation_ranges():
     import asyncio as _asyncio
-    from gpt_signup_hybrid.web.manager import get_upi_manager
+    from gpt_signup_hybrid_new.web.manager import get_upi_manager
 
     async def _run() -> None:
         mgr = get_upi_manager()
@@ -158,7 +158,7 @@ def t06_manager_validation_ranges():
 
 def t07_apply_settings():
     import asyncio as _asyncio
-    from gpt_signup_hybrid.web.manager import UpiJobManager
+    from gpt_signup_hybrid_new.web.manager import UpiJobManager
 
     async def _run() -> None:
         # Tạo instance riêng — singleton đã shutdown ở t06.
@@ -178,7 +178,7 @@ def t07_apply_settings():
 
 def t08_add_jobs_parser():
     import asyncio as _asyncio
-    from gpt_signup_hybrid.web.manager import UpiJobManager
+    from gpt_signup_hybrid_new.web.manager import UpiJobManager
 
     async def _run() -> None:
         mgr = UpiJobManager()
@@ -208,7 +208,7 @@ def t09_server_routes():
     """Verify FastAPI app có đầy đủ /api/upi/* routes."""
     # Lazy import — vì server.py có @app.on_event("startup") cần engine.
     import importlib.util
-    spec = importlib.util.find_spec("gpt_signup_hybrid.web.server")
+    spec = importlib.util.find_spec("gpt_signup_hybrid_new.web.server")
     assert spec is not None, "không import được module server.py"
     # Dùng AST tránh trigger startup event:
     import ast
@@ -257,7 +257,7 @@ def t11_qrcode_installed():
 
 
 def t12_sse_mux_channel_order():
-    from gpt_signup_hybrid.web.sse_mux import SseMux
+    from gpt_signup_hybrid_new.web.sse_mux import SseMux
     mux = SseMux()
     # Generate snapshots với 0 fns đã đăng ký → empty list, không crash.
     snapshots = mux.generate_snapshots()

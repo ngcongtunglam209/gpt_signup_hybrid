@@ -877,7 +877,7 @@ async def get_session_pure_request(
         _get_session_tokens,
         _step_resend_otp,
         _step_verify_otp,
-        _is_tls_error,
+        _is_rotatable_error,
         _IMPERSONATE_CANDIDATES,
         RequestPhaseError,
         USER_AGENT,
@@ -970,7 +970,14 @@ async def get_session_pure_request(
                         sess.close()
                     except Exception:
                         pass
-                    if _is_tls_error(e) and idx < len(_IMPERSONATE_CANDIDATES) - 1:
+                    # Rotate impersonate khi: TLS handshake fail HOẶC CF 403
+                    # flag JA3 (cùng impersonate retry vô ích — phải đổi
+                    # fingerprint Chrome trong _IMPERSONATE_CANDIDATES).
+                    if _is_rotatable_error(e) and idx < len(_IMPERSONATE_CANDIDATES) - 1:
+                        log(
+                            f"[session-req] fingerprint rotation: "
+                            f"{type(e).__name__} → next impersonate"
+                        )
                         continue
                     # Convert RequestPhaseError → SessionError tại boundary để
                     # caller (upi_runner) chỉ cần catch SessionError. Trước fix

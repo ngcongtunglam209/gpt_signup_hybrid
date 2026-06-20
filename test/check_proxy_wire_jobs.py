@@ -15,7 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent))
 
-import gpt_signup_hybrid.web.manager as mgr  # noqa: E402
+import gpt_signup_hybrid_new.web.manager as mgr  # noqa: E402
 
 SRC = (ROOT / "web" / "manager.py").read_text(encoding="utf-8")
 TREE = ast.parse(SRC)
@@ -61,10 +61,15 @@ def t01_resolve_is_coro() -> int:
 
 def t02_begin_empty_pool() -> int:
     job = types.SimpleNamespace()
+    self_dummy = types.SimpleNamespace(_use_proxy=True)
+    # _begin_job_proxy → self._resolve_proxy_for_job → _resolve_job_proxy → acquire.
+    self_dummy._resolve_proxy_for_job = types.MethodType(
+        mgr.JobManager._resolve_proxy_for_job, self_dummy
+    )
     orig = mgr.acquire_live_proxy
     try:
         mgr.acquire_live_proxy = _fake_acquire(None, None)
-        _run(mgr.JobManager._begin_job_proxy(types.SimpleNamespace(), job, lambda m: None))
+        _run(mgr.JobManager._begin_job_proxy(self_dummy, job, lambda m: None))
     finally:
         mgr.acquire_live_proxy = orig
     if job._active_proxy is not None or job._active_proxy_line is not None:
@@ -76,12 +81,16 @@ def t02_begin_empty_pool() -> int:
 
 def t03_begin_active_pool() -> int:
     job = types.SimpleNamespace()
+    self_dummy = types.SimpleNamespace(_use_proxy=True)
+    self_dummy._resolve_proxy_for_job = types.MethodType(
+        mgr.JobManager._resolve_proxy_for_job, self_dummy
+    )
     pool = mgr.get_proxy_pool()
     pool.configure([], mode="probe")
     orig = mgr.acquire_live_proxy
     try:
         mgr.acquire_live_proxy = _fake_acquire("http://u-abc12345:p@h:1", "h:1:u-{SID}:p")
-        _run(mgr.JobManager._begin_job_proxy(types.SimpleNamespace(), job, lambda m: None))
+        _run(mgr.JobManager._begin_job_proxy(self_dummy, job, lambda m: None))
     finally:
         mgr.acquire_live_proxy = orig
         pool.configure([], mode="round_robin")
@@ -160,17 +169,20 @@ def t07_rerun_acquire_before_loop() -> int:
     if node is None:
         print("[FAIL] t07 rerun_link_for_job not found", flush=True)
         return 1
-    # _resolve_job_proxy KHÔNG nằm trong For attempt loop (acquire 1 lần trước loop)
+    # Code refactor: rerun gọi self._resolve_proxy_for_job (wrap _resolve_job_proxy)
+    # → method này tự set _active_proxy_line; caller chỉ cần acquire 1 lần trước loop.
     for sub in ast.walk(node):
         if isinstance(sub, ast.For):
-            if "_resolve_job_proxy" in ast.dump(sub):
-                print("[FAIL] t07 _resolve_job_proxy nằm TRONG attempt loop (re-acquire)", flush=True)
+            if "_resolve_proxy_for_job" in ast.dump(sub):
+                print("[FAIL] t07 _resolve_proxy_for_job nằm TRONG attempt loop (re-acquire)", flush=True)
                 return 1
-    if "_resolve_job_proxy" not in ast.dump(node):
+    if "_resolve_proxy_for_job" not in ast.dump(node):
         print("[FAIL] t07 rerun không acquire", flush=True)
         return 1
-    if "_active_proxy_line" not in ast.dump(node):
-        print("[FAIL] t07 rerun không set _active_proxy_line", flush=True)
+    # _resolve_proxy_for_job body phải set _active_proxy_line (single source of truth).
+    resolver = _func_node("_resolve_proxy_for_job")
+    if resolver is None or "_active_proxy_line" not in ast.dump(resolver):
+        print("[FAIL] t07 _resolve_proxy_for_job không set _active_proxy_line", flush=True)
         return 1
     print("[PASS] t07 rerun_link acquire 1 lần trước loop + set line (F-M)", flush=True)
     return 0
@@ -181,9 +193,13 @@ def t08_2fa_sets_fields() -> int:
     if node is None:
         print("[FAIL] t08 _run_2fa_only_inner not found", flush=True)
         return 1
-    dump = ast.dump(node)
-    if "_resolve_job_proxy" not in dump or "_active_proxy_line" not in dump:
-        print("[FAIL] t08 _run_2fa_only_inner không acquire/set line", flush=True)
+    if "_resolve_proxy_for_job" not in ast.dump(node):
+        print("[FAIL] t08 _run_2fa_only_inner không acquire qua _resolve_proxy_for_job", flush=True)
+        return 1
+    # field-set responsibility moved into _resolve_proxy_for_job (DRY).
+    resolver = _func_node("_resolve_proxy_for_job")
+    if resolver is None or "_active_proxy_line" not in ast.dump(resolver):
+        print("[FAIL] t08 _resolve_proxy_for_job không set _active_proxy_line", flush=True)
         return 1
     print("[PASS] t08 _run_2fa_only_inner acquire + set fields (F-M)", flush=True)
     return 0
@@ -203,7 +219,11 @@ def t09_knob_load_once() -> int:
         mgr._PROXY_KNOBS_CACHE = None  # buộc load qua _current_proxy_knobs
 
         job = types.SimpleNamespace()
-        _run(mgr.JobManager._begin_job_proxy(types.SimpleNamespace(), job, lambda m: None))
+        self_dummy = types.SimpleNamespace(_use_proxy=True)
+        self_dummy._resolve_proxy_for_job = types.MethodType(
+            mgr.JobManager._resolve_proxy_for_job, self_dummy
+        )
+        _run(mgr.JobManager._begin_job_proxy(self_dummy, job, lambda m: None))
         # simulate 3 retries reuse cached knobs (KHÔNG load lại)
         for _ in range(3):
             _run(mgr._resolve_job_proxy(knobs=job._proxy_knobs))

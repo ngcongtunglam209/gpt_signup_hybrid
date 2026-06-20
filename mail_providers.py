@@ -317,6 +317,12 @@ _OUTLOOK_REFRESH_TOTAL_TIMEOUT = 15.0  # hard cap cho toàn bộ token refresh (
 # Raise terminal error để job kết thúc nhanh thay vì chờ OTP timeout (180s).
 _OUTLOOK_CONNECT_FAIL_THRESHOLD = 3
 
+# Grace window cho filter `receivedDateTime < started_at`. Đề phòng caller set
+# `started_at` lệch sau khi mail đã thực sự về (ví dụ browser_phase đặt
+# poll_started SAU khi đợi OTP form load → mail có thể về sớm hơn vài giây).
+# 30s đủ rộng để bắt mail OTP đến nhanh, vẫn loại được mail từ session cũ.
+_OUTLOOK_GRAPH_DATE_GRACE = timedelta(seconds=30)
+
 # Auth-fail strings → combo dead vĩnh viễn (revoke / disabled / format invalid)
 _OUTLOOK_AUTH_FATAL_KEYS = (
     "invalid_grant",
@@ -605,13 +611,20 @@ class OutlookMailProvider:
                         top=5,
                     )
                     consecutive_transient = 0  # reset khi 1 round thành công
+                    threshold = (
+                        started_at - _OUTLOOK_GRAPH_DATE_GRACE
+                        if started_at is not None else None
+                    )
                     for msg in messages:
                         received = _parse_dt(msg.get("receivedDateTime"))
-                        # Chỉ accept mail received SAU started_at (hoặc cùng giây).
-                        # started_at đã được reset = NOW sau set password trong browser_phase,
-                        # nên mail OTP cũ (trước set password) sẽ bị skip.
-                        if received is not None and started_at is not None:
-                            if received < started_at:
+                        # Chỉ accept mail received SAU started_at (trừ grace).
+                        # Trước đây so trực tiếp `received < started_at` → khi
+                        # caller set started_at vài giây sau khi mail đã về (vd
+                        # browser_phase chờ form load 2-3s) thì mail đúng bị
+                        # loại. Grace 30s cover khoảng lệch này, vẫn rớt mail
+                        # OTP từ session cũ (cách đây vài phút trở lên).
+                        if received is not None and threshold is not None:
+                            if received < threshold:
                                 continue
                         sender = (
                             (msg.get("from") or {}).get("emailAddress", {}).get("address", "")
@@ -677,6 +690,14 @@ _DONGVANFB_HEADERS = {
 # offset rồi convert sang UTC để so sánh với started_at (UTC). Trước đây gán nhầm
 # tzinfo=UTC khiến lệch +7h → filter started_at vô hiệu, lấy nhầm OTP cũ.
 _DONGVANFB_TZ = timezone(timedelta(hours=7))
+
+# Grace window cho filter date của DongVanFB.
+# - API trả date precision = phút (HH:MM) → mất tới 59s độ chính xác.
+# - Mail OpenAI thi thoảng tới chỉ vài giây sau khi click submit → có thể về
+#   trước khi caller kịp set `started_at`.
+# Đặt 90s để cover cả 2 case mà vẫn loại được mail OTP cũ từ session reg trước
+# (cách đây vài phút trở lên).
+_DONGVANFB_DATE_GRACE = timedelta(seconds=90)
 
 
 def _parse_dongvanfb_date(date_str: str) -> datetime | None:
@@ -744,14 +765,18 @@ class DongVanFBOutlookProvider:
         async with self._build_client() as client:
             attempt = 0
             consecutive_errors = 0
-            # Baseline-by-value: chống OTP stale triệt để, độc lập độ phân giải
-            # phút của API. Vòng poll THÀNH CÔNG đầu tiên ghi nhận mọi code OpenAI
-            # đang có trong inbox = "cũ" (gửi trước thời điểm bắt đầu poll). Các
-            # vòng sau chỉ chấp nhận code MỚI xuất hiện (không thuộc baseline).
-            # started_at được set ngay trước khi gửi OTP nên baseline phản ánh
-            # đúng trạng thái pre-send (email mới chưa kịp về ở vòng đầu ~1s).
-            seen_codes: set[str] = set()
-            baseline_captured = False
+            # Filter mail theo date thay vì baseline-by-value.
+            # Trước đây: vòng poll #1 capture mọi code OpenAI có sẵn = "cũ" rồi
+            # các vòng sau chỉ accept code MỚI ngoài baseline. Bug: nếu mail
+            # OTP về kịp trong vòng đầu (DongVanFB cache nhanh, mail server
+            # cùng region) → code đúng bị nhầm là "cũ" → loop đến timeout.
+            # Giờ: chỉ chấp nhận mail có date >= (started_at - grace). Mail OTP
+            # cũ từ session trước (vài phút trở lên) sẽ rớt ngoài window.
+            threshold = started_at - _DONGVANFB_DATE_GRACE
+            log(
+                f"[otp:dongvanfb] filter window: date >= {threshold.isoformat()} "
+                f"(started_at={started_at.isoformat()}, grace={_DONGVANFB_DATE_GRACE.total_seconds():.0f}s)"
+            )
             while True:
                 attempt += 1
                 try:
@@ -774,8 +799,7 @@ class DongVanFBOutlookProvider:
                             consecutive_errors = 0
                             messages: list[dict] = data.get("messages") or []
 
-                            # Sort mới nhất trước theo date (đã fix tz UTC+7) để khi
-                            # có nhiều code mới thì ưu tiên code gửi gần nhất.
+                            # Sort mới nhất trước theo date (đã fix tz UTC+7).
                             def _msg_dt(m: dict) -> datetime:
                                 return (
                                     _parse_dongvanfb_date(m.get("date") or "")
@@ -784,44 +808,42 @@ class DongVanFBOutlookProvider:
 
                             messages_sorted = sorted(messages, key=_msg_dt, reverse=True)
 
-                            # Trích code OpenAI hợp lệ theo thứ tự mới → cũ.
-                            openai_codes: list[str] = []
+                            stale_count = 0
                             for msg in messages_sorted:
                                 sender = str(msg.get("from") or "")
                                 subject = str(msg.get("subject") or "")
+                                msg_dt = _parse_dongvanfb_date(msg.get("date") or "")
+                                # Skip mail không parse được date — không thể
+                                # phân biệt cũ/mới, chấp nhận false-positive an
+                                # toàn hơn là nhặt nhầm code cũ.
+                                if msg_dt is None:
+                                    continue
+                                if msg_dt < threshold:
+                                    stale_count += 1
+                                    continue
                                 code = str(msg.get("code") or "").strip()
                                 if not (code and len(code) == 6 and code.isdigit()):
                                     code = _extract_otp(subject, str(msg.get("message") or "")) or ""
                                 if not code:
                                     continue
-                                if _is_openai_sender(sender) or "openai" in subject.lower():
-                                    openai_codes.append(code)
-                                else:
+                                if not (_is_openai_sender(sender) or "openai" in subject.lower()):
                                     log(
                                         f"[otp:dongvanfb] suspicious code {code} "
                                         f"from {sender!r} — skip (non-OpenAI sender)"
                                     )
-
-                            if not baseline_captured:
-                                seen_codes.update(openai_codes)
-                                baseline_captured = True
+                                    continue
                                 log(
-                                    f"[otp:dongvanfb] baseline {len(seen_codes)} code cũ "
-                                    f"— chờ code MỚI sau khi gửi (attempt {attempt})"
+                                    f"[otp:dongvanfb] found {code} "
+                                    f"(date={msg_dt.isoformat()}, attempt {attempt})"
                                 )
-                            else:
-                                for code in openai_codes:  # mới nhất trước
-                                    if code not in seen_codes:
-                                        log(
-                                            f"[otp:dongvanfb] found NEW {code} "
-                                            f"(attempt {attempt})"
-                                        )
-                                        return code
-                                if attempt <= 3 or attempt % 5 == 0:
-                                    log(
-                                        f"[otp:dongvanfb] chưa có code mới, "
-                                        f"{len(messages)} messages (attempt {attempt})"
-                                    )
+                                return code
+
+                            if attempt <= 3 or attempt % 5 == 0:
+                                log(
+                                    f"[otp:dongvanfb] chưa có mail OpenAI mới "
+                                    f"(total={len(messages)}, stale={stale_count}, "
+                                    f"attempt {attempt})"
+                                )
 
                     if consecutive_errors >= 3:
                         raise OutlookProviderUnavailable(

@@ -53,7 +53,7 @@ def t01_syntax() -> int:
 
 
 def t02_upiqrresult_fields() -> int:
-    from gpt_signup_hybrid.web.upi_runner import UpiQrResult
+    from gpt_signup_hybrid_new.web.upi_runner import UpiQrResult
 
     fields = {f for f in UpiQrResult.__dataclass_fields__}
     needed = {"access_token", "session_cookies"}
@@ -76,7 +76,7 @@ def t02_upiqrresult_fields() -> int:
 
 
 def t03_upijob_fields() -> int:
-    from gpt_signup_hybrid.web.manager import UpiJob
+    from gpt_signup_hybrid_new.web.manager import UpiJob
 
     fields = {f for f in UpiJob.__dataclass_fields__}
     needed = {"_access_token", "_session_cookies", "plan_check"}
@@ -93,7 +93,7 @@ def t03_upijob_fields() -> int:
 
 
 def t04_to_dict_shape() -> int:
-    from gpt_signup_hybrid.web.manager import UpiJob
+    from gpt_signup_hybrid_new.web.manager import UpiJob
 
     j = UpiJob(id="x", email="a@b.c", password="p")
     d = j.to_dict()
@@ -120,7 +120,7 @@ def t04_to_dict_shape() -> int:
 
 
 def t05_check_plan_method() -> int:
-    from gpt_signup_hybrid.web.manager import UpiJobManager
+    from gpt_signup_hybrid_new.web.manager import UpiJobManager
 
     fn = getattr(UpiJobManager, "check_plan", None)
     if fn is None:
@@ -139,7 +139,7 @@ def t05_check_plan_method() -> int:
 
 
 def t06_extract_plan() -> int:
-    from gpt_signup_hybrid.web.manager import _extract_plan_from_session
+    from gpt_signup_hybrid_new.web.manager import _extract_plan_from_session
 
     cases = [
         ({"accountPlan": "plus"}, "plus"),
@@ -253,7 +253,7 @@ def t09_css_classes() -> int:
 
 
 def t10_parse_entitlement() -> int:
-    from gpt_signup_hybrid.session_phase import _parse_entitlement_plan
+    from gpt_signup_hybrid_new.session_phase import _parse_entitlement_plan
 
     def ent(plan, active, expires=None):
         return {"accounts": {"default": {"entitlement": {
@@ -299,7 +299,7 @@ def t10_parse_entitlement() -> int:
 
 
 def t11_fetch_entitlement_signature() -> int:
-    from gpt_signup_hybrid.session_phase import fetch_account_entitlement
+    from gpt_signup_hybrid_new.session_phase import fetch_account_entitlement
 
     if not asyncio.iscoroutinefunction(fetch_account_entitlement):
         print("[FAIL] TC-11 fetch_entitlement :: phải là async", flush=True)

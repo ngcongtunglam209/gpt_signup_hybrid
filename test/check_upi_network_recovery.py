@@ -22,7 +22,7 @@ def _fail(idx: str, label: str, detail: str) -> None:
 
 
 def t01_constants() -> bool:
-    from gpt_signup_hybrid.web.upi_runner import (
+    from gpt_signup_hybrid_new.web.upi_runner import (
         NETWORK_FAIL_DETECT,
         NETWORK_PROBE_TIMEOUT_SECONDS,
         NETWORK_RECOVERY_MAX_WAIT_SECONDS,
@@ -38,7 +38,7 @@ def t01_constants() -> bool:
 
 def t02_classifier() -> bool:
     """_is_network_error vs _is_backend_exception."""
-    from gpt_signup_hybrid.web.upi_runner import (
+    from gpt_signup_hybrid_new.web.upi_runner import (
         _is_backend_exception,
         _is_network_error,
     )
@@ -69,7 +69,7 @@ def t03_probe_signature() -> bool:
     """_probe_connectivity và _wait_network_recovery có signature đúng."""
     import inspect
 
-    from gpt_signup_hybrid.web.upi_runner import (
+    from gpt_signup_hybrid_new.web.upi_runner import (
         _probe_connectivity,
         _wait_network_recovery,
     )
@@ -95,7 +95,7 @@ def t04_recovery_max_wait() -> bool:
     Mock sess.head luôn raise → buộc recovery loop poll cho tới khi vượt
     max_wait. Để chạy nhanh, monkey-patch constants xuống mức nhỏ.
     """
-    from gpt_signup_hybrid.web import upi_runner
+    from gpt_signup_hybrid_new.web import upi_runner
 
     class _DummyResp:
         status_code = 200

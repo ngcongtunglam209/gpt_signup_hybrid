@@ -804,17 +804,37 @@ class JobManager:
         if job.retry_count >= self._auto_retry_max:
             self._job_log(job, f"[auto-retry] đã retry {job.retry_count}/{self._auto_retry_max} lần — dừng")
             return False
+        # Nếu signup đã thành công (có session_path) nhưng 2FA chưa enable
+        # (chưa có secret) → chỉ retry Phase 2 (enable_2fa). Tránh signup lại
+        # tạo account thứ 2 hoặc trigger login flow trong khi account hiện tại
+        # đã reg xong nhưng thiếu 2FA. Cùng logic với manual `retry_job`.
+        retry_2fa_only = bool(job.session_path and not job.secret)
         job.retry_count += 1
         delay = self._auto_retry_delay * job.retry_count
-        self._job_log(job, f"[auto-retry] sẽ retry {job.retry_count}/{self._auto_retry_max} sau {delay:.0f}s")
-        if not await self._persist_status(job, "queued"):
+        label = "auto-retry-2fa" if retry_2fa_only else "auto-retry"
+        self._job_log(
+            job,
+            f"[{label}] sẽ retry {job.retry_count}/{self._auto_retry_max} sau {delay:.0f}s"
+            + (" (chỉ Phase 2, signup giữ nguyên)" if retry_2fa_only else ""),
+        )
+        # Khi retry 2fa-only phải preserve session_path + user_id trong DB,
+        # ngược lại update_status sẽ clear NULL theo behaviour mặc định.
+        persist_kwargs: dict[str, object] = {}
+        if retry_2fa_only:
+            persist_kwargs["session_path"] = job.session_path
+            persist_kwargs["user_id"] = job.user_id
+        if not await self._persist_status(job, "queued", **persist_kwargs):
             return False
         job.status = "queued"
         job.error = None
         job.started_at = None
         job.finished_at = None
+        if not retry_2fa_only:
+            # Full retry: clear partial state in-memory để khớp với DB.
+            job.session_path = None
+            job.user_id = None
         self._broadcast_job(job)
-        self._schedule_delayed_requeue(job.id, delay)
+        self._schedule_delayed_requeue(job.id, delay, retry_2fa_only=retry_2fa_only)
         return True
 
     def _broadcast(self, event: dict[str, Any]) -> None:
@@ -2746,18 +2766,84 @@ class SessionJobManager:
             def log(msg: str) -> None:
                 self._job_log(job, msg)
 
-            job_proxy = await self._begin_job_proxy(job, log)
-
             # Get Session fix cứng dùng pure_request (HTTP-only, không browser).
+            # Login DIRECT mặc định (proxy=None) — pattern y upi_runner Step 1
+            # với `proxy_from_step=3`: auth.openai.com / chatgpt.com chấp nhận
+            # IP host, route qua proxy datacenter dễ bị Cloudflare flag → HTTP
+            # 403 ngay GET /auth/login (prime). Get Session không có Stripe
+            # steps cần proxy IN nên DIRECT là chuẩn.
+            #
+            # Login retry 3 attempts (initial + 2 retry) với phân biệt:
+            #   - Retryable (transient): WARNING_BANNER, no accessToken,
+            #     callback URL, session-token cookie, prime 403 — Cloudflare/
+            #     proxy/server flaky, callback set-cookie chậm → retry sau 3s.
+            #   - Non-retryable (fatal): password fail, MFA fail, no secret,
+            #     OTP empty, no mail provider — không retry để tránh login spam
+            #     → lockout / mail provider rate-limit.
             from session_phase import get_session_pure_request
+            LOGIN_MAX_ATTEMPTS = 3
+            LOGIN_RETRY_DELAY = 3.0
+            NON_RETRYABLE_PATTERNS = (
+                "password verify failed",
+                "mfa verify failed",
+                "no mail_provider available",
+                "no secret provided",
+                "yêu cầu 2fa nhưng không có",
+                "otp polling returned empty",
+                "passwordless otp login but no mail_provider",
+            )
+
+            def _is_login_error_retryable(exc_msg: str) -> bool:
+                lower = exc_msg.lower()
+                return not any(pat in lower for pat in NON_RETRYABLE_PATTERNS)
+
+            async def _login_with_retry() -> dict[str, Any]:
+                last_exc: SessionError | None = None
+                for attempt in range(1, LOGIN_MAX_ATTEMPTS + 1):
+                    try:
+                        data = await get_session_pure_request(
+                            email=job.email,
+                            password=job.password,
+                            secret=job.secret,
+                            proxy=None,
+                            log=log,
+                        )
+                        if attempt > 1:
+                            log(
+                                f"[session] login OK ở attempt "
+                                f"{attempt}/{LOGIN_MAX_ATTEMPTS}"
+                            )
+                        return data
+                    except SessionError as exc:
+                        last_exc = exc
+                        err_msg = str(exc)
+                        if not _is_login_error_retryable(err_msg):
+                            log(
+                                f"[session] login fail (non-retryable): "
+                                f"{err_msg[:200]}"
+                            )
+                            raise
+                        if attempt >= LOGIN_MAX_ATTEMPTS:
+                            log(
+                                f"[session] login fail after "
+                                f"{LOGIN_MAX_ATTEMPTS} attempts: {err_msg[:200]}"
+                            )
+                            raise
+                        log(
+                            f"[session] login transient error "
+                            f"(attempt {attempt}/{LOGIN_MAX_ATTEMPTS}): "
+                            f"{err_msg[:140]} — retry sau "
+                            f"{LOGIN_RETRY_DELAY:g}s..."
+                        )
+                        await asyncio.sleep(LOGIN_RETRY_DELAY)
+                # Defensive: vòng lặp luôn return/raise; nhánh này chỉ tồn tại
+                # để type-checker không cảnh báo "missing return".
+                if last_exc is not None:
+                    raise last_exc
+                raise SessionError("login failed without specific error")
+
             session_data = await asyncio.wait_for(
-                get_session_pure_request(
-                    email=job.email,
-                    password=job.password,
-                    secret=job.secret,
-                    proxy=job_proxy,
-                    log=log,
-                ),
+                _login_with_retry(),
                 timeout=self._job_timeout,
             )
 
@@ -4750,7 +4836,11 @@ class UpiJobManager:
             # raw_pool (templates) dùng cho approve lazy-materialize-per-batch
             # + giữ len>1 cho _proxy_advance_enabled. Hot-load: user vừa cập
             # nhật là dùng ngay.
-            raw_pool = list(get_proxy_pool().live_entries())
+            # ordered_for_job() HONOR pool mode (random → shuffle / round_robin
+            # → rotate cursor) để 2 job UPI song song KHÔNG dùng cùng IP theo
+            # lockstep. live_entries() cũ trả order cố định nên mode random vô
+            # tác dụng với approve loop (consume pool theo batch index).
+            raw_pool = list(get_proxy_pool().ordered_for_job())
             # Debug log: nếu pool rỗng, log lý do — giúp user phân biệt giữa
             # "chưa cấu hình proxy" vs "proxy bị mark_dead". Mask cả raw line
             # để không leak credentials.

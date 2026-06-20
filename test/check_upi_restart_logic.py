@@ -11,10 +11,10 @@ import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PROJ = ROOT.parent  # parent for `gpt_signup_hybrid` package
+PROJ = ROOT.parent  # parent for `gpt_signup_hybrid_new` package
 sys.path.insert(0, str(PROJ))
 
-PKG = "gpt_signup_hybrid"
+PKG = "gpt_signup_hybrid_new"
 
 
 def _ok(idx: str, label: str, detail: str = "") -> None:
@@ -46,7 +46,7 @@ def t01_ast_parse() -> bool:
 def t02_import_runner() -> bool:
     """Import module + check symbols mới."""
     try:
-        from gpt_signup_hybrid.web.upi_runner import (
+        from gpt_signup_hybrid_new.web.upi_runner import (
             APPROVE_BACKEND_EXCEPTION_CONSECUTIVE,
             APPROVE_DELAY,
             APPROVE_MAX_RESTARTS,
@@ -71,7 +71,7 @@ def t02_import_runner() -> bool:
 
 def t03_signature() -> bool:
     """run_upi_qr_probe có 2 params mới: restart_threshold, max_restarts."""
-    from gpt_signup_hybrid.web.upi_runner import run_upi_qr_probe
+    from gpt_signup_hybrid_new.web.upi_runner import run_upi_qr_probe
 
     sig = inspect.signature(run_upi_qr_probe)
     params = sig.parameters
@@ -93,7 +93,7 @@ def t03_signature() -> bool:
 
 
 def t04_settings_keys_whitelist() -> bool:
-    from gpt_signup_hybrid.db.repositories import (
+    from gpt_signup_hybrid_new.db.repositories import (
         _EXACT_KEYS,
         _validate_type_constraint,
     )
@@ -138,7 +138,7 @@ def t04_settings_keys_whitelist() -> bool:
 
 
 def t05_manager_setters() -> bool:
-    from gpt_signup_hybrid.web.manager import UpiJobManager
+    from gpt_signup_hybrid_new.web.manager import UpiJobManager
 
     mgr = UpiJobManager(max_concurrent=1)
     try:
@@ -182,7 +182,7 @@ def t05_manager_setters() -> bool:
 
 
 def t06_result_field() -> bool:
-    from gpt_signup_hybrid.web.upi_runner import UpiQrResult
+    from gpt_signup_hybrid_new.web.upi_runner import UpiQrResult
 
     r = UpiQrResult(ok=True, email="x@y", restart_count=2)
     d = r.to_dict()
@@ -198,7 +198,7 @@ def t06_result_field() -> bool:
 
 def t07_server_payload() -> bool:
     """SetUpiConfigRequest có 2 fields mới với constraints đúng."""
-    from gpt_signup_hybrid.web.server import SetUpiConfigRequest
+    from gpt_signup_hybrid_new.web.server import SetUpiConfigRequest
 
     obj = SetUpiConfigRequest(restart_threshold=30, max_restarts=3)
     assert obj.restart_threshold == 30

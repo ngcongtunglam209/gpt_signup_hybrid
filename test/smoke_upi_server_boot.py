@@ -28,7 +28,7 @@ os.environ["GPT_SIGNUP_WEB_TOKEN"] = "test-token-smoke"
 # Pre-init DatabaseEngine singleton tới tmp path. Server.py sẽ gọi get_engine()
 # không args → trả singleton đã pre-init này.
 sys.path.insert(0, str(ROOT.parent))
-from gpt_signup_hybrid.db import get_engine as _get_engine_init  # noqa: E402
+from gpt_signup_hybrid_new.db import get_engine as _get_engine_init  # noqa: E402
 
 _get_engine_init(db_path=_TMP_DB)
 
@@ -51,7 +51,7 @@ def _check(label: str, fn) -> None:
 
 def main() -> int:
     from fastapi.testclient import TestClient
-    from gpt_signup_hybrid.web import server as srv
+    from gpt_signup_hybrid_new.web import server as srv
 
     client = TestClient(srv.app)
     headers = {"X-API-Token": "test-token-smoke"}
@@ -90,7 +90,7 @@ def main() -> int:
         assert data["approve_retries"] == 200
         assert data["job_timeout"] == 600
         # Verify settings store cũng đã ghi.
-        from gpt_signup_hybrid.db.repositories import SettingsRepository
+        from gpt_signup_hybrid_new.db.repositories import SettingsRepository
         repo = SettingsRepository(srv._engine)  # type: ignore[arg-type]
         assert repo.get("upi.max_concurrent") == 5
         assert repo.get("upi.approve_retries") == 200

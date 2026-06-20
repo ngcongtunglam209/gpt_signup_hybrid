@@ -19,19 +19,19 @@ import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-# Đảm bảo workspace root nằm trong sys.path để import gpt_signup_hybrid.*
+# Đảm bảo workspace root nằm trong sys.path để import gpt_signup_hybrid_new.*
 ROOT = Path(__file__).resolve().parents[1]
 PARENT = ROOT.parent
 for p in (str(PARENT), str(ROOT)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from gpt_signup_hybrid.web.upi_runner import (  # noqa: E402
+from gpt_signup_hybrid_new.web.upi_runner import (  # noqa: E402
     _overlay_email_on_qr,
     _overlay_email_on_png,
     _overlay_email_on_svg,
 )
-from gpt_signup_hybrid.web.telegram_notifier import _mask_email  # noqa: E402
+from gpt_signup_hybrid_new.web.telegram_notifier import _mask_email  # noqa: E402
 
 FAIL = 0
 TOTAL = 0

@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT.parent))
 
 
 def main() -> int:
-    from gpt_signup_hybrid.pay_upi_http import _to_form
+    from gpt_signup_hybrid_new.pay_upi_http import _to_form
 
     test_payload = {
         "_stripe_version": "2025-03-31.basil; checkout_server_update_beta=v1",

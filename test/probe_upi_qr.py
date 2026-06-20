@@ -309,8 +309,8 @@ def _parse_account(line: str) -> tuple[str, str, str | None]:
 
 def _load_proxy_pool(db_path: str) -> list[str]:
     try:
-        from gpt_signup_hybrid.db import get_engine
-        from gpt_signup_hybrid.db.repositories import SettingsRepository
+        from gpt_signup_hybrid_new.db import get_engine
+        from gpt_signup_hybrid_new.db.repositories import SettingsRepository
     except ModuleNotFoundError:
         from db import get_engine
         from db.repositories import SettingsRepository
@@ -530,7 +530,7 @@ async def _create_chatgpt_checkout_probe(
     log,
     proxies: dict[str, str] | None,
 ) -> dict[str, Any]:
-    from gpt_signup_hybrid.pay_upi_http import (
+    from gpt_signup_hybrid_new.pay_upi_http import (
         _CHATGPT_CHECKOUT_URL,
         _USER_AGENT,
         PayUpiError,
@@ -590,7 +590,7 @@ async def _stripe_elements_session_probe(
     log,
     proxies: dict[str, str] | None,
 ) -> dict[str, Any]:
-    from gpt_signup_hybrid.pay_upi_http import (
+    from gpt_signup_hybrid_new.pay_upi_http import (
         _STRIPE_ELEMENTS_URL,
         _STRIPE_VERSION,
         _USER_AGENT,
@@ -657,7 +657,7 @@ async def _stripe_confirm_upi_qr_variant(
     token_config: Any | None,
     proxies: dict[str, str] | None,
 ) -> dict[str, Any]:
-    from gpt_signup_hybrid.pay_upi_http import (
+    from gpt_signup_hybrid_new.pay_upi_http import (
         _STRIPE_CONFIRM_URL,
         _STRIPE_VERSION,
         _USER_AGENT,
@@ -672,7 +672,7 @@ async def _stripe_confirm_upi_qr_variant(
     init_checksum = init_data["init_checksum"]
 
     if token_config is not None:
-        from gpt_signup_hybrid import stripe_token as _st
+        from gpt_signup_hybrid_new import stripe_token as _st
 
         tokens = _st.build_token_fields(ppage_id=ppage_id, config=token_config)
         js_checksum = tokens["js_checksum"]
@@ -801,7 +801,7 @@ async def _stripe_payment_page_refresh_probe(
     log,
     proxies: dict[str, str] | None,
 ) -> dict[str, Any]:
-    from gpt_signup_hybrid.pay_upi_http import (
+    from gpt_signup_hybrid_new.pay_upi_http import (
         _STRIPE_PAGE_URL,
         _STRIPE_VERSION,
         _USER_AGENT,
@@ -972,7 +972,7 @@ async def _chatgpt_approve_checkout_probe(
     log,
     proxies: dict[str, str] | None,
 ) -> dict[str, Any]:
-    from gpt_signup_hybrid.pay_upi_http import (
+    from gpt_signup_hybrid_new.pay_upi_http import (
         _CHATGPT_APPROVE_URL,
         _USER_AGENT,
     )
@@ -1017,12 +1017,12 @@ async def _chatgpt_approve_checkout_probe(
 
 async def _run() -> int:
     from curl_cffi.requests import AsyncSession
-    from gpt_signup_hybrid import stripe_token as _st
-    from gpt_signup_hybrid.pay_upi_http import (
+    from gpt_signup_hybrid_new import stripe_token as _st
+    from gpt_signup_hybrid_new.pay_upi_http import (
         _stripe_init,
     )
-    from gpt_signup_hybrid.random_profile import random_india_profile
-    from gpt_signup_hybrid.session_phase import get_session_pure_request
+    from gpt_signup_hybrid_new.random_profile import random_india_profile
+    from gpt_signup_hybrid_new.session_phase import get_session_pure_request
 
     started = monotonic()
     account_line = os.environ.get("ACCOUNT_LINE", "")

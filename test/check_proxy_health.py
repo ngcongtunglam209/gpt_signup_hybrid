@@ -13,8 +13,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT.parent))
 
-import gpt_signup_hybrid.web.proxy_health as ph  # noqa: E402
-from gpt_signup_hybrid.web.proxy_health import (  # noqa: E402
+import gpt_signup_hybrid_new.web.proxy_health as ph  # noqa: E402
+from gpt_signup_hybrid_new.web.proxy_health import (  # noqa: E402
     _acquire_kwargs,
     _classify_exc,
     _load_proxy_knobs,
@@ -311,7 +311,7 @@ def t13_semaphore_bound() -> int:
 
 
 def t14_run_with_proxy_rotation_materialize() -> int:
-    import gpt_signup_hybrid.web.manager as mgr
+    import gpt_signup_hybrid_new.web.manager as mgr
 
     captured: list[str | None] = []
 
