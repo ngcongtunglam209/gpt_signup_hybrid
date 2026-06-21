@@ -574,12 +574,12 @@
   }
 
   // ── Mode → concurrency mapping ────────────────────────────────────
-  // Reg cap [1, 2] — dropdown share giữa các tab có Multi (3..50). Ở Reg,
-  // mọi giá trị > 2 đều silent clamp xuống 2 (yêu cầu sản phẩm).
+  // Reg cap [1, 5] — dropdown share giữa các tab có Multi (10..200). Ở Reg,
+  // mọi giá trị > 5 đều silent clamp xuống 5 (yêu cầu sản phẩm).
   function _modeToConcurrency(mode) {
     const map = { single: 1, multi: 2, multi3: 3, multi5: 5, multi10: 10, multi20: 20, multi30: 30, multi50: 50, multi100: 100, multi200: 200 };
     const raw = map[mode] || 1;
-    return Math.min(raw, 2);
+    return Math.min(raw, 5);
   }
 
   // ── Run button ───────────────────────────────────────────────────

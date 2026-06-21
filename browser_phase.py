@@ -668,12 +668,27 @@ async def _skip_passkey(page, *, log, leave_timeout: float = 10.0) -> bool:
     return False
 
 
+# Khi đã LẤY ĐƯỢC OTP, đảm bảo còn tối thiểu ngần này giây để hoàn tất các bước
+# ngắn còn lại (submit OTP + /about-you + chờ session) — KHÔNG để wall-clock kill
+# job ngay sau khi đã có OTP (lãng phí email + code). Áp cho cả deadline nội bộ
+# của flow lẫn watchdog bên ngoài (qua on_checkpoint).
+_POST_OTP_GRACE_SECONDS = 150.0
+# Budget cho các bước TRƯỚC khi có OTP (load trang + send + submit ban đầu),
+# cộng thêm vào otp_timeout để overall flow deadline phủ trọn thời gian chờ mail.
+_PRE_OTP_MARGIN_SECONDS = 60.0
+
+
 async def _drive_signup_flow(
     *, ctx, page, request, mail_provider, callback_holder, otp_started_at, log,
     overall_timeout: float = 240.0,
+    on_checkpoint=None,
+    post_otp_grace: float = _POST_OTP_GRACE_SECONDS,
 ) -> tuple[str, float]:
     """State machine: check URL/DOM hiện tại, dispatch handler tương ứng.
     Lặp đến khi đến được chatgpt.com (có session) hoặc gặp lỗi không phục hồi.
+
+    on_checkpoint: callback(stage:str) gọi khi vượt mốc quan trọng (đã lấy được
+        OTP) để watchdog bên ngoài gia hạn deadline tương ứng.
 
     Returns: (callback_url, otp_seconds).
     """
@@ -952,9 +967,11 @@ async def _drive_signup_flow(
             # rồi thử lần lượt trước khi resend.
             resend_after_seconds = float(request.otp_resend_after_seconds)
             resend_count = 0
-            max_resends = 2  # tối đa resend 2 lần — nhiều hơn dễ bị OpenAI rate-limit
-            stale_poll_count = 0  # đếm lần poll liên tiếp chỉ nhận code cũ
-            stale_poll_resend_threshold = 5  # sau 5 lần poll chỉ code cũ → resend
+            # Resend tối đa 1 lần: HME delay cao, resend nhiều chỉ vô hiệu mã đang
+            # bay + spam → OpenAI rate-limit. Chỉ resend khi mail HOÀN TOÀN chưa về
+            # sau resend_after_seconds, KHÔNG resend chỉ vì code cũ lặp lại.
+            max_resends = 1
+            stale_poll_count = 0  # đếm lần poll chỉ nhận code cũ (chỉ để log)
             while True:
                 # Nếu có codes pending chưa submit → thử từng cái
                 if pending_codes:
@@ -998,25 +1015,14 @@ async def _drive_signup_flow(
                     pending_codes = new_codes
                     continue  # loop lại → pop từ pending_codes
                 if otp_code and otp_code in tried_codes:
-                    # Code cũ quay lại — đếm, sau N lần → resend
+                    # Code cũ nằm lại mailbox là bình thường khi mail mới còn delay —
+                    # KHÔNG resend (resend chỉ vô hiệu mã mới đang bay). Cứ poll tiếp
+                    # cho tới khi code mới về hoặc hết otp_timeout.
                     stale_poll_count += 1
-                    if stale_poll_count >= stale_poll_resend_threshold and resend_count < max_resends:
-                        resend_count += 1
-                        stale_poll_count = 0
-                        log(f"[flow] poll {stale_poll_resend_threshold} lần chỉ code cũ — click Resend ({resend_count}/{max_resends})")
-                        try:
-                            resend_btn = page.locator('button:has-text("Resend"), a:has-text("Resend")').first
-                            await resend_btn.click(timeout=3000)
-                            log("[flow] clicked 'Resend email'")
-                        except Exception as exc:
-                            log(f"[flow] resend button not found: {exc}")
-                        await asyncio.sleep(2.0)
-                        poll_started = datetime.now(timezone.utc).replace(microsecond=0)
-                    else:
-                        log(f"[flow] OTP={otp_code} đã thử rồi, tiếp tục poll... ({stale_poll_count}/{stale_poll_resend_threshold})")
-                        await asyncio.sleep(request.otp_poll_interval_seconds)
+                    log(f"[flow] OTP={otp_code} đã thử rồi, chờ code mới... (lần {stale_poll_count})")
+                    await asyncio.sleep(request.otp_poll_interval_seconds)
                     continue
-                # otp_code is None → timeout thật sự, không code nào về → resend
+                # otp_code is None → hết resend_after_seconds mà KHÔNG có mail nào về
                 if resend_count < max_resends:
                     resend_count += 1
                     log(f"[flow] OTP chưa nhận sau {mini_timeout:.0f}s — click Resend ({resend_count}/{max_resends})")
@@ -1029,9 +1035,24 @@ async def _drive_signup_flow(
                     # Reset poll_started để chỉ nhận code mới sau resend
                     await asyncio.sleep(2.0)
                     poll_started = datetime.now(timezone.utc).replace(microsecond=0)
+                else:
+                    # Đã resend hết hạn mức — không resend thêm, tiếp tục poll tới
+                    # khi code về hoặc hết otp_timeout (tránh spam resend).
+                    log(f"[flow] OTP chưa về sau {mini_timeout:.0f}s — đã resend {resend_count} lần, tiếp tục chờ...")
             
             otp_seconds_total += time.monotonic() - t_otp
             log(f"[flow] OTP={otp_code} got in {time.monotonic() - t_otp:.1f}s")
+            # Đã LẤY ĐƯỢC OTP → gia hạn deadline nội bộ + báo watchdog ngoài, đảm bảo
+            # đủ thời gian submit + /about-you + session, không bị kill giữa chừng.
+            _grace_deadline = time.monotonic() + post_otp_grace
+            if _grace_deadline > deadline:
+                deadline = _grace_deadline
+                log(f"[flow] OTP secured — gia hạn flow +{post_otp_grace:.0f}s để hoàn tất")
+            if on_checkpoint is not None:
+                try:
+                    on_checkpoint("otp")
+                except Exception:
+                    pass
             tried_codes.add(otp_code)
             await _submit_otp(ctx, page, otp_code=otp_code, otp_selector=otp_selector, log=log)
             otp_submitted = True
@@ -1697,8 +1718,12 @@ async def run_browser_phase(
     mail_provider: MailProvider,
     otp_started_at: datetime,
     log,
+    on_checkpoint=None,
 ) -> tuple[BrowserHandoff, float]:
     """Phase 1: browser signup + set password post-login.
+
+    on_checkpoint: callback(stage:str) — gọi khi đã lấy được OTP để watchdog
+        bên ngoài gia hạn deadline (tránh kill job ngay sau khi có OTP).
 
     Returns: (handoff, otp_seconds).
     """
@@ -1854,6 +1879,8 @@ async def run_browser_phase(
                 callback_holder=callback_holder,
                 otp_started_at=otp_started_at,
                 log=log,
+                overall_timeout=request.otp_timeout_seconds + _PRE_OTP_MARGIN_SECONDS,
+                on_checkpoint=on_checkpoint,
             )
 
             _state = (
@@ -1935,6 +1962,8 @@ async def run_browser_phase(
                 callback_holder=callback_holder,
                 otp_started_at=otp_started_at,
                 log=log,
+                overall_timeout=request.otp_timeout_seconds + _PRE_OTP_MARGIN_SECONDS,
+                on_checkpoint=on_checkpoint,
             )
 
             _state = (

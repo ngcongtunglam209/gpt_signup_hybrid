@@ -7,9 +7,10 @@ Supports two registration modes:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from browser_phase import BrowserPhaseError, run_browser_phase
 from config import load_settings, runtime_session_dir
@@ -29,6 +30,67 @@ from request_phase import RequestPhaseError, run_request_phase
 
 if TYPE_CHECKING:
     from db.repositories import ComboRepository
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Watchdog gia hạn theo checkpoint OTP — dùng chung cho mọi caller của
+# run_signup (web manager, autoreg runner). Mục tiêu: KHÔNG bao giờ kill một
+# job ngay sau khi đã lấy được OTP (lãng phí email + code).
+# ─────────────────────────────────────────────────────────────────────
+
+# Sàn tối thiểu cho base_timeout của 1 signup job: phải phủ trọn otp_timeout
+# (mặc định 300s cho iCloud HME) + biên setup, nếu không job có thể bị kill ngay
+# TRONG lúc chờ mail hợp lệ.
+SIGNUP_BASE_TIMEOUT_FLOOR = 360.0
+# Sau khi đã lấy được OTP, đảm bảo còn tối thiểu ngần này giây để hoàn tất
+# about_you + phase2 + lấy session. Lớn hơn _POST_OTP_GRACE_SECONDS của
+# browser_phase để deadline NỘI BỘ của flow chạm trước (báo lỗi sạch) thay vì
+# bị watchdog hủy cứng.
+SIGNUP_POST_OTP_GRACE = 180.0
+
+
+def make_otp_grace_checkpoint(
+    deadline_holder: list[float], grace: float, loop
+) -> Callable[[str], None]:
+    """Callback(stage) bump deadline_holder[0] = max(hiện tại, now + grace).
+
+    Thread-safe (chỉ gán 1 float + đọc monotonic clock) → an toàn khi gọi từ
+    worker thread của pure_request mode.
+    """
+    def _cp(stage: str = "otp") -> None:
+        new_dl = loop.time() + grace
+        if new_dl > deadline_holder[0]:
+            deadline_holder[0] = new_dl
+    return _cp
+
+
+async def await_with_extendable_deadline(
+    coro: Awaitable, deadline_holder: list[float], *, loop=None
+):
+    """Await coro với deadline có thể gia hạn động (deadline_holder[0]).
+
+    Raise asyncio.TimeoutError khi vượt deadline (cùng loại exception như
+    asyncio.wait_for → tương thích handler timeout sẵn có ở caller).
+    Luôn hủy task gọn khi timeout hoặc bị cancel từ ngoài (shutdown).
+    """
+    loop = loop or asyncio.get_event_loop()
+    task = asyncio.ensure_future(coro)
+    try:
+        while True:
+            remaining = deadline_holder[0] - loop.time()
+            if remaining <= 0:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                raise asyncio.TimeoutError
+            done, _ = await asyncio.wait({task}, timeout=remaining)
+            if task in done:
+                return task.result()
+    except asyncio.CancelledError:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        raise
 
 
 def _build_mail_provider(
@@ -84,8 +146,13 @@ async def run_signup(
     *,
     log=print,
     combo_repo: "ComboRepository | None" = None,
+    on_checkpoint=None,
 ) -> SignupResult:
     """Chạy signup, return SignupResult.
+
+    on_checkpoint: callback(stage:str) — gọi khi vượt mốc quan trọng (đã lấy
+        được OTP) để watchdog bên ngoài gia hạn deadline, tránh kill job ngay
+        sau khi đã có OTP.
 
     Routing:
       - reg_mode="pure_request" → full HTTP-only (curl_cffi + sentinel)
@@ -134,6 +201,7 @@ async def run_signup(
                 request=request,
                 mail_provider=provider,
                 log=log,
+                on_checkpoint=on_checkpoint,
             )
             # Ensure email is set correctly
             if not result.email:
@@ -154,6 +222,7 @@ async def run_signup(
                 mail_provider=provider,
                 otp_started_at=otp_started_at,
                 log=log,
+                on_checkpoint=on_checkpoint,
             )
             result.phase1_seconds = time.monotonic() - t_p1
             result.otp_seconds = otp_seconds

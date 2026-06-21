@@ -23,6 +23,45 @@ cd "$ROOT_DIR"
 
 PKG_NAME="gpt_signup_hybrid"
 
+# ── Runtime config — chạy NHIỀU instance song song (port + DB khác nhau) ──
+# Mặc định lấy từ env (nếu có) hoặc giá trị cũ. Có thể override bằng CỜ:
+#   bash setup.sh --port 4444 --db db4444
+#   bash setup.sh --port 4444 --db runtime/data2.db --runtime runtime2 --host 0.0.0.0
+# Env tương đương: PORT=4444 GSH_DB_PATH=... RUNTIME_DIR=... HOST=...
+HOST="${HOST:-127.0.0.1}"
+PORT="${PORT:-8083}"
+GSH_DB_PATH="${GSH_DB_PATH:-runtime/data.db}"
+RUNTIME_DIR="${RUNTIME_DIR:-runtime}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --port)     PORT="$2"; shift 2 ;;
+    --port=*)   PORT="${1#*=}"; shift ;;
+    --host)     HOST="$2"; shift 2 ;;
+    --host=*)   HOST="${1#*=}"; shift ;;
+    --db)       GSH_DB_PATH="$2"; shift 2 ;;
+    --db=*)     GSH_DB_PATH="${1#*=}"; shift ;;
+    --runtime)  RUNTIME_DIR="$2"; shift 2 ;;
+    --runtime=*) RUNTIME_DIR="${1#*=}"; shift ;;
+    -h|--help)
+      echo "Usage: bash setup.sh [--port N] [--db PATH|name] [--host H] [--runtime DIR]"
+      echo "  --db nhận đường dẫn (vd runtime/data2.db) hoặc tên ngắn (vd db4444 → \$RUNTIME_DIR/db4444.db)"
+      exit 0 ;;
+    *) echo "ERROR: unknown arg: $1 (xem: bash setup.sh --help)" >&2; exit 1 ;;
+  esac
+done
+
+# --db dạng tên ngắn (không chứa '/' và không kết thúc .db) → quy về <RUNTIME_DIR>/<name>.db.
+case "$GSH_DB_PATH" in
+  */*)  : ;;          # đã là path → giữ nguyên
+  *.db) : ;;          # đã có đuôi .db (ở cwd) → giữ nguyên
+  *)    GSH_DB_PATH="$RUNTIME_DIR/${GSH_DB_PATH}.db" ;;
+esac
+
+# config._lookup ưu tiên os.environ trước .env → export sẽ đè .env.
+export GSH_DB_PATH
+export RUNTIME_DIR
+
 # Python 3.13 bắt buộc — fail-fast nếu không có.
 PY_BIN="${PYTHON:-}"
 if [ -z "${PY_BIN}" ]; then
@@ -150,23 +189,25 @@ else
   echo "[6/6] .env exists ✓"
 fi
 
-# Tạo runtime dirs trong package
+# Tạo runtime dirs trong package (theo RUNTIME_DIR — hỗ trợ instance riêng)
 mkdir -p \
-  runtime/profiles/template \
-  runtime/profiles/camoufox_template \
-  runtime/sessions \
-  runtime/outlook_state \
-  runtime/outlook_pool \
-  runtime/har_hybrid
+  "$RUNTIME_DIR/profiles/template" \
+  "$RUNTIME_DIR/profiles/camoufox_template" \
+  "$RUNTIME_DIR/sessions" \
+  "$RUNTIME_DIR/outlook_state" \
+  "$RUNTIME_DIR/outlook_pool" \
+  "$RUNTIME_DIR/har_hybrid"
 
 echo ""
 echo "═══════════════════════════════════════════════════════════"
 echo "  ✓ Setup done. Starting web UI..."
-echo "  → http://127.0.0.1:8083/"
+echo "  → http://$HOST:$PORT/"
+echo "  DB:      $GSH_DB_PATH"
+echo "  RUNTIME: $RUNTIME_DIR"
 echo ""
 echo "═══════════════════════════════════════════════════════════"
 echo ""
 
 # CWD vẫn là $ROOT_DIR. Python load .pth → thấy shim dir →
 # import được `gpt_signup_hybrid` qua symlink.
-.venv/bin/python -m gpt_signup_hybrid web --host 127.0.0.1 --port 8083
+.venv/bin/python -m gpt_signup_hybrid web --host "$HOST" --port "$PORT"

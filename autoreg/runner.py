@@ -254,7 +254,13 @@ class AutoRegRunner:
         """
         from mfa_phase import MfaError, enable_2fa
         from models import SignupRequest, SignupResult
-        from signup import run_signup
+        from signup import (
+            run_signup,
+            await_with_extendable_deadline,
+            make_otp_grace_checkpoint,
+            SIGNUP_BASE_TIMEOUT_FLOOR,
+            SIGNUP_POST_OTP_GRACE,
+        )
         from web.mail_modes import get_spec
 
         self._stats.processed += 1
@@ -301,9 +307,18 @@ class AutoRegRunner:
                     _bg_tasks.add(task)
                     task.add_done_callback(_bg_tasks.discard)
 
-                result: SignupResult = await asyncio.wait_for(
-                    run_signup(request, log=log_fn),
-                    timeout=self._config.job_timeout,
+                # Deadline gia hạn theo checkpoint OTP: base phủ trọn thời gian chờ
+                # OTP; sau khi lấy được OTP, job luôn còn SIGNUP_POST_OTP_GRACE giây
+                # để hoàn tất → không kill ngay sau khi đã có OTP.
+                _loop = asyncio.get_event_loop()
+                _base = max(float(self._config.job_timeout), SIGNUP_BASE_TIMEOUT_FLOOR)
+                _deadline_holder = [_loop.time() + _base]
+                _on_cp = make_otp_grace_checkpoint(
+                    _deadline_holder, SIGNUP_POST_OTP_GRACE, _loop
+                )
+                result: SignupResult = await await_with_extendable_deadline(
+                    run_signup(request, log=log_fn, on_checkpoint=_on_cp),
+                    _deadline_holder, loop=_loop,
                 )
 
                 if not result.success:

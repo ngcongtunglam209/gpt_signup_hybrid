@@ -15,6 +15,11 @@ TARGETS = [
     ROOT / "browser_phase.py",
     ROOT / "request_phase.py",
     ROOT / "models.py",
+    ROOT / "web" / "mail_modes.py",
+    ROOT / "signup.py",
+    ROOT / "web" / "manager.py",
+    ROOT / "autoreg" / "runner.py",
+    ROOT / "mail_providers.py",
 ]
 
 

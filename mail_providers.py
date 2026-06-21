@@ -84,6 +84,26 @@ def _extract_otp(subject: str, body: str) -> str | None:
     return match.group(1) or match.group(2)
 
 
+def _sort_messages_newest_first(messages: list[dict[str, Any]]) -> None:
+    """Sort in-place mới→cũ theo date/receivedAt/created_at.
+
+    Nếu KHÔNG message nào có date hợp lệ (iCloud worker đôi khi không trả) →
+    giữ nguyên thứ tự gốc của API (không đảo lung tung).
+    """
+    has_any_date = any(
+        _parse_dt(m.get("date") or m.get("receivedAt") or m.get("created_at"))
+        for m in messages
+    )
+    if has_any_date:
+        messages.sort(
+            key=lambda m: (
+                _parse_dt(m.get("date") or m.get("receivedAt") or m.get("created_at"))
+                or datetime.min.replace(tzinfo=timezone.utc)
+            ),
+            reverse=True,
+        )
+
+
 def _is_openai_sender(sender: str) -> bool:
     """Filter mail từ OpenAI để tránh nhặt nhầm OTP của dịch vụ khác."""
     s = (sender or "").lower()
@@ -110,19 +130,16 @@ class MailProvider(Protocol):
 # ─────────────────────────────────────────────────────────────────────
 
 
-# Grace window cho filter `msg_dt < started_at` của Worker provider.
-# Email `date` field = thời điểm OpenAI gửi mail, còn `started_at` được caller
-# chụp NGAY SAU khi submit (OTP form xuất hiện) → thường lệch 1-3s SAU send.
-# Mail relay iCloud HME → Worker có thể trễ vài phút, nên khi mã hợp lệ cuối cùng
-# về tới, date của nó (= send time) có thể sớm hơn started_at vài giây và bị loại
-# nhầm. Grace nới ngưỡng lùi lại để bù clock-skew. Giữ nhỏ hơn khoảng resend
-# (~90s) để KHÔNG vớt nhầm mã của lần gửi trước trong cùng session.
-# Mirror _OUTLOOK_GRAPH_DATE_GRACE (Outlook provider) — cùng class vấn đề.
-# 60s: bù clock-skew giữa mail server OpenAI và máy chạy bot, đồng thời vẫn nhỏ
-# hơn nhiều so với khoảng cách giữa 2 phiên đăng ký khác nhau (phút/giờ) nên KHÔNG
-# vớt nhầm mã của phiên cũ. Mã OTP cùng phiên (kể cả trước resend) vẫn còn hạn nên
-# chấp nhận được.
-_WORKER_DATE_GRACE = timedelta(seconds=60)
+# NOTE: Worker provider KHÔNG còn lọc OTP theo thời gian (`started_at`). Recipient
+# là +alias duy nhất cho mỗi phiên đăng ký nên mailbox chỉ chứa mã của phiên hiện
+# tại; mã được sort mới→cũ và caller dedup qua tried_codes. Lọc theo `date` (HME
+# relay lệch giờ, poll_started reset sau resend) trước đây gây loại nhầm mã hợp lệ.
+# Param `started_at` vẫn giữ trong signature để đồng nhất interface MailProvider
+# (các provider inbox-dùng-lại như Outlook/DongVanFB/Gmail vẫn cần lọc thời gian).
+
+# Số mã OTP tối đa lấy về trong 1 lần poll_all_codes (mới→cũ). Đủ để bắt mail-delay
+# trong cùng phiên (vài lần resend) mà không thử dồn mã cũ đã bị vô hiệu.
+_WORKER_MAX_CODES = 5
 
 
 class WorkerMailProvider:
@@ -204,31 +221,17 @@ class WorkerMailProvider:
                     else:
                         consecutive_errors = 0
                         messages = self._normalize(response.json())
-                        # Sort mới nhất trước dựa theo date field.
-                        # Nếu message không có date (iCloud worker có thể không trả) →
-                        # KHÔNG đảo vị trí: giữ thứ tự gốc từ API bằng cách gán
-                        # timestamp = epoch 0 (bị đẩy cuối khi reverse=True sort).
-                        # Nếu TẤT CẢ messages không có date → skip sort giữ nguyên API order.
-                        has_any_date = False
-                        for m in messages:
-                            if _parse_dt(m.get("date") or m.get("receivedAt") or m.get("created_at")):
-                                has_any_date = True
-                                break
-                        if has_any_date:
-                            messages.sort(
-                                key=lambda m: (
-                                    _parse_dt(m.get("date") or m.get("receivedAt") or m.get("created_at"))
-                                    or datetime.min.replace(tzinfo=timezone.utc)
-                                ),
-                                reverse=True,
-                            )
+                        # Sort mới nhất trước (helper xử lý case thiếu date).
+                        _sort_messages_newest_first(messages)
                         for msg in messages:
                             msg_to = str(msg.get("to") or "").strip().lower()
                             if msg_to and msg_to != mailbox:
                                 continue
-                            msg_dt = _parse_dt(msg.get("date") or msg.get("receivedAt") or msg.get("created_at"))
-                            if msg_dt is not None and msg_dt < (started_at - _WORKER_DATE_GRACE):
-                                continue
+                            # KHÔNG lọc theo thời gian: recipient là +alias DUY NHẤT
+                            # cho mỗi phiên nên mailbox chỉ chứa mã của phiên này. Mã
+                            # đã sort mới→cũ; caller (browser_phase) dedup qua tried_codes
+                            # nên luôn thử mã mới nhất chưa thử. Lọc theo `date` (HME relay
+                            # lệch giờ + poll_started reset sau resend) dễ loại nhầm mã đúng.
                             subject = str(msg.get("subject") or "")
                             body = (
                                 msg.get("bodyText") or msg.get("text") or msg.get("body")
@@ -293,15 +296,16 @@ class WorkerMailProvider:
                 if response.status_code != 200:
                     return []
                 messages = self._normalize(response.json())
+                # Sort mới→cũ để caller thử mã mới nhất trước (mirror poll_otp).
+                _sort_messages_newest_first(messages)
                 codes: list[str] = []
                 seen: set[str] = set()
                 for msg in messages:
                     msg_to = str(msg.get("to") or "").strip().lower()
                     if msg_to and msg_to != mailbox:
                         continue
-                    msg_dt = _parse_dt(msg.get("date") or msg.get("receivedAt") or msg.get("created_at"))
-                    if msg_dt is not None and msg_dt < (started_at - _WORKER_DATE_GRACE):
-                        continue
+                    # KHÔNG lọc theo thời gian — xem giải thích ở poll_otp (alias duy
+                    # nhất mỗi phiên + dedup tried_codes + thử mới→cũ ở caller).
                     subject = str(msg.get("subject") or "")
                     body = (
                         msg.get("bodyText") or msg.get("text") or msg.get("body")
@@ -311,6 +315,10 @@ class WorkerMailProvider:
                     if code and code not in seen:
                         seen.add(code)
                         codes.append(code)
+                        # Chỉ lấy tối đa N mã MỚI NHẤT — đã sort mới→cũ nên cắt sớm.
+                        # Tránh thử dồn quá nhiều mã cũ (đã bị OpenAI vô hiệu).
+                        if len(codes) >= _WORKER_MAX_CODES:
+                            break
                 return codes
         except Exception:
             return []

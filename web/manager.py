@@ -17,7 +17,13 @@ from config import load_settings, proxy_env_defaults, runtime_session_dir
 from mail_providers import OutlookCombo, OutlookComboError
 from mfa_phase import MfaError, enable_2fa
 from models import SignupRequest, SignupResult
-from signup import run_signup
+from signup import (
+    run_signup,
+    await_with_extendable_deadline,
+    make_otp_grace_checkpoint,
+    SIGNUP_BASE_TIMEOUT_FLOOR,
+    SIGNUP_POST_OTP_GRACE,
+)
 from _browser_retry import NETWORK_ERROR_MARKERS
 from .mail_modes import MailModeParseError, get_spec
 from .proxy_health import _acquire_kwargs, _load_proxy_knobs, acquire_live_proxy
@@ -626,8 +632,8 @@ class JobManager:
         return self._max
 
     def set_max_concurrent(self, n: int) -> None:
-        if n < 1 or n > 2:
-            raise ValueError("max_concurrent phải trong [1, 2]")
+        if n < 1 or n > 5:
+            raise ValueError("max_concurrent phải trong [1, 5]")
         self._max = n
         self._ensure_workers()
 
@@ -768,10 +774,10 @@ class JobManager:
             self._debug = bool(settings["reg.debug"])
         if "reg.max_concurrent" in settings:
             val = int(settings["reg.max_concurrent"])
-            # Cap về 2 — Reg cap [1, 2]. Giá trị cũ trong DB > 2 vẫn silent
+            # Cap về 5 — Reg cap [1, 5]. Giá trị cũ trong DB > 5 vẫn silent
             # clamp xuống thay vì bỏ qua, giữ behavior nhất quán với set_config.
             if val >= 1:
-                self._max = max(1, min(val, 2))
+                self._max = max(1, min(val, 5))
         if "reg.use_proxy" in settings:
             self._use_proxy = bool(settings["reg.use_proxy"])
         _hydrate_proxy_pool_from_settings(settings)
@@ -1413,11 +1419,30 @@ class JobManager:
 
             if retry_2fa_only:
                 await asyncio.wait_for(self._run_2fa_only_inner(job), timeout=timeout)
+            elif timeout is None:
+                await self._run_job(job)
             else:
-                await asyncio.wait_for(self._run_job(job), timeout=timeout)
+                # Signup path: deadline GIA HẠN theo checkpoint OTP. base phủ trọn
+                # thời gian chờ OTP; sau khi lấy được OTP, job luôn còn
+                # SIGNUP_POST_OTP_GRACE giây để hoàn tất → không kill ngay sau khi
+                # đã có OTP. Raise asyncio.TimeoutError như cũ nếu vượt deadline.
+                loop = asyncio.get_event_loop()
+                base = max(float(timeout), SIGNUP_BASE_TIMEOUT_FLOOR)
+                job._effective_timeout = base  # type: ignore[attr-defined]
+                deadline_holder = [loop.time() + base]
+                job._on_checkpoint = make_otp_grace_checkpoint(  # type: ignore[attr-defined]
+                    deadline_holder, SIGNUP_POST_OTP_GRACE, loop
+                )
+                try:
+                    await await_with_extendable_deadline(
+                        self._run_job(job), deadline_holder, loop=loop,
+                    )
+                finally:
+                    job._on_checkpoint = None  # type: ignore[attr-defined]
         except asyncio.TimeoutError:
-            error_msg = f"timeout {self._job_timeout:.0f}s exceeded — killed"
-            fatal_line = f"[fatal] job timeout {self._job_timeout:.0f}s — killed"
+            _eff = getattr(job, "_effective_timeout", self._job_timeout)
+            error_msg = f"timeout {_eff:.0f}s exceeded — killed (post-OTP grace {SIGNUP_POST_OTP_GRACE:.0f}s)"
+            fatal_line = f"[fatal] job timeout {_eff:.0f}s — killed"
             if await self._persist_status(job, "error", error=error_msg, log_line=fatal_line):
                 job.status = "error"
                 job.error = error_msg
@@ -1777,6 +1802,7 @@ class JobManager:
             request.mfa_inline = self._mfa_inline
             result: SignupResult = await run_signup(
                 request, log=log, combo_repo=self._combo_repo,
+                on_checkpoint=getattr(job, "_on_checkpoint", None),
             )
 
             # Update job email nếu đã resolve từ API (URL-only gmail_advanced)

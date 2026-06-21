@@ -3645,3 +3645,94 @@ body {
 #upi-qr-modal-paylink:hover {
   color: var(--accent-hover);
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+ * FIX layout single-column dải 521px–1100px (cửa sổ hẹp/portrait)
+ * ───────────────────────────────────────────────────────────────────
+ * Vấn đề cũ: ở dải này .grid dùng fr-rows + overflow:hidden nên ép nội
+ * dung vào chiều cao viewport và CẮT (textarea / Run / settings biến
+ * mất). Đồng thời các .config-field-* dùng `flex: x y <Npx>` — trong
+ * chế độ stack dọc, flex-basis bị trình duyệt hiểu thành CHIỀU CAO →
+ * field phình 210/280/140px, đẩy nội dung tràn ra ngoài card.
+ *
+ * Cách fix:
+ *  1. Tab chuẩn (.grid) → display:block + cuộn trang tự nhiên; mỗi card
+ *     cao theo nội dung, không còn quirk grid auto-row với flex card.
+ *  2. textarea chiều cao cố định (deterministic) thay vì flex:1.
+ *  3. Reset flex-basis của mọi config field về chiều cao tự nhiên.
+ *  4. Hàng settings → lưới auto-fit, tận dụng chiều ngang thay vì xếp
+ *     dọc full-width gây dài lê thê.
+ *
+ * Đặt ở CUỐI file để thắng source-order so với base rules (các base
+ * rule khai báo sau media query đầu file đang ghi đè ngược responsive).
+ * Dải ≤520px giữ nguyên block chuyên biệt sẵn có (không đụng tới).
+ * ═══════════════════════════════════════════════════════════════════ */
+@media (min-width: 521px) and (max-width: 1100px) {
+  /* Chỉ tab chuẩn đang active mới hiện (giữ tab ẩn = none) */
+  main.grid.tab-content.active {
+    display: block;
+    overflow-y: auto;
+    overflow-x: hidden;
+  }
+  .grid > .card {
+    margin-bottom: 10px;
+  }
+  .grid > .card:last-child {
+    margin-bottom: 0;
+  }
+
+  /* Sàn chiều cao để pane cuộn (job list / log / output) đủ chỗ dùng */
+  .card-jobs    { min-height: 340px; }
+  .card-log     { min-height: 200px; }
+  .card-success,
+  .card-error   { min-height: 140px; }
+
+  /* Textarea nhập liệu: chiều cao cố định, tự cuộn nội bộ */
+  .combo-textarea {
+    flex: 0 0 auto;
+    height: 200px;
+    min-height: 200px;
+  }
+
+  /* Mail Mode row (tab Reg): lưới 2 cột — Mail Mode | Reg Mode,
+     Worker URL | View Token. Mỗi field cao tự nhiên. */
+  .mail-mode-row {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px 10px;
+    align-items: end;
+  }
+  .mail-mode-row .config-field-mode,
+  .mail-mode-config-panel .config-field-long,
+  .mail-mode-config-panel .config-field-short {
+    flex: 0 0 auto;
+    width: auto;
+    min-width: 0;
+    max-width: none;
+  }
+
+  /* Hàng settings → lưới auto-fit gói gọn theo chiều ngang */
+  .card-settings-row,
+  .card-settings-row-mixed {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 8px 10px;
+    align-items: end;
+  }
+  .card-settings-row > *,
+  .card-settings-row-mixed > * {
+    width: auto;
+    min-width: 0;
+    max-width: none;
+  }
+  /* Field dài (Default password...) chiếm trọn 1 hàng */
+  .card-settings-row .config-field-long,
+  .card-settings-row-mixed .config-field-long {
+    grid-column: 1 / -1;
+  }
+  .card-settings-row-mixed .toggle-wrap {
+    align-self: center;
+    min-height: 34px;
+  }
+  .settings-divider { display: none; }
+}

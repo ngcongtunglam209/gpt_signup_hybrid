@@ -1,14 +1,14 @@
 """Verify fix bug write-through `reg.max_concurrent` không clamp.
 
-Bug cũ: payload.max_concurrent=50 → manager clamp về 10 nhưng settings_dict
-ghi raw 50 → SettingsRepository validate "must be in [1, 10], got 50" fail.
-Fix: clamp 1 nguồn duy nhất, dùng cho cả manager + write-through.
+Bug cũ: payload.max_concurrent lớn → manager clamp nhưng settings_dict ghi raw
+→ SettingsRepository validate fail. Fix: clamp 1 nguồn duy nhất, dùng cho cả
+manager + write-through. Reg cap hiện tại = [1, 5].
 
 TC-01  AST parse web/server.py OK.
 TC-02  set_config dùng max_concurrent_clamped cho settings_dict.
-TC-03  SettingsRepository.set("reg.max_concurrent", 10) accept (clamped).
+TC-03  SettingsRepository.set("reg.max_concurrent", 5) accept (clamped).
 TC-04  SettingsRepository.set("reg.max_concurrent", 50) reject (giữ guard rail).
-TC-05  Logic clamp: 50→10, 0→1, 5→5, None→None.
+TC-05  Logic clamp: 50→5, 0→1, 5→5, None→None.
 
 Chạy: python3 test/check_reg_config_clamp.py
 """
@@ -67,20 +67,20 @@ def tc03_tc04_repo_validate() -> None:
         # DatabaseEngine.__init__ auto-init schema (ALL_DDL on fresh DB).
         repo = SettingsRepository(engine)
 
-        # TC-03 — accept clamped (10).
+        # TC-03 — accept clamped (5).
         try:
-            repo.set("reg.max_concurrent", 10)
+            repo.set("reg.max_concurrent", 5)
             got = repo.get("reg.max_concurrent")
-            _log(got == 10, "TC-03", "set 10 accept", f"got={got}")
+            _log(got == 5, "TC-03", "set 5 accept", f"got={got}")
         except RepositoryError as exc:
-            _log(False, "TC-03", "set 10 accept", f"raised: {exc}")
+            _log(False, "TC-03", "set 5 accept", f"raised: {exc}")
 
         # TC-04 — reject 50 (guard rail).
         try:
             repo.set("reg.max_concurrent", 50)
             _log(False, "TC-04", "set 50 phải reject", "không raise")
         except RepositoryError as exc:
-            ok = "must be in [1, 10]" in str(exc)
+            ok = "must be in [1, 5]" in str(exc)
             _log(ok, "TC-04", "set 50 reject đúng",
                  f"err={str(exc)[:80]}")
 
@@ -88,11 +88,11 @@ def tc03_tc04_repo_validate() -> None:
 
 
 def tc05_clamp_logic() -> None:
-    """Reproduce logic clamp inline."""
+    """Reproduce logic clamp inline (Reg cap = 5)."""
     def clamp(v):
-        return max(1, min(v, 10)) if v is not None else None
+        return max(1, min(v, 5)) if v is not None else None
 
-    cases = {50: 10, 0: 1, 5: 5, 1: 1, 10: 10, 11: 10, None: None}
+    cases = {50: 5, 0: 1, 5: 5, 1: 1, 3: 3, 6: 5, None: None}
     fails = []
     for inp, expect in cases.items():
         got = clamp(inp)

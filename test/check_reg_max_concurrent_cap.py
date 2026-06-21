@@ -1,4 +1,4 @@
-"""Smoke check: Reg max_concurrent cap = 2 ở mọi nguồn (Settings, Manager, Server)."""
+"""Smoke check: Reg max_concurrent cap = 5 ở mọi nguồn (Settings, Manager, Server)."""
 from __future__ import annotations
 
 import ast
@@ -31,11 +31,11 @@ def main() -> int:
             failures.append(f"syntax {f}: {e}")
             print(f"[FAIL] syntax {f.relative_to(ROOT)} :: {e}", flush=True)
 
-    # 2. SettingsRepository validate reg.max_concurrent ∈ [1, 2]
+    # 2. SettingsRepository validate reg.max_concurrent ∈ [1, 5]
     from db.repositories import _validate_type_constraint, RepositoryError
 
-    # 1, 2 phải pass
-    for v in (1, 2):
+    # 1..5 phải pass
+    for v in (1, 2, 3, 5):
         try:
             _validate_type_constraint("reg.max_concurrent", v)
             print(f"[PASS] settings accept reg.max_concurrent={v}", flush=True)
@@ -43,8 +43,8 @@ def main() -> int:
             failures.append(f"settings reject {v}: {e}")
             print(f"[FAIL] settings reject {v} :: {e}", flush=True)
 
-    # 3, 5, 10 phải bị reject
-    for v in (3, 5, 10):
+    # 6, 10, 20 phải bị reject
+    for v in (6, 10, 20):
         try:
             _validate_type_constraint("reg.max_concurrent", v)
             failures.append(f"settings ACCEPT {v} (expected reject)")
@@ -59,14 +59,15 @@ def main() -> int:
     async def _check_jm() -> list[str]:
         local_fail: list[str] = []
         jm = JobManager(max_concurrent=1)
-        try:
-            jm.set_max_concurrent(2)
-            print(f"[PASS] JobManager.set_max_concurrent(2) ok, _max={jm.max_concurrent}", flush=True)
-        except ValueError as e:
-            local_fail.append(f"JobManager 2 fail: {e}")
-            print(f"[FAIL] JobManager.set_max_concurrent(2) :: {e}", flush=True)
+        for v in (2, 3, 5):
+            try:
+                jm.set_max_concurrent(v)
+                print(f"[PASS] JobManager.set_max_concurrent({v}) ok, _max={jm.max_concurrent}", flush=True)
+            except ValueError as e:
+                local_fail.append(f"JobManager {v} fail: {e}")
+                print(f"[FAIL] JobManager.set_max_concurrent({v}) :: {e}", flush=True)
 
-        for v in (3, 5, 10):
+        for v in (6, 10, 20):
             try:
                 jm.set_max_concurrent(v)
                 local_fail.append(f"JobManager ACCEPT {v}")
@@ -77,10 +78,10 @@ def main() -> int:
         # apply_settings cap
         jm2 = JobManager(max_concurrent=1)
         jm2.apply_settings({"reg.max_concurrent": 7})
-        if jm2.max_concurrent == 2:
-            print(f"[PASS] apply_settings cap 7 → 2", flush=True)
+        if jm2.max_concurrent == 5:
+            print(f"[PASS] apply_settings cap 7 → 5", flush=True)
         else:
-            local_fail.append(f"apply_settings 7 → {jm2.max_concurrent} (expected 2)")
+            local_fail.append(f"apply_settings 7 → {jm2.max_concurrent} (expected 5)")
             print(f"[FAIL] apply_settings 7 → {jm2.max_concurrent}", flush=True)
         return local_fail
 
@@ -88,19 +89,19 @@ def main() -> int:
 
     # 5. Server set_config clamp logic — kiểm tra qua đọc nguồn
     server_src = (ROOT / "web" / "server.py").read_text(encoding="utf-8")
-    if "max(1, min(payload.max_concurrent, 2))" in server_src:
-        print(f"[PASS] server.py clamp max_concurrent → 2", flush=True)
+    if "max(1, min(payload.max_concurrent, 5))" in server_src:
+        print(f"[PASS] server.py clamp max_concurrent → 5", flush=True)
     else:
-        failures.append("server.py không clamp về 2")
-        print(f"[FAIL] server.py không thấy clamp về 2", flush=True)
+        failures.append("server.py không clamp về 5")
+        print(f"[FAIL] server.py không thấy clamp về 5", flush=True)
 
     # 6. Frontend cap
     js_src = (ROOT / "web" / "static" / "app.js").read_text(encoding="utf-8")
-    if "Math.min(raw, 2)" in js_src:
-        print(f"[PASS] app.js cap _modeToConcurrency → 2", flush=True)
+    if "Math.min(raw, 5)" in js_src:
+        print(f"[PASS] app.js cap _modeToConcurrency → 5", flush=True)
     else:
-        failures.append("app.js không cap _modeToConcurrency về 2")
-        print(f"[FAIL] app.js không cap _modeToConcurrency về 2", flush=True)
+        failures.append("app.js không cap _modeToConcurrency về 5")
+        print(f"[FAIL] app.js không cap _modeToConcurrency về 5", flush=True)
 
     print("", flush=True)
     if failures:

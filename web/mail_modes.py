@@ -130,10 +130,10 @@ def _build_worker_request(
         # mã của chính phiên hiện tại thay vì timeout sớm.
         otp_timeout_seconds=300.0,
         otp_poll_interval_seconds=5.0,
-        # Chờ ~30s không thấy mail thì Resend (thay vì 90s mặc định). An toàn vì
-        # _WORKER_DATE_GRACE=60s vẫn chấp nhận mã in-flight của lần gửi trước,
-        # nên resend nhanh không làm rớt mã đang trên đường về.
-        otp_resend_after_seconds=30.0,
+        # iCloud HME relay có thể trễ 100-200s. Resend sớm chỉ vô hiệu mã đang bay
+        # rồi phải chờ mail mới (lại 100-200s) → đuổi vô tận + dễ bị rate-limit.
+        # Chờ 120s mới cho phép resend; resend tối đa 1 lần (xử lý ở browser/request phase).
+        otp_resend_after_seconds=120.0,
         headless=headless,
         keep_browser_open=keep_browser_open,
         password=password,

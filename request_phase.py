@@ -897,6 +897,7 @@ def _run_request_phase_sync(
     request: SignupRequest,
     mail_provider: MailProvider,
     log: Callable,
+    on_checkpoint: Callable | None = None,
 ) -> dict[str, Any]:
     """Synchronous core — runs in thread via asyncio.to_thread.
 
@@ -1096,6 +1097,14 @@ def _run_request_phase_sync(
         if not otp_code:
             raise RequestPhaseError("OTP polling returned empty code")
 
+        # Đã LẤY ĐƯỢC OTP → báo watchdog gia hạn deadline (tránh kill ngay sau khi có OTP).
+        if on_checkpoint is not None:
+            try:
+                on_checkpoint("otp")
+                log("[request] OTP secured — watchdog gia hạn để hoàn tất")
+            except Exception:
+                pass
+
         # Step 7: Verify OTP với retry. Nếu server trả "wrong code" (code stale
         # hoặc đã bị thay) → resend OTP + poll code MỚI rồi verify lại, thay vì
         # fail cứng. Chỉ raise khi hết số lần hoặc gặp lỗi không phải wrong-code.
@@ -1145,9 +1154,6 @@ def _run_request_phase_sync(
                 new_code = ""
                 pending_candidates: list[str] = []
                 stale_poll_count = 0
-                stale_poll_resend_threshold = 5  # 5 lần code cũ liên tiếp → resend lại
-                inner_resend_count = 0
-                inner_max_resends = 2  # tối đa resend thêm 2 lần trong vòng retry này
                 resend_after_seconds = float(request.otp_resend_after_seconds)
                 poll_interval = max(5.0, request.otp_poll_interval_seconds)
 
@@ -1208,30 +1214,14 @@ def _run_request_phase_sync(
                         break
 
                     if candidate and candidate in tried_codes:
+                        # Code cũ lặp lại = mail mới còn delay. KHÔNG resend (resend chỉ
+                        # vô hiệu mã đang bay). Poll tiếp tới hết deadline.
                         stale_poll_count += 1
-                        if (
-                            stale_poll_count >= stale_poll_resend_threshold
-                            and inner_resend_count < inner_max_resends
-                        ):
-                            inner_resend_count += 1
-                            stale_poll_count = 0
-                            log(
-                                f"[request] poll {stale_poll_resend_threshold} lần chỉ "
-                                f"code cũ → resend lại ({inner_resend_count}/{inner_max_resends})"
-                            )
-                            try:
-                                if not _step_resend_otp(session, device_id, log):
-                                    _step_send_otp(session, device_id, log)
-                            except Exception as exc:
-                                log(f"[request] resend lại lỗi: {exc}")
-                            retry_started_at = datetime.now(timezone.utc)
-                            time.sleep(2.0)
-                        else:
-                            log(
-                                f"[request] poll trả lại code đã thử ({candidate}) → "
-                                f"chờ tiếp ({stale_poll_count}/{stale_poll_resend_threshold})"
-                            )
-                            time.sleep(poll_interval)
+                        log(
+                            f"[request] poll trả lại code đã thử ({candidate}) → "
+                            f"chờ code mới (lần {stale_poll_count})"
+                        )
+                        time.sleep(poll_interval)
                         continue
 
                     # candidate rỗng = mini-timeout hết mà không có mail nào → loop tiếp
@@ -1244,6 +1234,11 @@ def _run_request_phase_sync(
                 raise RequestPhaseError("OTP retry: không nhận được code mới")
             otp_code = new_code
             tried_codes.add(otp_code)
+            if on_checkpoint is not None:
+                try:
+                    on_checkpoint("otp")
+                except Exception:
+                    pass
 
         if not verified:
             raise RequestPhaseError("OTP verify thất bại")
@@ -1347,8 +1342,12 @@ async def run_request_phase(
     request: SignupRequest,
     mail_provider: MailProvider,
     log: Callable = print,
+    on_checkpoint: Callable | None = None,
 ) -> SignupResult:
     """Run pure-request registration. Returns SignupResult.
+
+    on_checkpoint: callback(stage:str) — gọi khi đã lấy được OTP để watchdog
+        bên ngoài gia hạn deadline (tránh kill job ngay sau khi có OTP).
 
     The sync core runs in a worker thread (asyncio.to_thread) and polls OTP
     inline via a fresh event loop, with started_at = exact OTP send time so
@@ -1359,7 +1358,7 @@ async def run_request_phase(
 
     try:
         phase_result = await asyncio.to_thread(
-            _run_request_phase_sync, request, mail_provider, log,
+            _run_request_phase_sync, request, mail_provider, log, on_checkpoint,
         )
 
         result.success = True
