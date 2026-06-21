@@ -70,6 +70,13 @@ impl Settings {
                 raw     TEXT NOT NULL,
                 set_at  INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
             );
+
+            -- Ngôn ngữ giao diện theo user (vi/en). User phải chọn lần đầu.
+            CREATE TABLE IF NOT EXISTS user_lang (
+                user_id INTEGER PRIMARY KEY,
+                lang    TEXT NOT NULL,
+                set_at  INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
+            );
             "#,
         )?;
         Ok(Self {
@@ -310,5 +317,31 @@ impl Settings {
             .lock()
             .execute("DELETE FROM user_proxies WHERE user_id = ?1", params![user_id])?;
         Ok(n > 0)
+    }
+
+    // ── user_lang ─────────────────────────────────────────────────────────
+    /// Ngôn ngữ đã chọn của user ("vi"/"en"). None nếu chưa chọn lần nào.
+    pub fn get_user_lang(&self, user_id: i64) -> Option<String> {
+        self.lock()
+            .query_row(
+                "SELECT lang FROM user_lang WHERE user_id = ?1",
+                params![user_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    /// Đặt ngôn ngữ cho user (upsert).
+    pub fn set_user_lang(&self, user_id: i64, lang: &str) -> Result<()> {
+        self.lock().execute(
+            "INSERT INTO user_lang(user_id, lang) VALUES(?1, ?2)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 lang   = excluded.lang,
+                 set_at = CAST(strftime('%s','now') AS INTEGER)",
+            params![user_id, lang],
+        )?;
+        Ok(())
     }
 }

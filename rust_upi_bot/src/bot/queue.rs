@@ -228,8 +228,10 @@ mod tests {
                 username: None,
                 config: UpiJobConfig {
                     email: "x".into(),
-                    access_token: "x".into(),
-                    cookie_header: "".into(),
+                    auth: crate::upi::runner::AuthSource::Session {
+                        access_token: "x".into(),
+                        cookie_header: "".into(),
+                    },
                     proxy_pool: vec![],
                     approve_retries: 1,
                     restart_threshold: 0,

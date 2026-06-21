@@ -31,7 +31,9 @@ start_service() {
     procd_set_param stdout 1
     procd_set_param stderr 1
     procd_set_param file "$CFG"
-    procd_set_param limits nofile=4096
+    # 100 tiến trình đồng thời × nhiều socket (UPI + login wreq + TLS) → nâng
+    # giới hạn file descriptor để tránh "too many open files".
+    procd_set_param limits nofile=16384
     procd_close_instance
 }
 

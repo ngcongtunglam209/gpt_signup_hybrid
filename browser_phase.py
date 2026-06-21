@@ -1754,6 +1754,29 @@ async def run_browser_phase(
     otp_seconds = 0.0
     callback_url: str | None = None
 
+    # Kết quả enroll 2FA inline (page còn sống — CF-clean). Runner ghi vào đây
+    # sau khi login OK, trước khi đóng browser. NEVER raise để không phá flow
+    # (account đã create — phải trả cookies cho fallback Phase 2).
+    mfa_holder: dict[str, Any] = {}
+
+    async def _enroll_2fa_inline(page) -> None:
+        """Enroll 2FA bằng page đang login. Ghi kết quả vào mfa_holder, không raise."""
+        if not getattr(request, "mfa_inline", False):
+            return
+        from mfa_phase import MfaError, enable_2fa_in_page
+        try:
+            mfa_holder["two_factor"] = await enable_2fa_in_page(page, log=log)
+            log("[browser] 2FA enrolled inline OK (CF-clean)")
+        except MfaError as exc:
+            partial = getattr(exc, "partial_state", None)
+            if partial and partial.get("secret"):
+                mfa_holder["two_factor_partial"] = partial
+                log(f"[browser] 2FA inline: enroll OK nhưng activate fail → partial saved: {exc}")
+            else:
+                log(f"[browser] 2FA inline fail (fallback Phase 2): {exc}")
+        except Exception as exc:
+            log(f"[browser] 2FA inline lỗi bất ngờ (fallback Phase 2): {exc}")
+
     # Track xem có đã chạm mốc OTP poll chưa. Sau mốc này, KHÔNG retry kể cả
     # khi driver chết — vì OTP đã được gửi, retry sẽ gây gửi OTP lần 2 và
     # consume mã không cần thiết.
@@ -1838,6 +1861,8 @@ async def run_browser_phase(
                 or await _extract_state_from_url(page, log=log)
             )
             _cookies = await ctx.cookies()
+            # 2FA inline TRƯỚC khi đóng browser (page còn login + CF-clean).
+            await _enroll_2fa_inline(page)
             return _callback_url, _otp_seconds, _state or "", _cookies
         except BaseException as exc:
             # Plan D: log health snapshot trước khi propagate để debug được
@@ -1917,6 +1942,9 @@ async def run_browser_phase(
                 or await _extract_state_from_url(page, log=log)
             )
             _cookies = await ctx.cookies()
+
+            # 2FA inline TRƯỚC khi đóng ctx (page còn login + CF-clean).
+            await _enroll_2fa_inline(page)
 
             if not (request.keep_browser_open and not request.headless):
                 await ctx.close()
@@ -2035,6 +2063,8 @@ async def run_browser_phase(
             device_id=device_id,
             auth_session_logging_id=logging_id,
             callback_url=callback_url,
+            two_factor=mfa_holder.get("two_factor"),
+            two_factor_partial=mfa_holder.get("two_factor_partial"),
         ),
         otp_seconds,
     )

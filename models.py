@@ -117,6 +117,14 @@ class SignupRequest(BaseModel):
     )
     proxy: str | None = Field(default=None, description="HTTP/HTTPS proxy cho cả 2 phase.")
 
+    # MFA inline — enroll 2FA NGAY trong context vừa tạo account (browser page
+    # hoặc curl session còn sống), tái dùng CF clearance + đúng IP. Tránh spawn
+    # curl_cffi session mới sau khi context chết → bị Cloudflare 403 → mất acc.
+    mfa_inline: bool = Field(
+        default=True,
+        description="Enroll 2FA inline trong phase signup (CF-clean). Tắt → fallback enable_2fa Phase 2 (curl_cffi).",
+    )
+
 
 class BrowserHandoff(BaseModel):
     """Output Phase 1 — context để Phase 2 dùng."""
@@ -132,6 +140,17 @@ class BrowserHandoff(BaseModel):
     callback_url: str = Field(
         ...,
         description="Full callback URL (kèm code + state) trả về từ create_account, dùng cho Phase 2.",
+    )
+
+    # Kết quả enroll 2FA inline (browser page còn sống — CF-clean). None nếu
+    # mfa_inline tắt hoặc enroll fail (caller fallback enable_2fa Phase 2).
+    two_factor: dict[str, Any] | None = Field(
+        default=None,
+        description="MFA result inline {secret, factor_id, session_id, first_code, activated, ...}.",
+    )
+    two_factor_partial: dict[str, Any] | None = Field(
+        default=None,
+        description="State {secret, factor_id, session_id} khi enroll OK nhưng activate fail — để retry activate-only.",
     )
 
     # Cookies Phase 2 cần dùng (helpers)
@@ -162,3 +181,9 @@ class SignupResult(BaseModel):
     phase2_seconds: float = 0.0
     otp_seconds: float = 0.0
     error: str | None = None
+
+    # MFA enroll inline (CF-clean) — set bởi phase signup khi mfa_inline=True.
+    # two_factor: enroll + activate đầy đủ. two_factor_partial: enroll OK nhưng
+    # activate fail → caller persist + retry activate-only (không enroll lại).
+    two_factor: dict[str, Any] | None = Field(default=None, description="MFA result inline (đầy đủ).")
+    two_factor_partial: dict[str, Any] | None = Field(default=None, description="MFA partial state (activate fail).")

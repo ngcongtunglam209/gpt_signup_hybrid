@@ -34,6 +34,12 @@ if TYPE_CHECKING:
     from db.repositories import ComboRepository
 
 
+# UA browser: Cloudflare (Bot Fight Mode/WAF, error 1010) chặn UA httpx/urllib.
+_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
 _OTP_REGEX = re.compile(
     r"(?:verification\s+code|one[-\s]*time\s+(?:password|code)|security\s+code|login\s+code)"
     r"[^0-9]{0,40}(\d{6})"
@@ -104,6 +110,21 @@ class MailProvider(Protocol):
 # ─────────────────────────────────────────────────────────────────────
 
 
+# Grace window cho filter `msg_dt < started_at` của Worker provider.
+# Email `date` field = thời điểm OpenAI gửi mail, còn `started_at` được caller
+# chụp NGAY SAU khi submit (OTP form xuất hiện) → thường lệch 1-3s SAU send.
+# Mail relay iCloud HME → Worker có thể trễ vài phút, nên khi mã hợp lệ cuối cùng
+# về tới, date của nó (= send time) có thể sớm hơn started_at vài giây và bị loại
+# nhầm. Grace nới ngưỡng lùi lại để bù clock-skew. Giữ nhỏ hơn khoảng resend
+# (~90s) để KHÔNG vớt nhầm mã của lần gửi trước trong cùng session.
+# Mirror _OUTLOOK_GRAPH_DATE_GRACE (Outlook provider) — cùng class vấn đề.
+# 60s: bù clock-skew giữa mail server OpenAI và máy chạy bot, đồng thời vẫn nhỏ
+# hơn nhiều so với khoảng cách giữa 2 phiên đăng ký khác nhau (phút/giờ) nên KHÔNG
+# vớt nhầm mã của phiên cũ. Mã OTP cùng phiên (kể cả trước resend) vẫn còn hạn nên
+# chấp nhận được.
+_WORKER_DATE_GRACE = timedelta(seconds=60)
+
+
 class WorkerMailProvider:
     """Cloudflare Worker logs API.
 
@@ -146,7 +167,7 @@ class WorkerMailProvider:
         if not mailbox:
             raise ValueError("recipient is required")
 
-        headers: dict[str, str] = {"Accept": "application/json"}
+        headers: dict[str, str] = {"Accept": "application/json", "User-Agent": _BROWSER_UA}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
@@ -206,7 +227,7 @@ class WorkerMailProvider:
                             if msg_to and msg_to != mailbox:
                                 continue
                             msg_dt = _parse_dt(msg.get("date") or msg.get("receivedAt") or msg.get("created_at"))
-                            if msg_dt is not None and msg_dt < started_at:
+                            if msg_dt is not None and msg_dt < (started_at - _WORKER_DATE_GRACE):
                                 continue
                             subject = str(msg.get("subject") or "")
                             body = (
@@ -251,7 +272,7 @@ class WorkerMailProvider:
         if not mailbox:
             return []
 
-        headers: dict[str, str] = {"Accept": "application/json"}
+        headers: dict[str, str] = {"Accept": "application/json", "User-Agent": _BROWSER_UA}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
@@ -279,7 +300,7 @@ class WorkerMailProvider:
                     if msg_to and msg_to != mailbox:
                         continue
                     msg_dt = _parse_dt(msg.get("date") or msg.get("receivedAt") or msg.get("created_at"))
-                    if msg_dt is not None and msg_dt < started_at:
+                    if msg_dt is not None and msg_dt < (started_at - _WORKER_DATE_GRACE):
                         continue
                     subject = str(msg.get("subject") or "")
                     body = (

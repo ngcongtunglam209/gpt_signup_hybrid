@@ -16,6 +16,7 @@ mod stripe;
 mod stripe_token;
 mod upi;
 mod user_agent;
+mod auth;
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
@@ -28,14 +29,14 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::bot::board::{render_board_html, JobBoard, LiveBoardCtl};
+use crate::bot::i18n::{self, Lang};
 use crate::bot::limiter::{AdmitDecision, MessageDecision, UserLimiter};
 use crate::bot::queue::{spawn_workers, Job, JobEvent, JobQueue, SubmitError, WorkerConfig};
 use crate::bot::registry::JobRegistry;
 use crate::bot::session_buffer::{AppendResult, SessionBuffer};
 use crate::bot::telegram::{CallbackQuery, Message, TelegramClient};
 use crate::http::HttpClient;
-use crate::upi::runner::UpiJobConfig;
-use crate::upi::types::UpiQrResult;
+use crate::upi::runner::{AuthSource, UpiJobConfig};
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "upi-qr-bot", version)]
@@ -53,8 +54,12 @@ struct Cli {
     allowed_users: String,
 
     /// Số worker chạy đồng thời. Job mới sẽ vào queue khi đầy.
-    #[arg(long, env = "MAX_CONCURRENT", default_value = "5", global = true)]
+    #[arg(long, env = "MAX_CONCURRENT", default_value = "100", global = true)]
     max_concurrent: usize,
+
+    /// Số tiến trình tối đa 1 user chạy đồng thời.
+    #[arg(long, env = "MAX_PER_USER", default_value = "2", global = true)]
+    max_per_user: u32,
 
     /// Hard cap số job pending trong queue. Khi đầy, job mới bị reject. Bảo vệ RAM.
     #[arg(long, env = "QUEUE_CAPACITY", default_value = "50", global = true)]
@@ -137,13 +142,28 @@ enum SubCmd {
     StripeProbe,
     /// Run UPI flow 1 lần với session.json file local — không cần Telegram.
     /// Output JSON kết quả + path tới QR PNG.
+    /// Run UPI flow 1 lần — nhận session.json HOẶC combo email|pass|2fa.
+    /// Không cần Telegram. Output JSON kết quả + path tới QR PNG.
     RunOnce {
-        /// Path tới session.json
+        /// Path tới session.json (dùng session có sẵn).
         #[arg(long)]
-        session_json: PathBuf,
+        session_json: Option<PathBuf>,
+        /// Combo "email|password|totp_secret" (login HTTP lấy session).
+        #[arg(long, default_value = "")]
+        combo: String,
         /// Path xuất QR PNG (nếu có).
         #[arg(long, default_value = "/tmp/upi-runonce.png")]
         qr_out: PathBuf,
+    },
+    /// Test login HTTP từ combo `email|password|2fa` → in kết quả session.
+    /// Không cần Telegram. Dùng để verify flow login JA3 (wreq/BoringSSL).
+    LoginOnce {
+        /// Combo "email|password|totp_secret"
+        #[arg(long)]
+        combo: String,
+        /// Proxy URL cho login (optional). Empty = direct.
+        #[arg(long, default_value = "")]
+        proxy: String,
     },
 }
 
@@ -158,6 +178,101 @@ fn parse_proxy_pool(s: &str) -> Vec<String> {
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .collect()
+}
+
+/// Ngôn ngữ user (None nếu chưa chọn lần nào).
+fn user_lang(store: &settings::Settings, user_id: i64) -> Option<Lang> {
+    store.get_user_lang(user_id).and_then(|s| Lang::from_code(&s))
+}
+
+/// Fallback khi chưa rõ (chỉ dùng ở chỗ hiếm); mặc định tiếng Việt.
+fn lang_or_default(store: &settings::Settings, user_id: i64) -> Lang {
+    user_lang(store, user_id).unwrap_or(Lang::Vi)
+}
+
+/// Keyboard chọn ngôn ngữ (song ngữ).
+fn language_keyboard() -> Value {
+    serde_json::json!([[
+        {"text": "🇻🇳 Tiếng Việt", "callback_data": "setlang:vi"},
+        {"text": "🇬🇧 English", "callback_data": "setlang:en"}
+    ]])
+}
+
+/// Keyboard nút Stop cho đúng 1 tiến trình (job_id).
+fn stop_job_keyboard(lang: Lang, job_id: u64) -> Value {
+    serde_json::json!([[
+        {"text": i18n::btn_stop_this(lang), "callback_data": format!("stopjob:{}", job_id)}
+    ]])
+}
+
+/// Keyboard menu cài đặt.
+fn settings_keyboard(lang: Lang) -> Value {
+    serde_json::json!([[
+        {"text": i18n::btn_language(lang), "callback_data": "cmd:language"}
+    ]])
+}
+
+/// Danh sách lệnh menu Telegram localized (set per-chat sau khi chọn ngôn ngữ).
+/// Đầy đủ lệnh user; nếu là admin thì kèm nhóm lệnh admin.
+fn localized_commands(lang: Lang, is_admin: bool) -> Vec<(&'static str, &'static str)> {
+    let mut v = match lang {
+        Lang::Vi => vec![
+            ("start", "Bắt đầu / hướng dẫn"),
+            ("status", "Trạng thái bot + hàng chờ"),
+            ("stop", "Dừng tất cả tiến trình của bạn"),
+            ("cancel", "Xóa bộ đệm văn bản đang chờ"),
+            ("proxy_set", "Đặt proxy riêng của bạn"),
+            ("proxy_remove", "Xóa proxy của bạn"),
+            ("settings", "Cài đặt"),
+            ("language", "Đổi ngôn ngữ"),
+            ("help", "Trợ giúp"),
+        ],
+        Lang::En => vec![
+            ("start", "Start / instructions"),
+            ("status", "Bot status + queue"),
+            ("stop", "Stop all your processes"),
+            ("cancel", "Clear pending text buffer"),
+            ("proxy_set", "Set your own proxy"),
+            ("proxy_remove", "Remove your proxy"),
+            ("settings", "Settings"),
+            ("language", "Change language"),
+            ("help", "Help"),
+        ],
+    };
+    if is_admin {
+        let admin = match lang {
+            Lang::Vi => vec![
+                ("notify", "Gửi thông báo tới mọi user (admin)"),
+                ("chat", "Nhắn riêng 1 user (admin)"),
+                ("ban", "Cấm user (admin)"),
+                ("unban", "Gỡ cấm user (admin)"),
+                ("banlist", "Danh sách user bị cấm (admin)"),
+                ("board", "Bảng tiến trình realtime (admin)"),
+            ],
+            Lang::En => vec![
+                ("notify", "Broadcast to all users (admin)"),
+                ("chat", "Direct message a user (admin)"),
+                ("ban", "Ban a user (admin)"),
+                ("unban", "Unban a user (admin)"),
+                ("banlist", "List banned users (admin)"),
+                ("board", "Live process board (admin)"),
+            ],
+        };
+        v.extend(admin);
+    }
+    v
+}
+
+/// Validate JSON đúng shape của https://chatgpt.com/api/auth/session
+/// (phải có `accessToken` non-empty + object `user`).
+fn is_auth_session_json(v: &Value) -> bool {
+    let has_token = v
+        .get("accessToken")
+        .and_then(|t| t.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let has_user = v.get("user").map(|u| u.is_object()).unwrap_or(false);
+    has_token && has_user
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -185,6 +300,18 @@ async fn main() -> Result<()> {
     let allowed_users = parse_allowed_users(&cli.allowed_users);
     let proxy_pool = parse_proxy_pool(&cli.proxy_pool);
 
+    // Nâng giới hạn file descriptor cho nhiều tiến trình đồng thời (mỗi job mở
+    // socket UPI + login). Chạy root nên set được cả hard limit (tới fs.nr_open).
+    let want_nofile: u64 = (cli.max_concurrent as u64 * 64).clamp(8192, 262144);
+    if let Err(e) = rlimit::Resource::NOFILE.set(want_nofile, want_nofile) {
+        // Fallback: ít nhất nâng soft tới hard hiện có.
+        let _ = rlimit::increase_nofile_limit(want_nofile);
+        warn!("set nofile hard limit fail: {} (đã nâng soft tới hard)", e);
+    }
+    if let Ok((soft, hard)) = rlimit::Resource::NOFILE.get() {
+        info!("nofile limit: soft={} hard={}", soft, hard);
+    }
+
     std::fs::create_dir_all(&cli.qr_out_dir).ok();
     std::fs::create_dir_all(&cli.bundles_cache_dir).ok();
     if let Some(p) = cli.db_path.parent() {
@@ -204,8 +331,11 @@ async fn main() -> Result<()> {
     if let Some(cmd) = cli.cmd.clone() {
         match cmd {
             SubCmd::StripeProbe => return run_stripe_probe(client, cli.bundles_cache_dir.clone()).await,
-            SubCmd::RunOnce { session_json, qr_out } => {
-                return run_once(client, &cli, &proxy_pool, &session_json, &qr_out).await;
+            SubCmd::RunOnce { session_json, combo, qr_out } => {
+                return run_once(client, &cli, &proxy_pool, session_json.as_deref(), &combo, &qr_out).await;
+            }
+            SubCmd::LoginOnce { combo, proxy } => {
+                return run_login_once(&combo, &proxy).await;
             }
         }
     }
@@ -222,6 +352,7 @@ async fn main() -> Result<()> {
     let limiter = UserLimiter::new(
         Duration::from_secs(cli.user_cooldown_seconds),
         cli.user_msg_rate_per_min,
+        cli.max_per_user,
     );
     let session_buffer = Arc::new(tokio::sync::Mutex::new(SessionBuffer::new(
         cli.session_buffer_ttl_seconds,
@@ -268,10 +399,11 @@ async fn main() -> Result<()> {
 
     // Set bot commands menu (mặc định cho mọi user)
     let bot_commands: &[(&str, &str)] = &[
-        ("start", "Open menu"),
+        ("start", "Open menu / Mở menu"),
         ("status", "Bot status"),
-        ("stop", "Cancel my running jobs"),
-        ("cancel", "Clear pending text buffer"),
+        ("stop", "Stop my processes"),
+        ("settings", "Settings / Cài đặt"),
+        ("language", "Language / Ngôn ngữ"),
         ("proxy_set", "Set your own proxy"),
         ("proxy_remove", "Remove your proxy"),
         ("help", "Show help"),
@@ -435,7 +567,7 @@ async fn handle_message(
             Ok(true) => {
                 tg.send_message(
                     msg.chat.id,
-                    "⛔ You have been blocked by the admin.",
+                    &i18n::banned(lang_or_default(&store, user_id)),
                     Some(msg.message_id),
                 )
                 .await
@@ -447,10 +579,11 @@ async fn handle_message(
         }
     }
 
+    let lang_opt = user_lang(&store, user_id);
     if !allowed.is_empty() && !allowed.contains(&user_id) {
         tg.send_message(
             msg.chat.id,
-            "⛔ Account not whitelisted. Contact the admin.",
+            &i18n::not_whitelisted(lang_opt.unwrap_or(Lang::Vi)),
             Some(msg.message_id),
         )
         .await
@@ -458,24 +591,61 @@ async fn handle_message(
         return Ok(());
     }
 
+    // ── Cổng ngôn ngữ: user PHẢI chọn Việt/Anh trước khi dùng bot ──
+    let lang = match lang_opt {
+        Some(l) => l,
+        None => {
+            tg.send_message_kb(
+                msg.chat.id,
+                i18n::choose_language(),
+                None,
+                language_keyboard(),
+            )
+            .await
+            .ok();
+            return Ok(());
+        }
+    };
+
     // Commands
     if let Some(text) = &msg.text {
         let trimmed = text.trim();
         if trimmed.starts_with("/start") {
             // Clear buffer khi /start để không gộp nhầm session cũ
             session_buffer.lock().await.clear(msg.chat.id);
-            send_welcome(&tg, msg.chat.id, msg.message_id).await;
+            // Refresh menu lệnh localized đầy đủ (kèm admin nếu là admin).
+            tg.set_my_commands_for_chat(msg.chat.id, &localized_commands(lang, is_admin))
+                .await
+                .ok();
+            send_welcome(&tg, msg.chat.id, msg.message_id, lang).await;
+            return Ok(());
+        }
+        if trimmed.starts_with("/language") || trimmed.starts_with("/lang") {
+            tg.send_message_kb(msg.chat.id, i18n::choose_language(), None, language_keyboard())
+                .await
+                .ok();
+            return Ok(());
+        }
+        if trimmed.starts_with("/settings") {
+            tg.send_message_kb(
+                msg.chat.id,
+                &i18n::settings_title(lang),
+                None,
+                settings_keyboard(lang),
+            )
+            .await
+            .ok();
             return Ok(());
         }
         if trimmed.starts_with("/help") {
-            send_help(&tg, &store, msg.chat.id, msg.message_id, user_id, is_admin).await;
+            send_help(&tg, &store, msg.chat.id, msg.message_id, user_id, is_admin, lang).await;
             return Ok(());
         }
         if trimmed.starts_with("/status") {
             let pending = queue.pending();
             tg.send_message(
                 msg.chat.id,
-                &format!("✅ Bot online · queue {}/{}", pending, cli.queue_capacity),
+                &format!("{} · queue {}/{}", i18n::status_online(lang), pending, cli.queue_capacity),
                 None,
             )
             .await
@@ -484,7 +654,7 @@ async fn handle_message(
         }
         if trimmed.starts_with("/cancel") {
             session_buffer.lock().await.clear(msg.chat.id);
-            tg.send_message(msg.chat.id, "🧹 Cleared pending text buffer.", None)
+            tg.send_message(msg.chat.id, &i18n::stopped_all(lang, 0), None)
                 .await
                 .ok();
             return Ok(());
@@ -492,11 +662,7 @@ async fn handle_message(
         if trimmed.starts_with("/stop") {
             let stopped = registry.stop_user(user_id).await;
             session_buffer.lock().await.clear(msg.chat.id);
-            let body = if stopped == 0 {
-                "ℹ️ No running jobs to stop.".to_string()
-            } else {
-                format!("🛑 Stopped {} job(s) of yours.", stopped)
-            };
+            let body = i18n::stopped_all(lang, stopped);
             tg.send_message(msg.chat.id, &body, Some(msg.message_id))
                 .await
                 .ok();
@@ -574,15 +740,8 @@ async fn handle_message(
         }
 
         if trimmed.starts_with('/') {
-            // Unknown command — reply hướng dẫn thay vì silent drop. Show
-            // ngắn gọn để user biết bot đang sống và cách xem full help.
             let cmd = trimmed.split_whitespace().next().unwrap_or(trimmed);
-            let body = format!(
-                "❓ Unknown command: {}\n\n\
-                 Type /help to see the list of commands.",
-                cmd
-            );
-            tg.send_message(msg.chat.id, &body, Some(msg.message_id))
+            tg.send_message(msg.chat.id, &i18n::unknown_command(lang, cmd), Some(msg.message_id))
                 .await
                 .ok();
             return Ok(());
@@ -590,6 +749,41 @@ async fn handle_message(
 
         // Text thường — append vào session buffer
         if !trimmed.is_empty() {
+            // Auto-detect combo email|password|2fa (không phải JSON) → login HTTP.
+            if looks_like_combo_input(trimmed) {
+                match parse_account_combo(trimmed) {
+                    Some(combo) => {
+                        session_buffer.lock().await.clear(msg.chat.id);
+                        return process_account_combo(
+                            tg,
+                            queue,
+                            limiter,
+                            registry,
+                            store.clone(),
+                            msg.chat.id,
+                            msg.message_id,
+                            user_id,
+                            username,
+                            combo,
+                            proxy_pool,
+                            cli,
+                            board,
+                            lang,
+                        )
+                        .await;
+                    }
+                    None => {
+                        tg.send_message(
+                            msg.chat.id,
+                            &i18n::invalid_combo(lang),
+                            Some(msg.message_id),
+                        )
+                        .await
+                        .ok();
+                        return Ok(());
+                    }
+                }
+            }
             let result = {
                 let mut buf = session_buffer.lock().await;
                 buf.append(msg.chat.id, text)
@@ -610,6 +804,7 @@ async fn handle_message(
                         proxy_pool,
                         cli,
                         board,
+                        lang,
                     )
                     .await;
                 }
@@ -618,13 +813,10 @@ async fn handle_message(
                     // bởi Telegram → các message kế tiếp sẽ ghép lại trong TTL.
                     return Ok(());
                 }
-                AppendResult::Invalid(reason) => {
+                AppendResult::Invalid(_reason) => {
                     tg.send_message(
                         msg.chat.id,
-                        &format!(
-                            "❌ Text is not a valid JSON object: {}\n\nSend session JSON again (file or paste).",
-                            reason
-                        ),
+                        &i18n::invalid_session_json(lang),
                         Some(msg.message_id),
                     )
                     .await
@@ -640,7 +832,7 @@ async fn handle_message(
     let Some(doc) = msg.document.clone() else {
         tg.send_message(
             msg.chat.id,
-            "📄 Send session.json file or paste JSON text.",
+            &i18n::need_input(lang),
             Some(msg.message_id),
         )
         .await
@@ -650,7 +842,7 @@ async fn handle_message(
 
     let file_name = doc.file_name.unwrap_or_else(|| "session.json".into());
     if !file_name.to_lowercase().ends_with(".json") {
-        tg.send_message(msg.chat.id, "❌ File must be `.json`.", Some(msg.message_id))
+        tg.send_message(msg.chat.id, &i18n::invalid_session_json(lang), Some(msg.message_id))
             .await
             .ok();
         return Ok(());
@@ -658,7 +850,7 @@ async fn handle_message(
     if doc.file_size.unwrap_or(0) > 1_500_000 {
         tg.send_message(
             msg.chat.id,
-            "❌ File too large (>1.5MB). A valid session.json is usually < 100KB.",
+            &i18n::invalid_session_json(lang),
             Some(msg.message_id),
         )
         .await
@@ -684,12 +876,13 @@ async fn handle_message(
         proxy_pool,
         cli,
         board,
+        lang,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn process_session_json(
+async fn enqueue_and_track(
     tg: Arc<TelegramClient>,
     queue: Arc<JobQueue>,
     limiter: UserLimiter,
@@ -699,82 +892,31 @@ async fn process_session_json(
     reply_to: i64,
     user_id: i64,
     username: Option<String>,
-    raw: String,
+    email: String,
+    auth: AuthSource,
     proxy_pool: &[String],
     cli: &Cli,
     board: JobBoard,
+    lang: Lang,
 ) -> Result<()> {
-    // Anti-spam: check submit decision
+    // Admission: tối đa N tiến trình/user (mặc định 2).
     match limiter.check_submit(user_id).await {
         AdmitDecision::Allow => {}
-        AdmitDecision::JobInFlight => {
-            tg.send_message(
-                chat_id,
-                "⚠️ You already have a running job. Wait until it finishes before sending again.",
-                Some(reply_to),
-            )
-            .await
-            .ok();
+        AdmitDecision::MaxConcurrent { max } => {
+            tg.send_message(chat_id, &i18n::max_concurrent(lang, max), Some(reply_to))
+                .await
+                .ok();
             return Ok(());
         }
         AdmitDecision::Cooldown { remaining_secs } => {
-            tg.send_message(
-                chat_id,
-                &format!(
-                    "⏱ Cooldown active — wait {}s before retrying.",
-                    remaining_secs
-                ),
-                Some(reply_to),
-            )
-            .await
-            .ok();
+            tg.send_message(chat_id, &i18n::cooldown(lang, remaining_secs), Some(reply_to))
+                .await
+                .ok();
             return Ok(());
         }
     }
 
-    let session_json: Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(e) => {
-            tg.send_message(
-                chat_id,
-                &format!("❌ Invalid session JSON: {}", e),
-                Some(reply_to),
-            )
-            .await
-            .ok();
-            return Ok(());
-        }
-    };
-
-    let access_token = match session_json.get("accessToken").and_then(|v| v.as_str()) {
-        Some(t) if !t.is_empty() => t.to_string(),
-        _ => {
-            tg.send_message(
-                chat_id,
-                "❌ session JSON missing or empty `accessToken`.",
-                Some(reply_to),
-            )
-            .await
-            .ok();
-            return Ok(());
-        }
-    };
-    let email = session_json
-        .get("user")
-        .and_then(|u| u.get("email"))
-        .and_then(|e| e.as_str())
-        .unwrap_or("unknown@unknown")
-        .to_string();
-    let cookie_header = build_cookie_header(&session_json);
-
-    let job_id = uuid::Uuid::new_v4().simple().to_string();
-    let qr_path = cli.qr_out_dir.join(format!("qr_{}_{}.png", user_id, &job_id[..8]));
-
-    // Per-user proxy override: nếu user đã set proxy → materialize raw line,
-    // override pool global thành 1-element. Proxy của user PRIVATE — không
-    // share sang user khác. Materialize lỗi (format rác lưu từ trước) → log
-    // warn, fallback dùng pool global. /proxy_set đã validate format trước
-    // khi save nên path này hiếm khi rơi vào.
+    // Per-user proxy override (private, không share sang user khác).
     let user_proxy_raw = match store.get_user_proxy(user_id) {
         Ok(v) => v,
         Err(e) => {
@@ -800,10 +942,23 @@ async fn process_session_json(
         None => proxy_pool.to_vec(),
     };
 
+    // Đăng ký job TRƯỚC để có job_id (u64) gắn vào nút Stop của tin.
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<JobEvent>();
+    let (job_id, cancel_token) = registry.register(user_id).await;
+    let qr_path = cli
+        .qr_out_dir
+        .join(format!("qr_{}_{}.png", user_id, job_id));
+    let masked_email = upi::runner::mask_email(&email);
+
+    // Nhãn nguồn auth (để báo admin) — lấy trước khi move vào job_config.
+    let auth_kind = match &auth {
+        AuthSource::Login { .. } => "combo (email|pass|2fa)",
+        AuthSource::Session { .. } => "session.json",
+    };
+
     let job_config = UpiJobConfig {
         email: email.clone(),
-        access_token,
-        cookie_header,
+        auth,
         proxy_pool: effective_pool,
         approve_retries: cli.approve_retries,
         restart_threshold: cli.restart_threshold,
@@ -814,20 +969,16 @@ async fn process_session_json(
         qr_watermark: cli.qr_watermark.clone(),
     };
 
+    // Tin riêng cho tiến trình này, kèm nút Stop mang job_id.
     let status_msg_id = tg
-        .send_message(
+        .send_message_kb(
             chat_id,
-            &format!(
-                "🚀 Job received\nEmail: {}\nUser: {}\nQueueing...",
-                upi::runner::mask_email(&email),
-                username.as_deref().unwrap_or("-")
-            ),
+            &i18n::job_received(lang, &masked_email),
             Some(reply_to),
+            stop_job_keyboard(lang, job_id),
         )
         .await?;
 
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<JobEvent>();
-    let (job_id, cancel_token) = registry.register(user_id).await;
     let username_for_log = username.clone();
     let job = Job {
         user_id,
@@ -843,39 +994,41 @@ async fn process_session_json(
         Ok(position) => {
             limiter.mark_in_flight(user_id).await;
             board
-                .insert_queued(
-                    job_id,
-                    user_id,
-                    username_for_log.clone(),
-                    upi::runner::mask_email(&email),
-                )
+                .insert_queued(job_id, user_id, username_for_log.clone(), masked_email.clone())
                 .await;
-            tg.edit_message_text(
+            tg.edit_message_text_kb(
                 chat_id,
                 status_msg_id,
-                &format!("⏳ Queued (position ≈{})", position),
+                &bot::proc_view::render_queued(lang, &masked_email, position),
+                stop_job_keyboard(lang, job_id),
             )
             .await
             .ok();
+            // Báo admin khi user KHÁC tạo tiến trình mới (skip nếu chính admin).
+            if cli.admin_chat_id != 0 && user_id != cli.admin_chat_id {
+                let note = format!(
+                    "🆕 Tiến trình mới\nTừ: @{} (id {})\nEmail: {}\nNguồn: {}\nHàng chờ: ~{}",
+                    username_for_log.as_deref().unwrap_or("-"),
+                    user_id,
+                    masked_email,
+                    auth_kind,
+                    position,
+                );
+                if let Err(e) = tg.send_message(cli.admin_chat_id, &note, None).await {
+                    tracing::warn!(admin = cli.admin_chat_id, "admin new-process notify fail: {}", e);
+                }
+            }
         }
         Err(SubmitError::QueueFull { pending, capacity }) => {
-            // Job không vào queue được — release token + entry registry.
             registry.unregister(user_id, job_id).await;
-            tg.edit_message_text(
-                chat_id,
-                status_msg_id,
-                &format!(
-                    "🚫 Queue full ({}/{}). Bot is busy, please retry in a few minutes.",
-                    pending, capacity
-                ),
-            )
-            .await
-            .ok();
+            tg.edit_message_text(chat_id, status_msg_id, &i18n::queue_full(lang, pending, capacity))
+                .await
+                .ok();
             return Ok(());
         }
         Err(SubmitError::Closed) => {
             registry.unregister(user_id, job_id).await;
-            tg.edit_message_text(chat_id, status_msg_id, "🚫 Queue closed.")
+            tg.edit_message_text(chat_id, status_msg_id, &i18n::queue_closed(lang))
                 .await
                 .ok();
             return Ok(());
@@ -887,28 +1040,16 @@ async fn process_session_json(
     let admin_chat_id = cli.admin_chat_id;
     let board_for_task = board;
     let board_job_id = job_id;
+    let email_for_done = masked_email.clone();
     tokio::spawn(async move {
         let mut last_edit = std::time::Instant::now()
             .checked_sub(Duration::from_secs(60))
             .unwrap_or_else(std::time::Instant::now);
-        let mut log_buffer: Vec<String> = Vec::new();
         let mut started_at = std::time::Instant::now();
-        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        let mut view = bot::proc_view::ProcView::new(email_for_done.clone());
+        let mut running = false;
+        let mut tick = tokio::time::interval(Duration::from_secs(3));
         tick.tick().await; // first tick fires immediately — consume it.
-
-        let render_progress =
-            |started: std::time::Instant, buf: &Vec<String>| -> String {
-                let body = format!(
-                    "▶️ Processing ({:.0}s)\n\n{}",
-                    started.elapsed().as_secs_f64(),
-                    buf.join("\n")
-                );
-                if body.len() > 3800 {
-                    format!("{}…", &body[..3800])
-                } else {
-                    body
-                }
-            };
 
         loop {
             tokio::select! {
@@ -917,38 +1058,44 @@ async fn process_session_json(
                     match event {
                         JobEvent::Queued { position } => {
                             tg_for_log
-                                .edit_message_text(
+                                .edit_message_text_kb(
                                     chat_id,
                                     status_msg_id,
-                                    &format!("⏳ Queued (position ≈{})", position),
+                                    &bot::proc_view::render_queued(lang, &email_for_done, position),
+                                    stop_job_keyboard(lang, board_job_id),
                                 )
                                 .await
                                 .ok();
                         }
                         JobEvent::Started => {
                             started_at = std::time::Instant::now();
+                            running = true;
                             board_for_task.mark_running(board_job_id).await;
                             tg_for_log
-                                .edit_message_text(
+                                .edit_message_text_kb(
                                     chat_id,
                                     status_msg_id,
-                                    "▶️ Starting UPI flow...",
+                                    &bot::proc_view::render_your_turn(lang, &email_for_done),
+                                    stop_job_keyboard(lang, board_job_id),
                                 )
                                 .await
                                 .ok();
                             last_edit = std::time::Instant::now();
                         }
                         JobEvent::Log(line) => {
+                            // Board admin giữ log thô; user xem thẻ tiến trình gọn.
                             board_for_task.set_step(board_job_id, line.clone()).await;
-                            log_buffer.push(line);
-                            if log_buffer.len() > 24 {
-                                let drop_n = log_buffer.len() - 24;
-                                log_buffer.drain(0..drop_n);
-                            }
+                            view.update(&line);
+                            running = true;
                             if last_edit.elapsed() > Duration::from_millis(2500) {
-                                let body = render_progress(started_at, &log_buffer);
+                                let body = view.render_running(lang, started_at.elapsed().as_secs_f64());
                                 tg_for_log
-                                    .edit_message_text(chat_id, status_msg_id, &body)
+                                    .edit_message_text_kb(
+                                        chat_id,
+                                        status_msg_id,
+                                        &body,
+                                        stop_job_keyboard(lang, board_job_id),
+                                    )
                                     .await
                                     .ok();
                                 last_edit = std::time::Instant::now();
@@ -956,7 +1103,31 @@ async fn process_session_json(
                         }
                         JobEvent::Done(result) => {
                             board_for_task.remove(board_job_id).await;
-                            let body = render_done_message(&result);
+                            let expires = format_expires(result.qr_expires_at);
+                            let attempts = result.approve_attempts.len();
+                            let body = if result.ok {
+                                bot::proc_view::render_done_ok(
+                                    lang,
+                                    &email_for_done,
+                                    result.elapsed_seconds,
+                                    &expires,
+                                    attempts,
+                                )
+                            } else {
+                                let raw = result
+                                    .error
+                                    .clone()
+                                    .or_else(|| result.qr_reason.clone())
+                                    .unwrap_or_default();
+                                bot::proc_view::render_done_fail(
+                                    lang,
+                                    &email_for_done,
+                                    result.elapsed_seconds,
+                                    &raw,
+                                    attempts,
+                                )
+                            };
+                            // Tin terminal: BỎ nút Stop (edit không kèm keyboard).
                             tg_for_log
                                 .edit_message_text(chat_id, status_msg_id, &body)
                                 .await
@@ -964,32 +1135,17 @@ async fn process_session_json(
                             if let Some(qr) = result.qr_path.as_deref() {
                                 let path = std::path::Path::new(qr);
                                 if path.exists() {
-                                    let caption = format!(
-                                        "✅ UPI QR ready\nEmail: {}\nExpires: {}",
-                                        result.email,
-                                        format_expires(result.qr_expires_at),
-                                    );
+                                    let caption = i18n::qr_caption(lang, &email_for_done, &expires);
                                     if let Err(e) = tg_for_log
                                         .send_photo(chat_id, path, Some(&caption), None)
                                         .await
                                     {
-                                        tg_for_log
-                                            .send_message(
-                                                chat_id,
-                                                &format!("⚠️ sendPhoto fail: {}", e),
-                                                None,
-                                            )
-                                            .await
-                                            .ok();
+                                        tracing::warn!("sendPhoto fail: {}", e);
                                     }
                                 }
                             }
-                            // Notify admin chat khi user KHÁC tạo QR thành công.
-                            // Skip nếu admin tự tạo, hoặc admin_chat_id = 0 (disabled).
-                            if result.ok
-                                && admin_chat_id != 0
-                                && user_id != admin_chat_id
-                            {
+                            // Notify admin khi user KHÁC tạo QR thành công.
+                            if result.ok && admin_chat_id != 0 && user_id != admin_chat_id {
                                 let summary = format!(
                                     "🆕 QR success\nFrom: @{} (id {})\nEmail: {}\nElapsed: {:.1}s",
                                     username_for_log.as_deref().unwrap_or("-"),
@@ -997,15 +1153,8 @@ async fn process_session_json(
                                     result.email,
                                     result.elapsed_seconds,
                                 );
-                                if let Err(e) = tg_for_log
-                                    .send_message(admin_chat_id, &summary, None)
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        admin_chat_id,
-                                        "admin notify fail: {}",
-                                        e
-                                    );
+                                if let Err(e) = tg_for_log.send_message(admin_chat_id, &summary, None).await {
+                                    tracing::warn!(admin_chat_id, "admin notify fail: {}", e);
                                 }
                             }
                             crate::bot::queue::cleanup_qr_artifacts(&qr_path_for_send);
@@ -1017,7 +1166,11 @@ async fn process_session_json(
                                 .edit_message_text(
                                     chat_id,
                                     status_msg_id,
-                                    "⏰ Job timeout — killed to free worker. You can retry.",
+                                    &bot::proc_view::render_timeout(
+                                        lang,
+                                        &email_for_done,
+                                        started_at.elapsed().as_secs_f64(),
+                                    ),
                                 )
                                 .await
                                 .ok();
@@ -1030,7 +1183,11 @@ async fn process_session_json(
                                 .edit_message_text(
                                     chat_id,
                                     status_msg_id,
-                                    "🛑 Job cancelled by /stop.",
+                                    &bot::proc_view::render_stopped(
+                                        lang,
+                                        &email_for_done,
+                                        started_at.elapsed().as_secs_f64(),
+                                    ),
                                 )
                                 .await
                                 .ok();
@@ -1040,13 +1197,16 @@ async fn process_session_json(
                     }
                 }
                 _ = tick.tick() => {
-                    // Periodic heartbeat — refresh elapsed counter dù không có log mới.
-                    // Quan trọng khi 1 step (vd checkout) stall lâu trên mạng — user
-                    // vẫn thấy "Processing (Xs)" tăng để biết bot còn sống.
-                    if !log_buffer.is_empty() && last_edit.elapsed() > Duration::from_millis(2500) {
-                        let body = render_progress(started_at, &log_buffer);
+                    // Nhịp tim — cập nhật đồng hồ dù không có log mới.
+                    if running && last_edit.elapsed() > Duration::from_millis(2500) {
+                        let body = view.render_running(lang, started_at.elapsed().as_secs_f64());
                         tg_for_log
-                            .edit_message_text(chat_id, status_msg_id, &body)
+                            .edit_message_text_kb(
+                                chat_id,
+                                status_msg_id,
+                                &body,
+                                stop_job_keyboard(lang, board_job_id),
+                            )
                             .await
                             .ok();
                         last_edit = std::time::Instant::now();
@@ -1057,6 +1217,158 @@ async fn process_session_json(
     });
 
     Ok(())
+}
+
+/// Combo tài khoản dạng `email|password|totp_secret`.
+struct AccountCombo {
+    email: String,
+    password: String,
+    totp_secret: String,
+}
+
+/// Heuristic: text trông giống combo (không phải JSON, có '|' và '@').
+fn looks_like_combo_input(text: &str) -> bool {
+    let t = text.trim();
+    !t.starts_with('{') && !t.starts_with('[') && t.contains('|') && t.contains('@')
+}
+
+/// Parse 1 dòng `email|password|totp_secret`. Yêu cầu đúng 1 tài khoản/lần
+/// (multi-line bị từ chối ở caller). Trả None nếu format sai.
+fn parse_account_combo(text: &str) -> Option<AccountCombo> {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.len() != 1 {
+        return None;
+    }
+    let parts: Vec<&str> = lines[0].split('|').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let email = parts[0].trim();
+    let password = parts[1].trim();
+    let secret = parts[2].trim();
+    if email.is_empty() || password.is_empty() || secret.is_empty() || !email.contains('@') {
+        return None;
+    }
+    Some(AccountCombo {
+        email: email.to_string(),
+        password: password.to_string(),
+        totp_secret: secret.to_string(),
+    })
+}
+
+/// Nhận session.json (file hoặc paste text) → build job với session có sẵn.
+#[allow(clippy::too_many_arguments)]
+async fn process_session_json(
+    tg: Arc<TelegramClient>,
+    queue: Arc<JobQueue>,
+    limiter: UserLimiter,
+    registry: JobRegistry,
+    store: Arc<settings::Settings>,
+    chat_id: i64,
+    reply_to: i64,
+    user_id: i64,
+    username: Option<String>,
+    raw: String,
+    proxy_pool: &[String],
+    cli: &Cli,
+    board: JobBoard,
+    lang: Lang,
+) -> Result<()> {
+    // Chỉ nhận JSON đúng shape của https://chatgpt.com/api/auth/session.
+    let session_json: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => {
+            tg.send_message(chat_id, &i18n::invalid_session_json(lang), Some(reply_to))
+                .await
+                .ok();
+            return Ok(());
+        }
+    };
+    if !is_auth_session_json(&session_json) {
+        tg.send_message(chat_id, &i18n::invalid_session_json(lang), Some(reply_to))
+            .await
+            .ok();
+        return Ok(());
+    }
+    let access_token = session_json
+        .get("accessToken")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let email = session_json
+        .get("user")
+        .and_then(|u| u.get("email"))
+        .and_then(|e| e.as_str())
+        .unwrap_or("unknown@unknown")
+        .to_string();
+    let cookie_header = build_cookie_header(&session_json);
+
+    enqueue_and_track(
+        tg,
+        queue,
+        limiter,
+        registry,
+        store,
+        chat_id,
+        reply_to,
+        user_id,
+        username,
+        email,
+        AuthSource::Session {
+            access_token,
+            cookie_header,
+        },
+        proxy_pool,
+        cli,
+        board,
+        lang,
+    )
+    .await
+}
+
+/// Nhận combo `email|password|2fa` → login HTTP ở step [1/6] rồi chạy UPI.
+#[allow(clippy::too_many_arguments)]
+async fn process_account_combo(
+    tg: Arc<TelegramClient>,
+    queue: Arc<JobQueue>,
+    limiter: UserLimiter,
+    registry: JobRegistry,
+    store: Arc<settings::Settings>,
+    chat_id: i64,
+    reply_to: i64,
+    user_id: i64,
+    username: Option<String>,
+    combo: AccountCombo,
+    proxy_pool: &[String],
+    cli: &Cli,
+    board: JobBoard,
+    lang: Lang,
+) -> Result<()> {
+    enqueue_and_track(
+        tg,
+        queue,
+        limiter,
+        registry,
+        store,
+        chat_id,
+        reply_to,
+        user_id,
+        username,
+        combo.email,
+        AuthSource::Login {
+            password: combo.password,
+            totp_secret: combo.totp_secret,
+        },
+        proxy_pool,
+        cli,
+        board,
+        lang,
+    )
+    .await
 }
 
 /// Giờ VN dạng HH:MM:SS cho nhãn cập nhật của board.
@@ -1201,35 +1513,6 @@ fn format_expires(ts_opt: Option<i64>) -> String {
     format!("{} (UTC+7){}", vn.format("%d/%m/%Y %H:%M"), suffix)
 }
 
-fn render_done_message(r: &UpiQrResult) -> String {
-    let icon = if r.ok { "✅" } else { "❌" };
-    let status = if r.ok { "DONE" } else { "FAIL" };
-    let mut s = format!(
-        "{} {}\nEmail: {}\nElapsed: {:.1}s\nApproved: {}\nRestarts: {}\n",
-        icon,
-        status,
-        r.email,
-        r.elapsed_seconds,
-        if r.qr_path.is_some() && r.ok {
-            "yes"
-        } else {
-            "no"
-        },
-        r.restart_count,
-    );
-    if let Some(reason) = &r.qr_reason {
-        s.push_str(&format!("Reason: {}\n", reason));
-    }
-    if let Some(err) = &r.error {
-        s.push_str(&format!("Error: {}\n", err));
-    }
-    if !r.ok {
-        s.push_str("\n💡 Failed — you can retry by sending session JSON again after cooldown.\n");
-    }
-    s
-}
-
-
 async fn run_stripe_probe(client: Arc<HttpClient>, cache_dir: PathBuf) -> Result<()> {
     let cache = stripe::bundles::BundleCache::new(cache_dir);
     println!("→ fetch_bundles_live ...");
@@ -1261,28 +1544,55 @@ async fn run_once(
     client: Arc<HttpClient>,
     cli: &Cli,
     proxy_pool: &[String],
-    session_json: &PathBuf,
+    session_json: Option<&std::path::Path>,
+    combo: &str,
     qr_out: &PathBuf,
 ) -> Result<()> {
-    let raw = std::fs::read(session_json).context("failed to read session.json")?;
-    let v: Value = serde_json::from_slice(&raw).context("session.json is not valid JSON")?;
-    let access_token = v
-        .get("accessToken")
-        .and_then(|x| x.as_str())
-        .ok_or_else(|| anyhow!("session.json missing accessToken"))?
-        .to_string();
-    let email = v
-        .get("user")
-        .and_then(|u| u.get("email"))
-        .and_then(|e| e.as_str())
-        .unwrap_or("unknown@unknown")
-        .to_string();
-    let cookie_header = build_cookie_header(&v);
+    // Build (email, auth) từ combo email|pass|2fa HOẶC session.json.
+    let (email, auth) = if !combo.trim().is_empty() {
+        let parts: Vec<&str> = combo.split('|').collect();
+        if parts.len() < 3 {
+            return Err(anyhow!("combo phải là email|password|totp_secret"));
+        }
+        let (e, p, s) = (parts[0].trim(), parts[1].trim(), parts[2].trim());
+        if e.is_empty() || p.is_empty() || s.is_empty() {
+            return Err(anyhow!("combo có field rỗng"));
+        }
+        (
+            e.to_string(),
+            AuthSource::Login {
+                password: p.to_string(),
+                totp_secret: s.to_string(),
+            },
+        )
+    } else {
+        let path = session_json.ok_or_else(|| anyhow!("cần --session-json hoặc --combo"))?;
+        let raw = std::fs::read(path).context("failed to read session.json")?;
+        let v: Value = serde_json::from_slice(&raw).context("session.json is not valid JSON")?;
+        let access_token = v
+            .get("accessToken")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow!("session.json missing accessToken"))?
+            .to_string();
+        let email = v
+            .get("user")
+            .and_then(|u| u.get("email"))
+            .and_then(|e| e.as_str())
+            .unwrap_or("unknown@unknown")
+            .to_string();
+        let cookie_header = build_cookie_header(&v);
+        (
+            email,
+            AuthSource::Session {
+                access_token,
+                cookie_header,
+            },
+        )
+    };
 
     let job = UpiJobConfig {
         email,
-        access_token,
-        cookie_header,
+        auth,
         proxy_pool: proxy_pool.to_vec(),
         approve_retries: cli.approve_retries,
         restart_threshold: cli.restart_threshold,
@@ -1301,33 +1611,63 @@ async fn run_once(
     Ok(())
 }
 
+/// Test login HTTP từ combo `email|password|2fa` → in kết quả (không in token).
+async fn run_login_once(combo: &str, proxy: &str) -> Result<()> {
+    let parts: Vec<&str> = combo.split('|').collect();
+    if parts.len() < 3 {
+        return Err(anyhow!("combo phải là email|password|totp_secret"));
+    }
+    let email = parts[0].trim();
+    let password = parts[1].trim();
+    let secret = parts[2].trim();
+    if email.is_empty() || password.is_empty() || secret.is_empty() {
+        return Err(anyhow!("combo có field rỗng"));
+    }
+    let proxy_opt = if proxy.trim().is_empty() {
+        None
+    } else {
+        Some(proxy.trim())
+    };
 
-/// Welcome message with inline keyboard.
-async fn send_welcome(tg: &Arc<TelegramClient>, chat_id: i64, reply_to: i64) {
-    let info = "👋 UPI QR Bot\n\n\
-        Send your session.json file or paste the JSON text \
-        (long text auto-merged from Telegram chunks).\n\n\
-        Pick an action:";
+    let log: crate::upi::runner::LogFn = Arc::new(|line: &str| println!("{}", line));
+    match crate::auth::login_pure_request(email, password, secret, proxy_opt, &log).await {
+        Ok(sess) => {
+            println!("\n=== LOGIN OK ===");
+            println!(
+                "accessToken_len={} cookie_count={} cookie_header_len={}",
+                sess.access_token.len(),
+                sess.cookie_count,
+                sess.cookie_header.len()
+            );
+            Ok(())
+        }
+        Err(e) => {
+            println!("\n=== LOGIN FAIL ===\n{}", e);
+            Err(anyhow!("login failed"))
+        }
+    }
+}
+
+
+/// Welcome message with inline keyboard (localized).
+async fn send_welcome(tg: &Arc<TelegramClient>, chat_id: i64, reply_to: i64, lang: Lang) {
+    let info = i18n::welcome(lang);
     let kb = serde_json::json!([
         [
-            {"text": "📊 Status", "callback_data": "cmd:status"},
-            {"text": "🛑 Stop my jobs", "callback_data": "cmd:stop"}
+            {"text": i18n::btn_status(lang), "callback_data": "cmd:status"},
+            {"text": i18n::btn_stop_all(lang), "callback_data": "cmd:stop"}
         ],
         [
-            {"text": "🧹 Clear buffer", "callback_data": "cmd:cancel"},
-            {"text": "❓ Help", "callback_data": "cmd:help"}
+            {"text": i18n::btn_settings(lang), "callback_data": "cmd:settings"},
+            {"text": i18n::btn_help(lang), "callback_data": "cmd:help"}
         ],
         [
-            {"text": "💬 Contact @prr9293", "url": "https://t.me/prr9293"}
+            {"text": "💬 @prr9293", "url": "https://t.me/prr9293"}
         ]
     ]);
-    if let Err(e) = tg
-        .send_message_kb(chat_id, info, Some(reply_to), kb)
-        .await
-    {
+    if let Err(e) = tg.send_message_kb(chat_id, &info, Some(reply_to), kb).await {
         tracing::warn!("send_welcome fail: {}", e);
-        // Fallback: plain text
-        tg.send_message(chat_id, info, Some(reply_to)).await.ok();
+        tg.send_message(chat_id, &info, Some(reply_to)).await.ok();
     }
 }
 
@@ -1362,35 +1702,66 @@ async fn handle_callback(
 
     let chat_id = cb.message.as_ref().map(|m| m.chat.id).unwrap_or(0);
     let data = cb.data.clone().unwrap_or_default();
+    let lang = lang_or_default(&store, user_id);
+
+    // Chọn ngôn ngữ (có thể xảy ra trước khi user có lang).
+    if let Some(code) = data.strip_prefix("setlang:") {
+        if let Some(l) = Lang::from_code(code) {
+            store.set_user_lang(user_id, l.code()).ok();
+            tg.answer_callback_query(&cb.id, Some(&i18n::language_set(l))).await.ok();
+            // Đặt menu lệnh localized cho riêng chat này (đầy đủ + admin nếu có).
+            let cmds = localized_commands(l, is_admin);
+            tg.set_my_commands_for_chat(chat_id, &cmds).await.ok();
+            send_welcome(&tg, chat_id, 0, l).await;
+        } else {
+            tg.answer_callback_query(&cb.id, None).await.ok();
+        }
+        return Ok(());
+    }
+
+    // Dừng đúng 1 tiến trình theo job_id.
+    if let Some(id_str) = data.strip_prefix("stopjob:") {
+        if let Ok(job_id) = id_str.parse::<u64>() {
+            let ok = registry.stop_job(user_id, job_id).await;
+            let toast = if ok { i18n::stopped_this(lang) } else { i18n::stop_not_found(lang) };
+            tg.answer_callback_query(&cb.id, Some(&toast)).await.ok();
+        } else {
+            tg.answer_callback_query(&cb.id, None).await.ok();
+        }
+        return Ok(());
+    }
 
     match data.as_str() {
         "cmd:status" => {
             tg.answer_callback_query(&cb.id, None).await.ok();
-            tg.send_message(chat_id, "✅ Bot online.", None).await.ok();
+            tg.send_message(chat_id, &i18n::status_online(lang), None).await.ok();
         }
         "cmd:stop" => {
             let n = registry.stop_user(user_id).await;
             session_buffer.lock().await.clear(chat_id);
-            let body = if n == 0 {
-                "ℹ️ No running jobs to stop.".to_string()
-            } else {
-                format!("🛑 Stopped {} job(s) of yours.", n)
-            };
+            let body = i18n::stopped_all(lang, n);
             tg.answer_callback_query(&cb.id, Some(&body)).await.ok();
             tg.send_message(chat_id, &body, None).await.ok();
         }
-        "cmd:cancel" => {
-            session_buffer.lock().await.clear(chat_id);
-            tg.answer_callback_query(&cb.id, Some("Buffer cleared"))
-                .await
-                .ok();
-            tg.send_message(chat_id, "🧹 Cleared pending text buffer.", None)
+        "cmd:settings" => {
+            tg.answer_callback_query(&cb.id, None).await.ok();
+            tg.send_message_kb(chat_id, &i18n::settings_title(lang), None, settings_keyboard(lang))
                 .await
                 .ok();
         }
+        "cmd:language" => {
+            tg.answer_callback_query(&cb.id, None).await.ok();
+            tg.send_message_kb(chat_id, i18n::choose_language(), None, language_keyboard())
+                .await
+                .ok();
+        }
+        "cmd:cancel" => {
+            session_buffer.lock().await.clear(chat_id);
+            tg.answer_callback_query(&cb.id, None).await.ok();
+        }
         "cmd:help" => {
             tg.answer_callback_query(&cb.id, None).await.ok();
-            send_help(&tg, &store, chat_id, 0, user_id, is_admin).await;
+            send_help(&tg, &store, chat_id, 0, user_id, is_admin, lang).await;
         }
         "proxy:check" => {
             // Probe live status proxy của chính user — không cho user khác
@@ -2167,52 +2538,94 @@ async fn send_help(
     reply_to: i64,
     user_id: i64,
     is_admin: bool,
+    lang: Lang,
 ) {
-    let mut help = String::from(
-        "📚 Commands\n\n\
-         User:\n\
-         /start — open menu\n\
-         /status — bot status\n\
-         /stop — cancel YOUR running jobs\n\
-         /cancel — clear pending text buffer\n\
-         /proxy_set <line> — set your own proxy\n\
-         /proxy_remove — remove your proxy\n\
-         /help — this message\n",
-    );
+    let vi = matches!(lang, Lang::Vi);
+    let mut help = if vi {
+        String::from(
+            "📚 Danh sách lệnh\n\n\
+             Người dùng:\n\
+             /start — mở menu / hướng dẫn\n\
+             /status — trạng thái bot + hàng chờ\n\
+             /stop — dừng TẤT CẢ tiến trình của bạn\n\
+             /cancel — xóa bộ đệm văn bản đang chờ\n\
+             /proxy_set <line> — đặt proxy riêng của bạn\n\
+             /proxy_remove — xóa proxy của bạn\n\
+             /settings — cài đặt\n\
+             /language — đổi ngôn ngữ\n\
+             /help — bảng này\n",
+        )
+    } else {
+        String::from(
+            "📚 Commands\n\n\
+             User:\n\
+             /start — open menu / instructions\n\
+             /status — bot status + queue\n\
+             /stop — stop ALL your processes\n\
+             /cancel — clear pending text buffer\n\
+             /proxy_set <line> — set your own proxy\n\
+             /proxy_remove — remove your proxy\n\
+             /settings — settings\n\
+             /language — change language\n\
+             /help — this message\n",
+        )
+    };
     if is_admin {
-        help.push_str(
+        help.push_str(if vi {
             "\nAdmin:\n\
-             /notify <message> — broadcast to all users (keeps line breaks + formatting)\n\
-             /chat <@username | id> <message> — send a direct message to one user\n\
-             /ban <@username | id> [reason] — ban by user_id\n\
-             /unban <@username | id> — unban\n\
-             /banlist — list banned users\n",
-        );
-        help.push_str("             /board — live process table (auto-refresh)\n");
+             /notify <nội dung> — gửi thông báo tới mọi user (giữ format)\n\
+             /chat <@user | id> <nội dung> — nhắn riêng 1 user\n\
+             /ban <@user | id> [lý do] — cấm theo user_id\n\
+             /unban <@user | id> — gỡ cấm\n\
+             /banlist — danh sách user bị cấm\n\
+             /board — bảng tiến trình realtime\n"
+        } else {
+            "\nAdmin:\n\
+             /notify <message> — broadcast to all users (keeps formatting)\n\
+             /chat <@user | id> <message> — direct message one user\n\
+             /ban <@user | id> [reason] — ban by user_id\n\
+             /unban <@user | id> — unban\n\
+             /banlist — list banned users\n\
+             /board — live process table\n"
+        });
     }
-    help.push_str(
-        "\nSupported proxy formats (same as Python upi):\n\
+    help.push_str(if vi {
+        "\nĐịnh dạng proxy hỗ trợ:\n\
          • host:port\n\
          • host:port:user:pass\n\
          • scheme://user:pass@host:port (http, https, socks5)\n\
-         • {SID} placeholder for sticky sessions\n",
-    );
+         • {SID} cho sticky session\n"
+    } else {
+        "\nSupported proxy formats:\n\
+         • host:port\n\
+         • host:port:user:pass\n\
+         • scheme://user:pass@host:port (http, https, socks5)\n\
+         • {SID} placeholder for sticky sessions\n"
+    });
 
-    // Trạng thái proxy hiện tại của user
     match store.get_user_proxy(user_id) {
         Ok(Some(raw)) => {
             help.push_str(&format!(
-                "\n🌐 Your proxy: {}\n",
+                "\n🌐 {}: {}\n",
+                if vi { "Proxy của bạn" } else { "Your proxy" },
                 proxy_format::mask_proxy(&raw)
             ));
         }
         Ok(None) => {
-            help.push_str("\n🌐 Proxy: not set (DIRECT or admin's global pool)\n");
+            help.push_str(if vi {
+                "\n🌐 Proxy: chưa đặt (DIRECT hoặc dùng pool chung của admin)\n"
+            } else {
+                "\n🌐 Proxy: not set (DIRECT or admin's global pool)\n"
+            });
         }
         Err(_) => {}
     }
 
-    help.push_str("\nSend a session.json file or paste JSON text to start a job.");
+    help.push_str(if vi {
+        "\nGửi file session.json (lấy từ chatgpt.com/api/auth/session) hoặc combo `email|password|2fa` để bắt đầu."
+    } else {
+        "\nSend a session.json file (from chatgpt.com/api/auth/session) or combo `email|password|2fa` to start."
+    });
 
     let reply = if reply_to == 0 { None } else { Some(reply_to) };
     tg.send_message(chat_id, &help, reply).await.ok();

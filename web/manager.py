@@ -526,6 +526,9 @@ class JobManager:
         self._auto_retry: bool = False
         self._auto_retry_max: int = 3
         self._auto_retry_delay: float = 15.0
+        # MFA inline: enroll 2FA ngay trong context vừa tạo account (CF-clean).
+        # Default True — fix bug curl_cffi spawn-sau bị CF 403 → mất acc.
+        self._mfa_inline: bool = True
         # Toggle áp dụng proxy pool cho job (per-Reg). False = job chạy direct
         # (no proxy) — bỏ qua acquire ở _begin_job_proxy / rerun / 2FA branch.
         # Default True để giữ behavior cũ.
@@ -790,6 +793,8 @@ class JobManager:
             val = float(settings["reg.auto_retry_delay"])
             if val >= 5.0:
                 self._auto_retry_delay = val
+        if "reg.mfa_inline" in settings:
+            self._mfa_inline = bool(settings["reg.mfa_inline"])
 
     async def _maybe_auto_retry(self, job: Job) -> bool:
         """If auto-retry enabled and retries < max, requeue job after delay.
@@ -1768,6 +1773,8 @@ class JobManager:
                 proxy=job_proxy,
                 reg_mode=job.reg_mode,
             )
+            # Hydrate mfa_inline từ Settings Store (single source of truth).
+            request.mfa_inline = self._mfa_inline
             result: SignupResult = await run_signup(
                 request, log=log, combo_repo=self._combo_repo,
             )
@@ -1888,15 +1895,30 @@ class JobManager:
                 return
 
             try:
-                mfa_result = await enable_2fa(
-                    access_token=result.access_token,
-                    cookies=result.cookies,
-                    proxy=getattr(job, "_active_proxy", None),
-                    on_enroll=_make_on_enroll_callback(
-                        self._session_repo, email=job.email, log=log,
-                    ),
-                    log=log,
-                )
+                mfa_result = result.two_factor
+                if mfa_result is not None:
+                    log("[2fa] dùng enroll inline (CF-clean) — skip enable_2fa Phase 2")
+                else:
+                    # Inline tắt / enroll fail → fallback curl_cffi. Nếu inline
+                    # đã enroll OK nhưng activate fail → pending để activate-only.
+                    inline_partial = result.two_factor_partial
+                    if inline_partial:
+                        _persist_partial_state_sync(
+                            self._session_repo,
+                            email=job.email,
+                            partial_state=inline_partial,
+                            log=log,
+                        )
+                    mfa_result = await enable_2fa(
+                        access_token=result.access_token,
+                        cookies=result.cookies,
+                        proxy=getattr(job, "_active_proxy", None),
+                        pending_enrollment=inline_partial,
+                        on_enroll=_make_on_enroll_callback(
+                            self._session_repo, email=job.email, log=log,
+                        ),
+                        log=log,
+                    )
             except MfaError as exc:
                 _persist_partial_state_sync(
                     self._session_repo,

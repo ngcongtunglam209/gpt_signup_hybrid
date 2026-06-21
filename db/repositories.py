@@ -59,6 +59,7 @@ _EXACT_KEYS: frozenset[str] = frozenset([
     "reg.job_timeout", "reg.post_reg_get_session", "reg.post_reg_get_link",
     "reg.post_reg_link_region", "reg.auto_retry", "reg.auto_retry_max",
     "reg.auto_retry_delay", "reg.max_concurrent", "reg.use_proxy",
+    "reg.mfa_inline",
     "proxy.pool", "proxy.rotation_mode",
     "proxy.probe_endpoint", "proxy.probe_timeout", "proxy.max_tries",
     "proxy.sid_len", "proxy.sid_retry_per_line", "proxy.probe_concurrency",
@@ -117,7 +118,8 @@ def _validate_type_constraint(key: str, value: Any) -> None:
         return
 
     if key in ("reg.headless", "reg.debug", "reg.post_reg_get_session",
-               "reg.post_reg_get_link", "reg.auto_retry", "reg.use_proxy"):
+               "reg.post_reg_get_link", "reg.auto_retry", "reg.use_proxy",
+               "reg.mfa_inline"):
         if not isinstance(value, bool):
             raise RepositoryError(
                 "set", TypeError(f"{key}: must be bool, got {type(value).__name__}")

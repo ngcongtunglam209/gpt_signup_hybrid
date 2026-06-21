@@ -79,6 +79,29 @@ impl JobRegistry {
         n
     }
 
+    /// Cancel ĐÚNG 1 job theo (user_id, job_id) — cho nút Stop per-process.
+    /// Trả true nếu tìm thấy và đã cancel.
+    pub async fn stop_job(&self, user_id: i64, job_id: u64) -> bool {
+        let mut g = self.inner.map.lock().await;
+        let Some(v) = g.get_mut(&user_id) else {
+            return false;
+        };
+        let mut found = false;
+        v.retain(|e| {
+            if e.id == job_id {
+                e.token.cancel();
+                found = true;
+                false
+            } else {
+                true
+            }
+        });
+        if v.is_empty() {
+            g.remove(&user_id);
+        }
+        found
+    }
+
     /// Số user còn entry (memory metric).
     pub async fn user_count(&self) -> usize {
         self.inner.map.lock().await.len()

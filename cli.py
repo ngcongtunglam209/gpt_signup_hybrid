@@ -734,6 +734,9 @@ def signup_cmd(
         otp_poll_interval_seconds=otp_interval,
         sentinel_cookie_timeout_seconds=sentinel_timeout,
         har_capture=har_capture,
+        # CLI signup không persist 2FA → tắt inline để giữ behavior cũ (account
+        # không bị bật 2FA mà mất secret). Dùng `enable-2fa` command riêng.
+        mfa_inline=False,
     )
 
     log = _emit_log()

@@ -270,13 +270,38 @@ impl TelegramClient {
         message_id: i64,
         text: &str,
     ) -> Result<()> {
+        self.edit_message_text_inner(chat_id, message_id, text, None).await
+    }
+
+    /// Edit message giữ inline keyboard (vd nút Stop của tiến trình).
+    pub async fn edit_message_text_kb(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        keyboard: Value,
+    ) -> Result<()> {
+        self.edit_message_text_inner(chat_id, message_id, text, Some(keyboard))
+            .await
+    }
+
+    async fn edit_message_text_inner(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        reply_markup: Option<Value>,
+    ) -> Result<()> {
         let url = format!("{}/editMessageText", self.base_url);
-        let body = json!({
+        let mut body = json!({
             "chat_id": chat_id,
             "message_id": message_id,
             "text": text,
             "disable_web_page_preview": true,
         });
+        if let Some(kb) = reply_markup {
+            body["reply_markup"] = json!({ "inline_keyboard": kb });
+        }
         let resp = self.http.post(&url).json(&body).send().await?;
         let v: Value = resp.json().await?;
         if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {

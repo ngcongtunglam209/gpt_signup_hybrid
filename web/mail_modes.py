@@ -125,8 +125,15 @@ def _build_worker_request(
         email_logs_url=cfg.get("logs_url", "https://icloud-cf-mail.n5pskgzs9g.workers.dev/logs"),
         email_api_key=cfg.get("api_key", ""),
         email_insecure_tls=insecure,
-        otp_timeout_seconds=200.0,
+        # iCloud HME relay (Apple forward HME→inbox) trễ tới vài phút trước khi
+        # mail vào inbox để worker IMAP IDLE bắt được. 300s cho đủ biên để vớt
+        # mã của chính phiên hiện tại thay vì timeout sớm.
+        otp_timeout_seconds=300.0,
         otp_poll_interval_seconds=5.0,
+        # Chờ ~30s không thấy mail thì Resend (thay vì 90s mặc định). An toàn vì
+        # _WORKER_DATE_GRACE=60s vẫn chấp nhận mã in-flight của lần gửi trước,
+        # nên resend nhanh không làm rớt mã đang trên đường về.
+        otp_resend_after_seconds=30.0,
         headless=headless,
         keep_browser_open=keep_browser_open,
         password=password,

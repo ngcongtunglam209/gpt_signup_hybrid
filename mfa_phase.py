@@ -275,29 +275,30 @@ async def _enroll_totp(
     # __cf_bm mới và lấy access_token đã propagate.
     body_text_initial = r.text[:1500] if hasattr(r, "text") else ""
     if _is_cf_challenge(r.status_code, body_text_initial, getattr(r, "headers", None)):
+        if not cookies:
+            # Fail-fast: không có cookies để refresh CF → raise NGAY, không in
+            # log gây hiểu lầm "refreshing" rồi mới phát hiện thiếu cookies.
+            raise MfaError(
+                f"enroll CF challenge HTTP {r.status_code} but no cookies passed "
+                f"để refresh — caller phải truyền cookies (body: {body_text_initial[:200]})"
+            )
         log(
             f"[mfa] CF challenge HTTP {r.status_code} (body_len={len(body_text_initial)}) "
             f"— refreshing token + CF cookies"
         )
-        if cookies:
-            new_token = await _refresh_access_token(session, cookies=cookies, log=log)
-            if new_token:
-                access_token = new_token
-                headers["Authorization"] = f"Bearer {access_token}"
-                await asyncio.sleep(3.0)  # cho CF propagate cookie mới
-                r = await _post_with_retry(
-                    session, url=url, headers=headers, body={"factor_type": "totp"},
-                    log=log, label="enroll-cf-retry",
-                )
-            else:
-                raise MfaError(
-                    f"enroll CF challenge HTTP {r.status_code} + refresh token failed "
-                    f"(body: {body_text_initial[:200]})"
-                )
+        new_token = await _refresh_access_token(session, cookies=cookies, log=log)
+        if new_token:
+            access_token = new_token
+            headers["Authorization"] = f"Bearer {access_token}"
+            await asyncio.sleep(3.0)  # cho CF propagate cookie mới
+            r = await _post_with_retry(
+                session, url=url, headers=headers, body={"factor_type": "totp"},
+                log=log, label="enroll-cf-retry",
+            )
         else:
             raise MfaError(
-                f"enroll CF challenge HTTP {r.status_code} but no cookies passed "
-                f"để refresh — caller phải truyền cookies (body: {body_text_initial[:200]})"
+                f"enroll CF challenge HTTP {r.status_code} + refresh token failed "
+                f"(body: {body_text_initial[:200]})"
             )
 
     if r.status_code != 200:
@@ -640,3 +641,324 @@ async def enable_2fa(
         else:
             result["mfa_info"] = await _check_mfa_info(session, access_token=active_token, log=log)
         return result
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# INLINE ENROLL — enroll 2FA NGAY trong context vừa tạo account (CF-clean)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Root cause của bug "mất acc": enable_2fa cũ luôn mở curl_cffi session MỚI
+# SAU khi browser/session gốc đã chết → mất CF clearance, sai IP, fingerprint
+# xấp xỉ → Cloudflare 403 → enroll fail vĩnh viễn → account đã create nhưng
+# không bật được 2FA và không retry signup được nữa.
+#
+# Giải pháp: enroll bằng CHÍNH context vừa pass CF:
+#   - browser mode  → ``enable_2fa_in_page``  (fetch same-origin trong page).
+#   - pure_request  → ``enable_2fa_in_session`` (tái dùng curl session sống).
+#
+# Cả 2 chia sẻ logic phân loại response + build result + idempotent/conflict
+# markers với fallback ``enable_2fa``. Khác biệt duy nhất là transport HTTP.
+
+
+def _classify_enroll_response(status_code: int, body_text: str) -> tuple[str, Any]:
+    """Phân loại response của POST mfa/enroll.
+
+    Returns ``(kind, payload)``:
+      - ``("ok", enroll_dict)``    — 200 + có ``secret``.
+      - ``("conflict", msg)``      — server đã có active factor (không retry).
+      - ``("error", msg)``         — lỗi khác (retry được).
+    """
+    if status_code == 200:
+        try:
+            data = json.loads(body_text)
+        except Exception:
+            return ("error", f"200 nhưng body không phải JSON: {body_text[:200]}")
+        if isinstance(data, dict) and "secret" in data:
+            return ("ok", data)
+        return ("error", f"200 thiếu secret: {body_text[:200]}")
+    low = (body_text or "").lower()
+    if any(m in low for m in _ENROLL_CONFLICT_MARKERS):
+        return ("conflict", body_text[:200])
+    return ("error", f"HTTP {status_code}: {body_text[:200]}")
+
+
+def _build_mfa_result(
+    *, secret: str, factor_id: str, session_id: str, first_code: str,
+    activated: bool, mfa_info: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Result dict thống nhất với ``enable_2fa`` (cùng schema downstream)."""
+    return {
+        "secret": secret,
+        "factor_id": factor_id,
+        "session_id": session_id,
+        "provisioning_uri": f"otpauth://totp/ChatGPT?secret={secret}&issuer=ChatGPT",
+        "first_code": first_code,
+        "activated": activated,
+        "mfa_info": mfa_info,
+    }
+
+
+# ── Browser transport (page.evaluate fetch, same-origin chatgpt.com) ──
+
+_PAGE_FETCH_JS = """
+async ({method, path, body, token}) => {
+  const headers = {'Content-Type': 'application/json'};
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  const opt = {method: method, headers: headers, credentials: 'include'};
+  if (body !== null && body !== undefined) opt.body = JSON.stringify(body);
+  const resp = await fetch(path, opt);
+  const text = await resp.text();
+  return {status: resp.status, text: text};
+}
+"""
+
+
+async def _page_request(
+    page, *, method: str, path: str, body: dict | None, token: str | None,
+) -> tuple[int, str]:
+    """Gọi fetch() trong page context → (status, text)."""
+    res = await page.evaluate(
+        _PAGE_FETCH_JS,
+        {"method": method, "path": path, "body": body, "token": token},
+    )
+    return int(res["status"]), str(res.get("text") or "")
+
+
+async def _page_access_token(page, *, log) -> str | None:
+    """Lấy accessToken qua /api/auth/session trong page (CF-clean)."""
+    try:
+        status, text = await _page_request(
+            page, method="GET", path="/api/auth/session", body=None, token=None,
+        )
+        if status != 200:
+            log(f"[mfa-inline] /api/auth/session HTTP {status}")
+            return None
+        data = json.loads(text)
+        token = data.get("accessToken")
+        if not token:
+            log("[mfa-inline] /api/auth/session thiếu accessToken")
+        return token
+    except Exception as exc:
+        log(f"[mfa-inline] lấy accessToken lỗi: {exc}")
+        return None
+
+
+async def enable_2fa_in_page(
+    page,
+    *,
+    activate: bool = True,
+    log=print,
+    max_attempts: int = 3,
+) -> dict[str, Any]:
+    """Enroll + activate 2FA bằng chính ``page`` browser đang login.
+
+    Page đã pass Cloudflare challenge, giữ ``cf_clearance``/``__cf_bm`` hợp lệ,
+    TLS/JA3 fingerprint thật và đúng IP → fetch same-origin tới /backend-api
+    gần như không thể bị CF 403 (khác hẳn curl_cffi spawn sau).
+
+    Raises:
+        MfaError: enroll/activate fail. ``partial_state`` mang secret/factor_id/
+            session_id khi enroll OK nhưng activate fail (caller persist + retry
+            activate-only, không enroll lại).
+    """
+    access_token = await _page_access_token(page, log=log)
+    if not access_token:
+        raise MfaError("enroll-in-page: không lấy được accessToken từ page")
+
+    # ── enroll (retry nhẹ — CF hiếm khi block trong page) ──
+    enroll_data: dict[str, Any] | None = None
+    last_err = ""
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            log(f"[mfa-inline] enroll retry {attempt}/{max_attempts}")
+        try:
+            status, text = await _page_request(
+                page, method="POST", path="/backend-api/accounts/mfa/enroll",
+                body={"factor_type": "totp"}, token=access_token,
+            )
+        except Exception as exc:
+            last_err = f"page.evaluate lỗi: {exc}"
+            log(f"[mfa-inline] enroll attempt {attempt}/{max_attempts} {last_err}")
+            if attempt < max_attempts:
+                await asyncio.sleep(_BACKOFF_SECONDS[min(attempt - 1, len(_BACKOFF_SECONDS) - 1)])
+            continue
+
+        kind, payload = _classify_enroll_response(status, text)
+        if kind == "ok":
+            enroll_data = payload
+            break
+        if kind == "conflict":
+            raise MfaError(
+                f"enroll-in-page conflict — account đã có 2FA active server-side: {payload}"
+            )
+        last_err = str(payload)
+        log(f"[mfa-inline] enroll attempt {attempt}/{max_attempts} failed: {last_err}")
+        if attempt < max_attempts:
+            await asyncio.sleep(_BACKOFF_SECONDS[min(attempt - 1, len(_BACKOFF_SECONDS) - 1)])
+
+    if enroll_data is None:
+        raise MfaError(f"enroll-in-page failed sau {max_attempts} lần: {last_err}")
+
+    secret = normalize_secret(enroll_data["secret"])
+    factor_id = enroll_data["factor"]["id"]
+    session_id = enroll_data["session_id"]
+    first_code = generate_code(secret)
+    log(f"[mfa-inline] enroll OK factor_id={factor_id[:20]} secret_len={len(secret)}")
+
+    if not activate:
+        return _build_mfa_result(
+            secret=secret, factor_id=factor_id, session_id=session_id,
+            first_code=first_code, activated=False, mfa_info=None,
+        )
+
+    # ── activate ──
+    try:
+        status, text = await _page_request(
+            page, method="POST",
+            path="/backend-api/accounts/mfa/user/activate_enrollment",
+            body={
+                "factor_id": factor_id, "factor_type": "totp",
+                "session_id": session_id, "code": first_code,
+            },
+            token=access_token,
+        )
+    except Exception as exc:
+        raise MfaError(
+            f"activate-in-page transport lỗi: {exc}",
+            partial_state={"secret": secret, "factor_id": factor_id, "session_id": session_id},
+        )
+
+    if status == 200 or _is_activate_idempotent_response(status, text):
+        log(f"[mfa-inline] activate OK (HTTP {status})")
+        return _build_mfa_result(
+            secret=secret, factor_id=factor_id, session_id=session_id,
+            first_code=first_code, activated=True, mfa_info={},
+        )
+
+    raise MfaError(
+        f"activate-in-page failed HTTP {status}: {text[:300]}",
+        partial_state={"secret": secret, "factor_id": factor_id, "session_id": session_id},
+    )
+
+
+# ── Sync curl transport (tái dùng session pure_request còn sống) ──
+
+def _backend_headers_sync(access_token: str, user_agent: str) -> dict[str, str]:
+    """Headers cho POST /backend-api từ curl session (đồng bộ browser thật)."""
+    from user_agent_profile import SEC_CH_UA, SEC_CH_UA_MOBILE, SEC_CH_UA_PLATFORM
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+        "User-Agent": user_agent,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://chatgpt.com",
+        "Referer": "https://chatgpt.com/",
+        "sec-ch-ua": SEC_CH_UA,
+        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+    }
+
+
+def enable_2fa_in_session(
+    session,
+    *,
+    access_token: str,
+    user_agent: str,
+    activate: bool = True,
+    log=print,
+    max_attempts: int = 3,
+) -> dict[str, Any]:
+    """Enroll + activate 2FA bằng CHÍNH ``session`` curl_cffi (sync) đang sống.
+
+    Dùng cho mode pure_request: session vừa pass CF để ``create_account`` thành
+    công nên còn ``cf_clearance``/``__cf_bm`` fresh + đúng proxy/IP. Enroll trong
+    cùng session an toàn hơn hẳn so với spawn session mới sau đó.
+
+    Chạy SYNC (trong worker thread của request_phase). Raises ``MfaError`` với
+    ``partial_state`` khi enroll OK nhưng activate fail.
+    """
+    import time as _time
+
+    headers = _backend_headers_sync(access_token, user_agent)
+    enroll_url = f"{_BASE}/accounts/mfa/enroll"
+
+    enroll_data: dict[str, Any] | None = None
+    last_err = ""
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            log(f"[mfa-inline] enroll retry {attempt}/{max_attempts}")
+        try:
+            r = session.post(
+                enroll_url, headers=headers,
+                data=json.dumps({"factor_type": "totp"}), timeout=_HTTP_TIMEOUT,
+            )
+            status = r.status_code
+            text = r.text if hasattr(r, "text") else ""
+        except Exception as exc:
+            last_err = f"curl lỗi: {exc}"
+            log(f"[mfa-inline] enroll attempt {attempt}/{max_attempts} {last_err}")
+            if attempt < max_attempts:
+                _time.sleep(_BACKOFF_SECONDS[min(attempt - 1, len(_BACKOFF_SECONDS) - 1)])
+            continue
+
+        kind, payload = _classify_enroll_response(status, text)
+        if kind == "ok":
+            enroll_data = payload
+            break
+        if kind == "conflict":
+            raise MfaError(
+                f"enroll-in-session conflict — account đã có 2FA active server-side: {payload}"
+            )
+        last_err = str(payload)
+        log(f"[mfa-inline] enroll attempt {attempt}/{max_attempts} failed: {last_err}")
+        if attempt < max_attempts:
+            _time.sleep(_BACKOFF_SECONDS[min(attempt - 1, len(_BACKOFF_SECONDS) - 1)])
+
+    if enroll_data is None:
+        raise MfaError(f"enroll-in-session failed sau {max_attempts} lần: {last_err}")
+
+    secret = normalize_secret(enroll_data["secret"])
+    factor_id = enroll_data["factor"]["id"]
+    session_id = enroll_data["session_id"]
+    first_code = generate_code(secret)
+    log(f"[mfa-inline] enroll OK factor_id={factor_id[:20]} secret_len={len(secret)}")
+
+    if not activate:
+        return _build_mfa_result(
+            secret=secret, factor_id=factor_id, session_id=session_id,
+            first_code=first_code, activated=False, mfa_info=None,
+        )
+
+    try:
+        r = session.post(
+            f"{_BASE}/accounts/mfa/user/activate_enrollment",
+            headers=headers,
+            data=json.dumps({
+                "factor_id": factor_id, "factor_type": "totp",
+                "session_id": session_id, "code": first_code,
+            }),
+            timeout=_HTTP_TIMEOUT,
+        )
+        status = r.status_code
+        text = r.text if hasattr(r, "text") else ""
+    except Exception as exc:
+        raise MfaError(
+            f"activate-in-session transport lỗi: {exc}",
+            partial_state={"secret": secret, "factor_id": factor_id, "session_id": session_id},
+        )
+
+    if status == 200 or _is_activate_idempotent_response(status, text):
+        log(f"[mfa-inline] activate OK (HTTP {status})")
+        return _build_mfa_result(
+            secret=secret, factor_id=factor_id, session_id=session_id,
+            first_code=first_code, activated=True, mfa_info={},
+        )
+
+    raise MfaError(
+        f"activate-in-session failed HTTP {status}: {text[:300]}",
+        partial_state={"secret": secret, "factor_id": factor_id, "session_id": session_id},
+    )

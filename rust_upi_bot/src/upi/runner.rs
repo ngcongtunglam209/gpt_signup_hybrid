@@ -39,11 +39,25 @@ pub const NETWORK_RECOVERY_POLL_MS: u64 = 5000;
 pub const NETWORK_RECOVERY_MAX_WAIT_S: u64 = 600;
 pub const CONFIRM_VARIANTS: &[&str] = &["qr_code", "empty", "flow_qr", "intent"];
 
+/// Nguồn auth cho job: session.json có sẵn HOẶC login HTTP từ email|pass|2fa.
+#[derive(Debug, Clone)]
+pub enum AuthSource {
+    /// Session đã có sẵn (upload session.json) — Bearer token + cookie header.
+    Session {
+        access_token: String,
+        cookie_header: String,
+    },
+    /// Combo email|pass|2fa — login HTTP để lấy session ở step [1/6].
+    Login {
+        password: String,
+        totp_secret: String,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct UpiJobConfig {
     pub email: String,
-    pub access_token: String,
-    pub cookie_header: String,
+    pub auth: AuthSource,
     pub proxy_pool: Vec<String>,
     pub approve_retries: u32,
     pub restart_threshold: u32,
@@ -196,11 +210,6 @@ pub async fn run_upi_qr(
 ) -> UpiQrResult {
     let started = Instant::now();
     let masked_email = mask_email(&cfg.email);
-    let auth = UpiAuth {
-        email: cfg.email.clone(),
-        access_token: cfg.access_token.clone(),
-        cookie_header: cfg.cookie_header.clone(),
-    };
 
     let restart_enabled = cfg.restart_threshold > 0 && cfg.max_restarts > 0;
     let proxy_advance_enabled = cfg.proxy_from_step <= 6
@@ -208,7 +217,58 @@ pub async fn run_upi_qr(
         && cfg.proxy_pool.len() > 1;
 
     log(&format!("Account: {}", masked_email));
-    log("[1/6] login   OK   session supplied");
+
+    // Step 1 — resolve auth: session có sẵn HOẶC login HTTP (email|pass|2fa).
+    let (access_token, cookie_header) = match &cfg.auth {
+        AuthSource::Session {
+            access_token,
+            cookie_header,
+        } => {
+            log("[1/6] login   OK   session supplied");
+            (access_token.clone(), cookie_header.clone())
+        }
+        AuthSource::Login {
+            password,
+            totp_secret,
+        } => {
+            // Login dùng proxy đầu pool nếu có (IP residential giúp qua
+            // Cloudflare tốt hơn router IP), bất kể proxy_from_step.
+            let login_proxy = cfg.proxy_pool.first().map(|s| s.as_str());
+            log(&format!(
+                "[1/6] login   →    HTTP login (email|pass|2fa) proxy={}",
+                login_proxy.map(mask_proxy).unwrap_or_else(|| "direct".into())
+            ));
+            match crate::auth::login_pure_request(
+                &cfg.email,
+                password,
+                totp_secret,
+                login_proxy,
+                &log,
+            )
+            .await
+            {
+                Ok(sess) => {
+                    log(&format!(
+                        "[1/6] login   OK   session acquired (cookies={})",
+                        sess.cookie_count
+                    ));
+                    (sess.access_token, sess.cookie_header)
+                }
+                Err(e) => {
+                    return finalize_error(
+                        masked_email,
+                        started,
+                        format!("login fail: {}", short_msg(&format!("{}", e), 300)),
+                    );
+                }
+            }
+        }
+    };
+    let auth = UpiAuth {
+        email: cfg.email.clone(),
+        access_token,
+        cookie_header,
+    };
 
     let stripe_js_id = uuid::Uuid::new_v4().to_string();
     let profile = random_india_profile();

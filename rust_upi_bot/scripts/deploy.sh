@@ -8,6 +8,17 @@ ROOT_DIR="$(dirname "$0")/.."
 
 cd "$ROOT_DIR"
 
+# BoringSSL (wreq, login JA3) build qua cmake → cần C/C++ compiler có sysroot
+# musl đầy đủ. zig ship sẵn sysroot musl; wrapper dịch clang-triple
+# `aarch64-unknown-linux-musl` → zig `aarch64-linux-musl`.
+#   - CC_<target>/CXX_<target>: cho cc-rs (zstd-sys...).
+#   - CC/CXX plain: cmake của BoringSSL đọc $CC lúc project().
+export CC_aarch64_unknown_linux_musl="$PWD/scripts/zig-cc.sh"
+export CXX_aarch64_unknown_linux_musl="$PWD/scripts/zig-cxx.sh"
+export CC="$PWD/scripts/zig-cc.sh"
+export CXX="$PWD/scripts/zig-cxx.sh"
+chmod +x scripts/zig-cc.sh scripts/zig-cxx.sh
+
 echo "→ cargo zigbuild release aarch64-musl..."
 cargo zigbuild --release --target aarch64-unknown-linux-musl
 

@@ -176,6 +176,9 @@ async def run_signup(
             result.cookies = phase2_result["cookies"]
             result.password = request.password
             result.name = request.name
+            # 2FA inline (enroll trong browser page — CF-clean)
+            result.two_factor = handoff.two_factor
+            result.two_factor_partial = handoff.two_factor_partial
             # Compute age
             try:
                 y, m, d = request.birthdate.split("-")

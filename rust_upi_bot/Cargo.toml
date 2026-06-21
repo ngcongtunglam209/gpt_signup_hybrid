@@ -43,6 +43,11 @@ font8x8 = { version = "0.3", default-features = false, features = ["unicode"] }
 # Crypto / encoding
 base64 = "0.22"
 sha2 = "0.10"
+# TOTP 2FA (email|pass|2fa login): HMAC-SHA1 + base32 secret — pure Rust,
+# cross-compile aarch64-musl an toàn (không C deps).
+sha1 = "0.10"
+hmac = "0.12"
+data-encoding = "2"
 percent-encoding = "2"
 
 # Utility
@@ -65,3 +70,11 @@ tokio-util = "0.7"
 bytes = "1"
 url = "2"
 futures-util = "0.3"
+# Nâng RLIMIT_NOFILE lúc startup (100 tiến trình đồng thời cần nhiều socket).
+# Pure Rust (libc) — cross-compile aarch64-musl OK.
+rlimit = "0.10"
+# JA3/JA4 + HTTP2 fingerprint Chrome (BoringSSL) — dùng RIÊNG cho login flow
+# (chatgpt.com/auth.openai.com sau Cloudflare). UPI flow vẫn dùng reqwest+rustls.
+# Cross-compile aarch64-musl qua zig wrapper (scripts/zig-cc.sh) — xem deploy.sh.
+wreq = { version = "5.3.0", features = ["json", "socks", "gzip", "brotli", "zstd"] }
+wreq-util = "2.2.6"

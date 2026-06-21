@@ -1286,6 +1286,33 @@ def _run_request_phase_sync(
         except Exception:
             pass
 
+        # ── Inline 2FA enroll (CF-clean) — tái dùng session vừa pass CF ──
+        # Session này vừa create_account thành công nên còn cf_clearance fresh
+        # + đúng proxy/IP. Enroll ngay tại đây an toàn hơn spawn session mới.
+        # NEVER fail registration vì account đã được tạo: lỗi enroll → để
+        # caller fallback enable_2fa Phase 2.
+        two_factor = None
+        two_factor_partial = None
+        if getattr(request, "mfa_inline", False) and access_token:
+            from mfa_phase import MfaError, enable_2fa_in_session
+            try:
+                two_factor = enable_2fa_in_session(
+                    session,
+                    access_token=access_token,
+                    user_agent=request.user_agent,
+                    log=log,
+                )
+                log("[request] 2FA enrolled inline OK (CF-clean)")
+            except MfaError as exc:
+                partial = getattr(exc, "partial_state", None)
+                if partial and partial.get("secret"):
+                    two_factor_partial = partial
+                    log(f"[request] 2FA inline: enroll OK nhưng activate fail → partial saved: {exc}")
+                else:
+                    log(f"[request] 2FA inline fail (fallback Phase 2): {exc}")
+            except Exception as exc:
+                log(f"[request] 2FA inline lỗi bất ngờ (fallback Phase 2): {exc}")
+
         return {
             "session_token": session_token,
             "access_token": access_token,
@@ -1293,6 +1320,8 @@ def _run_request_phase_sync(
             "password": password,
             "cookies": cookies,
             "device_id": device_id,
+            "two_factor": two_factor,
+            "two_factor_partial": two_factor_partial,
         }
     finally:
         try:
@@ -1342,6 +1371,8 @@ async def run_request_phase(
         result.cookies = phase_result.get("cookies", [])
         result.phase1_seconds = time.monotonic() - t_start
         result.phase2_seconds = 0.0  # No separate phase 2 in pure-request mode
+        result.two_factor = phase_result.get("two_factor")
+        result.two_factor_partial = phase_result.get("two_factor_partial")
 
         # Compute age
         try:

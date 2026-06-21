@@ -334,12 +334,17 @@ class AutoRegRunner:
                 if result.access_token:
                     await self._log("info", f"{prefix} Enabling 2FA...", {"email": email})
                     try:
-                        mfa_result = await enable_2fa(
-                            access_token=result.access_token,
-                            cookies=result.cookies,
-                            proxy=email_proxy,
-                            log=log_fn,
-                        )
+                        mfa_result = result.two_factor
+                        if mfa_result is not None:
+                            log_fn("[2fa] dùng enroll inline (CF-clean) — skip enable_2fa")
+                        else:
+                            mfa_result = await enable_2fa(
+                                access_token=result.access_token,
+                                cookies=result.cookies,
+                                proxy=email_proxy,
+                                pending_enrollment=result.two_factor_partial,
+                                log=log_fn,
+                            )
                         secret_2fa = mfa_result.get("secret")
                         await self._log("info", f"{prefix} 2FA enabled", {
                             "email": email, "secret": secret_2fa,
