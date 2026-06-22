@@ -19,6 +19,7 @@ from mail_providers import (
     MailProvider,
     OutlookComboError,
     OutlookProviderUnavailable,
+    build_provider_china_icloud,
     build_provider_dongvanfb,
     build_provider_gmail_advanced,
     build_provider_outlook,
@@ -131,6 +132,14 @@ def _build_mail_provider(
         return build_provider_gmail_advanced(
             email=provider_email,
             api_url=request.gmail_api_url,
+        )
+    if request.mail_provider == "china_icloud":
+        if not request.china_icloud_url:
+            raise ValueError("mail_provider='china_icloud' yêu cầu china_icloud_url")
+        return build_provider_china_icloud(
+            email=request.email,
+            api_url=request.china_icloud_url,
+            proxy=None,
         )
     if request.mail_provider == "worker":
         return build_provider_worker(

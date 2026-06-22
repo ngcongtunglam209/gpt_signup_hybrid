@@ -40,6 +40,72 @@ fn stripe_return_url(session_id: &str) -> String {
     format!("https://checkout.stripe.com/c/pay/{}", session_id)
 }
 
+/// Cắt chuỗi an toàn theo char boundary (KHÔNG slice theo byte — body lỗi từ
+/// Cloudflare/Stripe có thể chứa ký tự đa byte UTF-8, slice byte giữa ký tự sẽ
+/// PANIC → task worker chết → leak slot/registry → user kẹt "không phản hồi").
+fn safe_truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+/// Warm Cloudflare cookie cho proxy mới — port từ Python `_warm_cf_cookie`
+/// (FIX-CF-WARMUP-2026-06-20). GET `https://chatgpt.com/` qua proxy đó để CF
+/// set `__cf_bm` trong jar → request approve kế tiếp KHÔNG bị 403 hit đầu.
+///
+/// Best-effort: lỗi gì cũng nuốt + log warn, KHÔNG fail approve loop. Caller
+/// gọi 1 lần mỗi khi sang batch proxy mới (trước approve attempt đầu của batch).
+pub async fn warm_cf_cookie(
+    client: &HttpClient,
+    proxy: Option<&str>,
+    log: &crate::upi::runner::LogFn,
+) {
+    let mut headers: HashMap<&str, &str> = HashMap::new();
+    headers.insert(
+        "Accept",
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    );
+    headers.insert("Accept-Language", "en-IN,en;q=0.9");
+    headers.insert("User-Agent", WINDOWS_USER_AGENT);
+    headers.insert("sec-ch-ua", SEC_CH_UA);
+    headers.insert("sec-ch-ua-mobile", SEC_CH_UA_MOBILE);
+    headers.insert("sec-ch-ua-platform", SEC_CH_UA_PLATFORM);
+    headers.insert("sec-fetch-dest", "document");
+    headers.insert("sec-fetch-mode", "navigate");
+    headers.insert("sec-fetch-site", "none");
+    headers.insert("sec-fetch-user", "?1");
+    headers.insert("upgrade-insecure-requests", "1");
+
+    let proxy_mask = proxy
+        .map(crate::proxy_format::mask_proxy)
+        .unwrap_or_else(|| "direct".into());
+    match client.get_text("https://chatgpt.com/", &headers, proxy).await {
+        Ok(r) => {
+            // 200/403 đều có Set-Cookie __cf_bm; chỉ flag warn cho status lạ.
+            let icon = if r.status == 200 || r.status == 403 {
+                "OK  "
+            } else {
+                "WARN"
+            };
+            log(&format!(
+                "[6/6] cf-warmup    {} http={}  proxy={}",
+                icon, r.status, proxy_mask
+            ));
+        }
+        Err(e) => {
+            log(&format!(
+                "[6/6] cf-warmup    WARN skip ({}) — approve sẽ tự xoay nếu 403  proxy={}",
+                e, proxy_mask
+            ));
+        }
+    }
+}
+
 /// Confirm UPI payload theo variant.
 fn upi_payload_for_variant(variant: &str) -> Value {
     match variant {
@@ -97,7 +163,7 @@ pub async fn create_chatgpt_checkout(
         return Err(anyhow!(
             "checkout HTTP {}: {}",
             resp.status,
-            &resp.body[..resp.body.len().min(300)]
+            safe_truncate(&resp.body, 300)
         ));
     }
     let data: Value = serde_json::from_str(&resp.body)?;
@@ -171,7 +237,7 @@ pub async fn stripe_init(
         return Err(anyhow!(
             "stripe init HTTP {}: {}",
             resp.status,
-            &resp.body[..resp.body.len().min(300)]
+            safe_truncate(&resp.body, 300)
         ));
     }
     let data: Value = serde_json::from_str(&resp.body)?;
@@ -234,7 +300,7 @@ pub async fn stripe_elements_session(
         return Err(anyhow!(
             "elements/sessions HTTP {}: {}",
             resp.status,
-            &resp.body[..resp.body.len().min(300)]
+            safe_truncate(&resp.body, 300)
         ));
     }
     let data: Value = serde_json::from_str(&resp.body)?;
@@ -384,7 +450,7 @@ pub async fn stripe_confirm_upi_qr(
 
     let resp = client.post_form(&url, &headers, &form, proxy).await?;
     let data: Value = serde_json::from_str(&resp.body).unwrap_or_else(|_| {
-        json!({"_raw": &resp.body[..resp.body.len().min(1000)]})
+        json!({"_raw": safe_truncate(&resp.body, 1000)})
     });
     let ok = resp.status == 200;
     let keys = collect_keys(&data, 30);
@@ -462,7 +528,7 @@ pub async fn stripe_payment_page_refresh(
 
     let resp = client.get_with_query(&url, &headers, &query, proxy).await?;
     let data: Value = serde_json::from_str(&resp.body).unwrap_or_else(|_| {
-        json!({"_raw": &resp.body[..resp.body.len().min(1000)]})
+        json!({"_raw": safe_truncate(&resp.body, 1000)})
     });
     let ok = resp.status == 200;
     let keys = collect_keys(&data, 30);
@@ -523,7 +589,7 @@ pub async fn chatgpt_approve_checkout(
         .post_json(CHATGPT_APPROVE_URL, &headers, &body, proxy)
         .await?;
     let data: Value = serde_json::from_str(&resp.body).unwrap_or_else(|_| {
-        json!({"_raw": &resp.body[..resp.body.len().min(1000)]})
+        json!({"_raw": safe_truncate(&resp.body, 1000)})
     });
     let result = data
         .get("result")

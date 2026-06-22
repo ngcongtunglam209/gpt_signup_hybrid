@@ -36,6 +36,9 @@ pub enum JobEvent {
     Queued { position: usize },
     Started,
     Log(String),
+    /// Nội dung session.json thu được sau login từ combo — bot gửi file lại
+    /// cho user (tái dùng lượt sau).
+    Session(String),
     Done(UpiQrResult),
     Timeout,
     Cancelled,
@@ -140,6 +143,12 @@ pub fn spawn_workers(
                 let log_fn: crate::upi::runner::LogFn = Arc::new(move |line: &str| {
                     let _ = log_tx.send(JobEvent::Log(line.to_string()));
                 });
+                // Sink phát session.json sau login combo → bot gửi file cho user.
+                let session_tx = job.log_tx.clone();
+                let session_sink: crate::upi::runner::SessionSink =
+                    Arc::new(move |content: String| {
+                        let _ = session_tx.send(JobEvent::Session(content));
+                    });
 
                 let user_id = job.user_id;
                 let job_id = job.job_id;
@@ -149,7 +158,7 @@ pub fn spawn_workers(
                 let outcome = tokio::select! {
                     biased;
                     _ = cancel_for_run.cancelled() => Outcome::Cancelled,
-                    res = tokio::time::timeout(timeout, run_upi_qr(client, job.config, log_fn)) => {
+                    res = tokio::time::timeout(timeout, run_upi_qr(client, job.config, log_fn, Some(session_sink))) => {
                         match res {
                             Ok(r) => Outcome::Done(r),
                             Err(_) => Outcome::Timeout,

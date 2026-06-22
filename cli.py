@@ -492,6 +492,11 @@ def web_cmd(
     from web.server import set_loopback_bind
     set_loopback_bind(is_loopback)
 
+    # Truyền local endpoint cho Cloudflare Tunnel manager — manager sẽ trỏ
+    # tunnel về 127.0.0.1:<port> ngay cả khi uvicorn bind LAN.
+    from web.cloudflare_tunnel import get_cloudflare_tunnel
+    get_cloudflare_tunnel().set_local_endpoint(host, port)
+
     # Print token cho user (nhất là non-loopback cần nhập thủ công)
     from web.auth import get_token as _get_web_token
     _token = _get_web_token()

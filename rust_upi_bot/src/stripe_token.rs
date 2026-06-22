@@ -253,7 +253,12 @@ fn extract_webpack_module(body: &str, mod_id: u32) -> String {
 
     for m in pattern.find_iter(body) {
         let after = &body[m.end()..];
-        let preview_end = (200).min(after.len());
+        let mut preview_end = (200).min(after.len());
+        // Lùi về char boundary — bundle JS có thể chứa ký tự đa byte, slice byte
+        // giữa ký tự sẽ panic (release `panic=abort` → chết cả tiến trình).
+        while preview_end > 0 && !after.is_char_boundary(preview_end) {
+            preview_end -= 1;
+        }
         let preview = &after[..preview_end];
         if let Some(sig) = sig_re.find(preview) {
             let brace_open = m.end() + sig.end() - 1;

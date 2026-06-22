@@ -38,6 +38,11 @@ pub struct LoginSession {
     pub access_token: String,
     pub cookie_header: String,
     pub cookie_count: usize,
+    /// Raw JSON từ `/api/auth/session` (có `accessToken` + `user`) — dùng để
+    /// dựng lại file session.json gửi cho user tái dùng lượt sau.
+    pub session_json: Value,
+    /// Cookie jar export (`__cookies` schema) đính vào session.json.
+    pub cookies: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -50,10 +55,11 @@ static MFA_CHALLENGE_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"/mfa-challenge/([a-f0-9]+)").unwrap());
 
 fn short(s: &str, n: usize) -> String {
-    if s.len() <= n {
+    if s.chars().count() <= n {
         s.to_string()
     } else {
-        format!("{}…", &s[..n])
+        let h: String = s.chars().take(n).collect();
+        format!("{}…", h)
     }
 }
 
@@ -664,5 +670,7 @@ pub async fn login_pure_request(
         access_token,
         cookie_header,
         cookie_count,
+        session_json: session,
+        cookies,
     })
 }

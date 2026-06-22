@@ -13,11 +13,11 @@ use crate::stripe::bundles::{extract_config_live, BundleCache};
 use crate::stripe_token::StripeTokenConfig;
 use crate::upi::endpoints::{
     chatgpt_approve_checkout, create_chatgpt_checkout, extract_amount, stripe_confirm_upi_qr,
-    stripe_elements_session, stripe_init, stripe_payment_page_refresh, ApproveAttempt,
+    stripe_elements_session, stripe_init, ApproveAttempt,
     ConfirmAttempt, RefreshAttempt,
 };
 use crate::upi::matchers::{
-    find_matches, find_qr_expires_at, find_qr_image_url, find_upi_uri, Match,
+    find_matches, find_hosted_instructions_url, find_qr_expires_at, find_qr_image_url, find_upi_uri, Match,
 };
 use crate::upi::qr::{download_qr_image, render_qr_png};
 use crate::upi::types::{
@@ -64,6 +64,9 @@ pub struct UpiJobConfig {
     /// (giữ hành vi cũ khi admin chưa cấu hình login proxy).
     pub login_proxy: Option<String>,
     pub approve_retries: u32,
+    /// Delay giữa các approve attempt (ms). Default `APPROVE_DELAY_MS=3000`
+    /// nếu None — đồng bộ Python `APPROVE_DELAY=3.0`.
+    pub approve_delay_ms: Option<u64>,
     pub restart_threshold: u32,
     pub max_restarts: u32,
     pub proxy_from_step: u32,
@@ -74,16 +77,32 @@ pub struct UpiJobConfig {
 
 pub type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Sink phát nội dung session.json (chuỗi) ngay khi login từ combo thành công,
+/// để bot gửi file lại cho user tái dùng lượt sau. `None` ở chế độ CLI run-once.
+pub type SessionSink = Arc<dyn Fn(String) + Send + Sync>;
+
+/// Dựng nội dung file session.json từ raw `/api/auth/session` + cookies jar.
+/// Đính `__cookies` để bot `build_cookie_header` đọc lại được ở lượt sau.
+fn build_session_file(session_json: &Value, cookies: &[Value]) -> String {
+    let mut obj = session_json.clone();
+    if let Some(map) = obj.as_object_mut() {
+        map.insert("__cookies".to_string(), Value::Array(cookies.to_vec()));
+    }
+    serde_json::to_string_pretty(&obj).unwrap_or_else(|_| obj.to_string())
+}
+
 /// Mask email cho log (giữ 3 ký tự đầu + 2 cuối local part).
 pub fn mask_email(email: &str) -> String {
     if let Some(at_idx) = email.find('@') {
-        let local = &email[..at_idx];
+        let local = &email[..at_idx]; // at_idx tại '@' (ASCII) → boundary an toàn
         let domain = &email[at_idx + 1..];
-        if local.len() <= 3 {
-            return format!("{}***@{}", &local[..local.len().min(1)], domain);
+        let chars: Vec<char> = local.chars().collect();
+        if chars.len() <= 3 {
+            let head: String = chars.iter().take(1).collect();
+            return format!("{}***@{}", head, domain);
         }
-        let head = &local[..3];
-        let tail = &local[local.len() - 2..];
+        let head: String = chars.iter().take(3).collect();
+        let tail: String = chars.iter().skip(chars.len() - 2).collect();
         return format!("{}***{}@{}", head, tail, domain);
     }
     "***".into()
@@ -212,10 +231,98 @@ fn refresh_to_summary(a: &RefreshAttempt, attempt: u32, proxy: &str) -> RefreshA
     }
 }
 
+/// Login errors fatal — KHÔNG retry để tránh login spam → lockout. Port 1:1
+/// pattern từ Python `session_phase.NON_RETRYABLE_LOGIN_PATTERNS` (lowercase
+/// substring match). Lỗi không match → coi là transient (CF flaky / cookie
+/// chậm / network) → retry.
+pub fn is_fatal_login_error(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    const FATAL: &[&str] = &[
+        "password verify fail",
+        "mfa verify fail",
+        "no mail_provider available",
+        "no secret provided",
+        "yêu cầu 2fa nhưng không có",
+        "otp polling returned empty",
+        "passwordless otp",
+        "không xác định được login flow",
+    ];
+    FATAL.iter().any(|p| lower.contains(p))
+}
+
+/// Refresh payment page với pool retry — port từ Python
+/// `_stripe_payment_page_refresh_retry`. Thử LẦN LƯỢT từng proxy trong pool
+/// (rotate cùng cách với approve loop) cho đến khi 1 proxy trả OK. Trả attempt
+/// cuối + lý do nếu tất cả fail. Pool rỗng → thử 1 lần direct.
+async fn payment_page_refresh_with_pool(
+    client: &HttpClient,
+    session_id: &str,
+    publishable_key: &str,
+    stripe_js_id: &str,
+    elements_data: &Value,
+    proxy_pool: &[String],
+    login_proxy: Option<&str>,
+    proxy_from_step: u32,
+) -> crate::upi::endpoints::RefreshAttempt {
+    use crate::upi::endpoints::{stripe_payment_page_refresh, RefreshAttempt};
+
+    // Khi step 5 < proxy_from_step → segment login (login_proxy / direct).
+    // Khi step 5 >= proxy_from_step → segment work (pool). Pool rỗng = thử 1 lần.
+    let candidates: Vec<Option<&str>> = if 5 < proxy_from_step {
+        vec![login_proxy]
+    } else if proxy_pool.is_empty() {
+        vec![None]
+    } else {
+        proxy_pool.iter().map(|s| Some(s.as_str())).collect()
+    };
+
+    let mut last: Option<RefreshAttempt> = None;
+    for proxy in candidates {
+        match stripe_payment_page_refresh(
+            client,
+            session_id,
+            publishable_key,
+            stripe_js_id,
+            elements_data,
+            proxy,
+        )
+        .await
+        {
+            Ok(r) => {
+                if r.ok {
+                    return r;
+                }
+                last = Some(r);
+            }
+            Err(e) => {
+                last = Some(RefreshAttempt {
+                    http_status: None,
+                    ok: false,
+                    keys: vec![],
+                    error: None,
+                    error_type: Some("NetworkError".into()),
+                    error_msg: Some(format!("{}", e)),
+                    data: None,
+                });
+            }
+        }
+    }
+    last.unwrap_or(RefreshAttempt {
+        http_status: None,
+        ok: false,
+        keys: vec![],
+        error: None,
+        error_type: Some("NoCandidate".into()),
+        error_msg: Some("no proxy candidates available".into()),
+        data: None,
+    })
+}
+
 pub async fn run_upi_qr(
     client: Arc<HttpClient>,
     cfg: UpiJobConfig,
     log: LogFn,
+    session_sink: Option<SessionSink>,
 ) -> UpiQrResult {
     let started = Instant::now();
     let masked_email = mask_email(&cfg.email);
@@ -224,6 +331,12 @@ pub async fn run_upi_qr(
     let proxy_advance_enabled = cfg.proxy_from_step <= 6
         && APPROVE_PROXY_BATCH > 1
         && cfg.proxy_pool.len() > 1;
+    // Validate delay [2000, 60000] ms — đồng bộ Python `[2.0, 60.0]s`. Quá thấp
+    // → Stripe rate-limit (`blocked` spam). Fallback default khi None hoặc invalid.
+    let approve_delay_ms: u64 = cfg
+        .approve_delay_ms
+        .filter(|ms| (2_000..=60_000).contains(ms))
+        .unwrap_or(APPROVE_DELAY_MS);
 
     log(&format!("Account: {}", masked_email));
 
@@ -252,27 +365,86 @@ pub async fn run_upi_qr(
                 "[1/6] login   →    HTTP login (email|pass|2fa) proxy={}",
                 login_proxy.map(mask_proxy).unwrap_or_else(|| "direct".into())
             ));
-            match crate::auth::login_pure_request(
-                &cfg.email,
-                password,
-                totp_secret,
-                login_proxy,
-                &log,
-            )
-            .await
-            {
-                Ok(sess) => {
-                    log(&format!(
-                        "[1/6] login   OK   session acquired (cookies={})",
-                        sess.cookie_count
-                    ));
+            // Login retry — port từ Python `LOGIN_MAX_ATTEMPTS=3, RETRY_DELAY=3s`.
+            // Lỗi transient (CF flaky / cookie chậm / WARNING_BANNER) retry tới
+            // 3 lần; lỗi fatal (sai password/MFA/passwordless) bỏ ngay.
+            const LOGIN_MAX_ATTEMPTS: u32 = 3;
+            const LOGIN_RETRY_DELAY_MS: u64 = 3000;
+            let mut session_opt: Option<crate::auth::LoginSession> = None;
+            let mut last_err: Option<String> = None;
+            for attempt in 1..=LOGIN_MAX_ATTEMPTS {
+                match crate::auth::login_pure_request(
+                    &cfg.email,
+                    password,
+                    totp_secret,
+                    login_proxy,
+                    &log,
+                )
+                .await
+                {
+                    Ok(sess) => {
+                        if attempt > 1 {
+                            log(&format!(
+                                "[1/6] login   OK   attempt {}/{} (cookies={})",
+                                attempt, LOGIN_MAX_ATTEMPTS, sess.cookie_count
+                            ));
+                        } else {
+                            log(&format!(
+                                "[1/6] login   OK   session acquired (cookies={})",
+                                sess.cookie_count
+                            ));
+                        }
+                        session_opt = Some(sess);
+                        break;
+                    }
+                    Err(e) => {
+                        let msg = format!("{}", e);
+                        last_err = Some(msg.clone());
+                        if is_fatal_login_error(&msg) {
+                            log(&format!(
+                                "[1/6] login   FAIL fatal: {}",
+                                short_msg(&msg, 200)
+                            ));
+                            break;
+                        }
+                        if attempt >= LOGIN_MAX_ATTEMPTS {
+                            log(&format!(
+                                "[1/6] login   FAIL after {} attempts: {}",
+                                LOGIN_MAX_ATTEMPTS,
+                                short_msg(&msg, 200)
+                            ));
+                            break;
+                        }
+                        log(&format!(
+                            "[1/6] login   WARN transient (attempt {}/{}): {} → retry sau {}s",
+                            attempt,
+                            LOGIN_MAX_ATTEMPTS,
+                            short_msg(&msg, 140),
+                            LOGIN_RETRY_DELAY_MS / 1000
+                        ));
+                        tokio::time::sleep(Duration::from_millis(LOGIN_RETRY_DELAY_MS)).await;
+                    }
+                }
+            }
+            match session_opt {
+                Some(sess) => {
+                    // Phát session.json lại cho user NGAY (trước khi chạy tiếp
+                    // các step có thể fail) → user giữ được session để dùng lượt
+                    // sau dù QR có lỗi về sau.
+                    if let Some(sink) = &session_sink {
+                        let content = build_session_file(&sess.session_json, &sess.cookies);
+                        sink(content);
+                    }
                     (sess.access_token, sess.cookie_header)
                 }
-                Err(e) => {
+                None => {
                     return finalize_error(
                         masked_email,
                         started,
-                        format!("login fail: {}", short_msg(&format!("{}", e), 300)),
+                        format!(
+                            "login fail: {}",
+                            short_msg(&last_err.unwrap_or_else(|| "unknown".into()), 300)
+                        ),
                     );
                 }
             }
@@ -593,43 +765,40 @@ pub async fn run_upi_qr(
         }
         final_confirmed = true;
 
-        // Step 5c — page refresh trước approve
-        match stripe_payment_page_refresh(
+        // Step 5c — page refresh trước approve. Dùng pool retry: thử lần lượt
+        // từng proxy live → giảm khả năng fail bước 5c (best-effort cho aggregate
+        // matches QR).
+        let r = payment_page_refresh_with_pool(
             &client,
             &session_id,
             &publishable_key,
             &stripe_js_id,
             &elements_data,
-            proxy_for_step(&cfg.proxy_pool, login_proxy_ref, cfg.proxy_from_step, 5),
+            &cfg.proxy_pool,
+            login_proxy_ref,
+            cfg.proxy_from_step,
         )
-        .await
-        {
-            Ok(r) => {
-                if let Some(ref d) = r.data {
-                    last_refresh_data = d.clone();
-                    all_refresh_data.push(d.clone());
-                }
-                log(&format!(
-                    "[5c{}] refresh    {}    http={}",
-                    phase_tag,
-                    if r.ok { "OK  " } else { "FAIL" },
-                    r.http_status
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "—".into())
-                ));
-                refresh_attempts.push(refresh_to_summary(&r, 1, "direct"));
-            }
-            Err(e) => {
-                log(&format!("[5c{}] refresh    FAIL network: {}", phase_tag, e));
-            }
+        .await;
+        if let Some(ref d) = r.data {
+            last_refresh_data = d.clone();
+            all_refresh_data.push(d.clone());
         }
+        log(&format!(
+            "[5c{}] refresh    {}    http={}",
+            phase_tag,
+            if r.ok { "OK  " } else { "FAIL" },
+            r.http_status
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "—".into())
+        ));
+        refresh_attempts.push(refresh_to_summary(&r, 1, "direct"));
 
         // Step 6 — approve loop
         if restart_count == 0 {
             log(&format!(
                 "[6/6] approve loop start  retries={} delay={:.1}s batch={}",
                 cfg.approve_retries,
-                APPROVE_DELAY_MS as f64 / 1000.0,
+                approve_delay_ms as f64 / 1000.0,
                 APPROVE_PROXY_BATCH
             ));
         } else {
@@ -644,6 +813,9 @@ pub async fn run_upi_qr(
         // giúp phân biệt Cloudflare edge block (HTML, cf-ray) vs OpenAI app
         // error (JSON detail) để chẩn đoán proxy reputation vs auth/session.
         let mut seen_error_statuses: HashSet<u16> = HashSet::new();
+        // Track batch đã warm CF cookie — port từ Python `_warm_cf_cookie` khi
+        // sang batch proxy mới. Mỗi batch chỉ warm 1 lần (cookie đủ cho cả batch).
+        let mut warmed_batches: HashSet<u32> = HashSet::new();
 
         let approve_started = Instant::now();
         while approve_index_total < cfg.approve_retries {
@@ -656,6 +828,14 @@ pub async fn run_upi_qr(
                 proxy_virtual_attempt,
                 APPROVE_PROXY_BATCH,
             );
+            // Sang batch mới → warm CF cookie cho proxy (giảm 403 hit đầu).
+            // Best-effort, không block flow nếu fail.
+            if proxy_advance_enabled && proxy_url.is_some() {
+                let current_batch = (proxy_virtual_attempt - 1) / APPROVE_PROXY_BATCH;
+                if warmed_batches.insert(current_batch) {
+                    crate::upi::endpoints::warm_cf_cookie(&client, proxy_url, &log).await;
+                }
+            }
             let attempt = match chatgpt_approve_checkout(&client, &auth, &session_id, proxy_url)
                 .await
             {
@@ -794,7 +974,7 @@ pub async fn run_upi_qr(
                 }
             }
             if approve_index_total < cfg.approve_retries {
-                tokio::time::sleep(Duration::from_millis(APPROVE_DELAY_MS)).await;
+                tokio::time::sleep(Duration::from_millis(approve_delay_ms)).await;
             }
         }
         let approve_elapsed = approve_started.elapsed().as_secs_f64();
@@ -805,32 +985,33 @@ pub async fn run_upi_qr(
             ));
         }
 
-        // Refresh post-approve (best-effort)
+        // Refresh post-approve (best-effort) — pool retry để tăng cơ hội lấy
+        // hosted_instructions_url cho QR.
         if !triggered_restart && fatal_approve_error.is_none() && (approved || !approve_attempts.is_empty()) {
-            if let Ok(r) = stripe_payment_page_refresh(
+            let r = payment_page_refresh_with_pool(
                 &client,
                 &session_id,
                 &publishable_key,
                 &stripe_js_id,
                 &elements_data,
-                proxy_for_step(&cfg.proxy_pool, login_proxy_ref, cfg.proxy_from_step, 5),
+                &cfg.proxy_pool,
+                login_proxy_ref,
+                cfg.proxy_from_step,
             )
-            .await
-            {
-                if let Some(ref d) = r.data {
-                    last_refresh_data = d.clone();
-                    all_refresh_data.push(d.clone());
-                }
-                log(&format!(
-                    "[5c{}] refresh    {}    http={}",
-                    phase_tag,
-                    if r.ok { "OK  " } else { "FAIL" },
-                    r.http_status
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "—".into())
-                ));
-                refresh_attempts.push(refresh_to_summary(&r, 2, "direct"));
+            .await;
+            if let Some(ref d) = r.data {
+                last_refresh_data = d.clone();
+                all_refresh_data.push(d.clone());
             }
+            log(&format!(
+                "[5c{}] refresh    {}    http={}",
+                phase_tag,
+                if r.ok { "OK  " } else { "FAIL" },
+                r.http_status
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "—".into())
+            ));
+            refresh_attempts.push(refresh_to_summary(&r, 2, "direct"));
         }
 
         if approved || fatal_approve_error.is_some() {
@@ -870,6 +1051,7 @@ pub async fn run_upi_qr(
     let upi_uri = find_upi_uri(&matches);
     let qr_image_url = find_qr_image_url(&matches);
     let qr_expires_at = find_qr_expires_at(&matches);
+    let payment_link = find_hosted_instructions_url(&matches);
 
     let mut qr_path: Option<String> = None;
     let mut qr_source: Option<String> = None;
@@ -980,6 +1162,7 @@ pub async fn run_upi_qr(
         qr_source_url: qr_image_url,
         qr_reason,
         qr_expires_at,
+        payment_link,
         has_upi_uri: upi_uri.is_some(),
         has_qr_image_url: false, // re-set below
         confirm_attempts,
@@ -1003,10 +1186,11 @@ fn finalize_error(masked: String, started: Instant, msg: String) -> UpiQrResult 
 }
 
 fn short(s: &str, head: usize) -> String {
-    if s.len() <= head {
+    if s.chars().count() <= head {
         s.to_string()
     } else {
-        format!("{}…", &s[..head])
+        let h: String = s.chars().take(head).collect();
+        format!("{}…", h)
     }
 }
 

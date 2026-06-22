@@ -572,6 +572,12 @@
       </span>
       <span class="settings-nav-label">Telegram</span>
     </button>
+    <button class="settings-nav-item" data-settings-section="tunnel" role="tab" aria-selected="false">
+      <span class="settings-nav-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12h6"/><path d="M16 12h6"/><path d="M12 2v6"/><path d="M12 16v6"/><circle cx="12" cy="12" r="4"/></svg>
+      </span>
+      <span class="settings-nav-label">Tunnel</span>
+    </button>
   </aside>
 
   <!-- Content pane -->
@@ -659,6 +665,52 @@
         </div>
 
         <div id="telegram-status" class="proxy-pool-status muted"></div>
+      </div>
+    </section>
+
+    <!-- ── Section: Tunnel ── -->
+    <section class="card settings-section" id="settings-section-tunnel" data-settings-pane="tunnel">
+      <header class="card-head">
+        <h2>Cloudflare Quick Tunnel</h2>
+        <span id="tunnel-status-badge" class="badge badge-muted">stopped</span>
+      </header>
+
+      <div class="settings-section-body">
+        <p class="settings-hint muted">
+          Bật để tạo URL công khai <code>https://*.trycloudflare.com</code> trỏ về web UI local — truy cập từ thiết bị khác/Internet không cần mở port.
+          Mỗi lần bật cấp 1 URL ngẫu nhiên (không cần Cloudflare account). Tool tự tải <code>cloudflared</code> binary lần đầu (Win/Mac/Linux, x64/arm64).
+          <strong>Lưu ý:</strong> URL public bypass firewall — đảm bảo <strong>Auth token</strong> đã đặt và không chia sẻ link bừa bãi.
+        </p>
+
+        <label class="input-group" id="tunnel-toggle-row" title="Bật/tắt Cloudflare Quick Tunnel">
+          <span class="input-label">Trạng thái</span>
+          <label class="toggle-wrap" style="margin-left: 0;">
+            <input type="checkbox" id="tunnel-enabled-toggle" />
+            <span class="toggle-track"><span class="toggle-thumb"></span></span>
+            <span class="toggle-label" id="tunnel-toggle-label">Đang tắt</span>
+          </label>
+        </label>
+
+        <label class="input-group" id="tunnel-url-row">
+          <span class="input-label">Public URL</span>
+          <div class="tunnel-url-box">
+            <input type="text" id="tunnel-url-input" readonly placeholder="(chưa có URL — bật tunnel để cấp)" spellcheck="false" />
+            <button id="tunnel-url-copy" class="btn btn-ghost btn-small" type="button" disabled>Copy</button>
+            <button id="tunnel-url-open" class="btn btn-ghost btn-small" type="button" disabled>Mở</button>
+          </div>
+        </label>
+
+        <div class="proxy-pool-toolbar">
+          <span class="settings-toolbar-spacer"></span>
+          <button id="tunnel-restart" class="btn btn-ghost btn-small" type="button" disabled>Cấp URL mới</button>
+        </div>
+
+        <div id="tunnel-status-line" class="proxy-pool-status muted"></div>
+
+        <details class="tunnel-log-details">
+          <summary class="muted">Log cloudflared (20 dòng cuối)</summary>
+          <pre id="tunnel-log-tail" class="tunnel-log-tail"></pre>
+        </details>
       </div>
     </section>
   </div>

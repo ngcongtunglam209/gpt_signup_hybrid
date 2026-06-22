@@ -150,6 +150,24 @@ fn sort_entries(out: &mut [(u64, JobStatus)]) {
     });
 }
 
+/// Escape ký tự đặc biệt HTML — Telegram parse_mode=HTML chặn `<`/`>`/`&`
+/// chưa escape. Mọi giá trị động (email, username, step) PHẢI qua hàm này
+/// trước khi nhúng vào template HTML của board.
+pub fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Cắt chuỗi theo số ký tự (char-safe), thêm '…' nếu bị cắt.
 pub fn truncate_chars(s: &str, max: usize) -> String {
     let trimmed = s.trim();

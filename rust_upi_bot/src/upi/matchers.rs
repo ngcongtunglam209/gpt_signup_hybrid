@@ -108,6 +108,45 @@ pub fn find_qr_image_url(matches: &[Match]) -> Option<String> {
     None
 }
 
+/// Tìm `hosted_instructions_url` (`https://payments.stripe.com/upi/instructions/...`)
+/// — port từ Python `_find_hosted_instructions_url`. Đây là link thanh toán
+/// UPI hosted (trang QR + nút mở app). Bắt 2 cách:
+///   1. key `hosted_instructions_url` → value là URL string trực tiếp.
+///   2. key `next_action` → value là dict, đào nested
+///      `upi_handle_redirect_or_display_qr_code.hosted_instructions_url`.
+pub fn find_hosted_instructions_url(matches: &[Match]) -> Option<String> {
+    const PREFIX: &str = "https://payments.stripe.com/upi/instructions/";
+    // (1) direct string value.
+    for m in matches {
+        if let Value::String(s) = &m.value {
+            if s.starts_with(PREFIX) {
+                return Some(s.clone());
+            }
+        }
+    }
+    // (2) nested dict.
+    for m in matches {
+        if let Value::Object(obj) = &m.value {
+            if let Some(block) = obj
+                .get("upi_handle_redirect_or_display_qr_code")
+                .and_then(|v| v.as_object())
+            {
+                if let Some(url) = block.get("hosted_instructions_url").and_then(|v| v.as_str()) {
+                    if url.starts_with(PREFIX) {
+                        return Some(url.to_string());
+                    }
+                }
+            }
+            if let Some(url) = obj.get("hosted_instructions_url").and_then(|v| v.as_str()) {
+                if url.starts_with(PREFIX) {
+                    return Some(url.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn find_qr_expires_at(matches: &[Match]) -> Option<i64> {
     for m in matches {
         if let Value::Object(obj) = &m.value {

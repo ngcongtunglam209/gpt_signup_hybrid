@@ -52,13 +52,13 @@ pub fn welcome(lang: Lang) -> String {
          Gửi cho bot 1 trong 2:\n\
          • File `session.json` lấy từ https://chatgpt.com/api/auth/session\n\
          • Hoặc tài khoản dạng `email|password|2fa_secret` (gửi nhiều dòng = nhiều tiến trình)\n\n\
-         Bạn chạy được tối đa *10 tiến trình* cùng lúc. Mỗi tiến trình hiển thị ở 1 tin riêng kèm nút Dừng.\n\n\
+         Bạn chạy được tối đa *5 tiến trình* cùng lúc. Mỗi tiến trình hiển thị ở 1 tin riêng kèm nút Dừng.\n\n\
          Chọn thao tác:",
         "👋 *UPI QR Bot*\n\n\
          Send the bot one of:\n\
          • A `session.json` file from https://chatgpt.com/api/auth/session\n\
          • Or accounts as `email|password|2fa_secret` (multiple lines = multiple processes)\n\n\
-         You can run up to *10 processes* at once. Each process shows in its own message with a Stop button.\n\n\
+         You can run up to *5 processes* at once. Each process shows in its own message with a Stop button.\n\n\
          Pick an action:",
     )
 }
@@ -92,24 +92,34 @@ pub fn btn_board_stop(lang: Lang, email: &str) -> String {
 
 // ─── Board ────────────────────────────────────────────────────────────
 
-/// Header bảng tiến trình. `scope_all` = admin xem toàn hệ thống; false = user
-/// chỉ xem tiến trình của chính mình.
-pub fn board_header(lang: Lang, running: usize, queued: usize, scope_all: bool, clock: &str) -> String {
-    let scope_vi = if scope_all { "toàn hệ thống" } else { "của bạn" };
-    let scope_en = if scope_all { "system-wide" } else { "yours" };
+/// Note "proxy chậm — skip cho job này" gắn sau dòng probe khi latency vượt
+/// ngưỡng cấu hình.
+pub fn proxy_skip_slow(lang: Lang, latency_ms: u64, limit_ms: u64) -> String {
     pick(
         lang,
-        &format!("📊 Tiến trình {} — ▶️ {} chạy · ⏳ {} chờ · 🕒 {}", scope_vi, running, queued, clock),
-        &format!("📊 Processes ({}) — ▶️ {} run · ⏳ {} queue · 🕒 {}", scope_en, running, queued, clock),
+        &format!(" · ⚠️ chậm ({}ms > {}ms) → bỏ qua cho job này", latency_ms, limit_ms),
+        &format!(" · ⚠️ slow ({}ms > {}ms) → skipped for this job", latency_ms, limit_ms),
     )
 }
 
-pub fn board_empty(lang: Lang, scope_all: bool) -> String {
-    if scope_all {
-        pick(lang, "\n\nKhông có tiến trình nào đang chạy.", "\n\nNo processes running.")
-    } else {
-        pick(lang, "\n\nBạn chưa có tiến trình nào.", "\n\nYou have no processes running.")
-    }
+/// Note "proxy chậm nhưng vẫn dùng" — trường hợp pool không còn proxy nhanh
+/// nào, fallback dùng line slow để job không bị block.
+pub fn proxy_slow_fallback(lang: Lang, latency_ms: u64, limit_ms: u64) -> String {
+    pick(
+        lang,
+        &format!(" · 🐢 chậm ({}ms > {}ms) — vẫn dùng (không có proxy nhanh)", latency_ms, limit_ms),
+        &format!(" · 🐢 slow ({}ms > {}ms) — used anyway (no fast proxy)", latency_ms, limit_ms),
+    )
+}
+
+/// Cảnh báo cho card pre-flight: pool user toàn dead → job sẽ chạy DIRECT
+/// (không block, đỡ hơn chặn user vì proxy chết).
+pub fn proxy_pool_all_dead_direct(lang: Lang) -> String {
+    pick(
+        lang,
+        "⚠️ Pool proxy toàn dead — job sẽ chạy DIRECT (không proxy).",
+        "⚠️ All pool proxies dead — job will run DIRECT (no proxy).",
+    )
 }
 
 pub fn board_stopped_toast(lang: Lang, ok: bool) -> String {
@@ -170,6 +180,23 @@ pub fn need_input(lang: Lang) -> String {    pick(
         lang,
         "📄 Gửi file `session.json` hoặc dán combo `email|password|2fa`.",
         "📄 Send a `session.json` file or paste combo `email|password|2fa`.",
+    )
+}
+
+/// Caption file session.json gửi lại user sau khi login từ combo thành công.
+pub fn reuse_session_caption(lang: Lang, email: &str) -> String {
+    pick(
+        lang,
+        &format!(
+            "💾 Session của {} đã đăng nhập xong.\nLần sau hãy GỬI THẲNG file session.json này \
+             cho bot (thay vì combo) để chạy nhanh hơn và đỡ rủi ro đăng nhập lại.",
+            email
+        ),
+        &format!(
+            "💾 Session for {} is ready.\nNext time, send THIS session.json file to the bot \
+             (instead of the combo) for faster runs and to avoid re-login.",
+            email
+        ),
     )
 }
 
@@ -313,41 +340,87 @@ pub fn btn_proxy_remove(lang: Lang) -> String {
 
 // ─── Proxy: /proxy_set ────────────────────────────────────────────────
 
-pub fn proxy_show_current(lang: Lang, masked: &str) -> String {
+/// Render danh sách proxy (đã mask) dạng đánh số, kèm hướng dẫn nút.
+pub fn proxy_show_pool(lang: Lang, masked: &[String]) -> String {
+    let mut listing = String::new();
+    for (i, m) in masked.iter().enumerate() {
+        listing.push_str(&format!("{}. {}\n", i + 1, m));
+    }
     pick(
         lang,
         &format!(
-            "🌐 Proxy của bạn:\n{}\n\nDùng các nút bên dưới để kiểm tra trạng thái hoặc xóa.\n\
-             Đổi proxy: /proxy_set <line>",
-            masked
+            "🌐 Pool proxy của bạn ({}/10):\n{}\nBot xoay proxy ngẫu nhiên trong pool. \
+             Pre-flight tự loại bỏ proxy chết/chậm trước mỗi job.\n\n\
+             Đổi pool: /proxy_set\n<line 1>\n<line 2>\n...",
+            masked.len(),
+            listing
         ),
         &format!(
-            "🌐 Your proxy:\n{}\n\nUse the buttons below to check live status or remove it.\n\
-             To change proxy: /proxy_set <line>",
-            masked
+            "🌐 Your proxy pool ({}/10):\n{}\nThe bot rotates proxies randomly across the pool. \
+             Pre-flight removes dead/slow proxies before each job.\n\n\
+             To change: /proxy_set\n<line 1>\n<line 2>\n...",
+            masked.len(),
+            listing
         ),
     )
 }
 
-pub fn proxy_set_usage(lang: Lang) -> String {
+pub fn proxy_set_usage_multi(lang: Lang) -> String {
     pick(
         lang,
-        "ℹ️ Bạn chưa đặt proxy.\n\n\
-         Cách dùng:\n\
-         /proxy_set host:port\n\
-         /proxy_set host:port:user:pass\n\
-         /proxy_set http://user:pass@host:port\n\
-         /proxy_set socks5://user:pass@host:1080\n\n\
-         Hỗ trợ {SID} cho sticky session:\n\
-         /proxy_set host:port:user-{SID}:pass",
-        "ℹ️ You haven't set a proxy yet.\n\n\
-         Usage:\n\
-         /proxy_set host:port\n\
-         /proxy_set host:port:user:pass\n\
-         /proxy_set http://user:pass@host:port\n\
-         /proxy_set socks5://user:pass@host:1080\n\n\
-         Supports {SID} placeholder for sticky sessions:\n\
-         /proxy_set host:port:user-{SID}:pass",
+        "ℹ️ Bạn chưa đặt proxy nào.\n\n\
+         Cách dùng (1 hoặc NHIỀU dòng, tối đa 10):\n\
+         /proxy_set host1:port1\nhost2:port2:user:pass\nhttp://u:p@host3:port3\n\n\
+         Hỗ trợ template {SID} cho sticky session.",
+        "ℹ️ You haven't set any proxy yet.\n\n\
+         Usage (1 or MORE lines, up to 10):\n\
+         /proxy_set host1:port1\nhost2:port2:user:pass\nhttp://u:p@host3:port3\n\n\
+         Supports {SID} placeholder for sticky sessions.",
+    )
+}
+
+pub fn proxy_set_ok_pool(
+    lang: Lang,
+    masked: &[String],
+    from_step: u32,
+    dropped: usize,
+    invalid: usize,
+) -> String {
+    let mut listing = String::new();
+    for (i, m) in masked.iter().enumerate() {
+        listing.push_str(&format!("{}. {}\n", i + 1, m));
+    }
+    let mut notes = String::new();
+    if dropped > 0 {
+        match lang {
+            Lang::Vi => notes.push_str(&format!("\n⚠️ Vượt giới hạn 10 dòng — đã bỏ {} dòng cuối.", dropped)),
+            Lang::En => notes.push_str(&format!("\n⚠️ Over the 10-line cap — dropped {} extra line(s).", dropped)),
+        }
+    }
+    if invalid > 0 {
+        match lang {
+            Lang::Vi => notes.push_str(&format!("\n⚠️ Bỏ {} dòng sai định dạng.", invalid)),
+            Lang::En => notes.push_str(&format!("\n⚠️ Skipped {} invalid line(s).", invalid)),
+        }
+    }
+    pick(
+        lang,
+        &format!(
+            "✅ Đã lưu pool proxy của bạn ({} dòng):\n{}\n\
+             Job tiếp theo sẽ xoay ngẫu nhiên trong pool, ghi đè pool chung từ step {} trở đi.{}",
+            masked.len(),
+            listing,
+            from_step,
+            notes
+        ),
+        &format!(
+            "✅ Saved your proxy pool ({} lines):\n{}\n\
+             Your next job will rotate randomly through this pool, overriding the global pool from step {} onward.{}",
+            masked.len(),
+            listing,
+            from_step,
+            notes
+        ),
     )
 }
 
@@ -382,24 +455,6 @@ pub fn proxy_save_failed(lang: Lang, err: &str) -> String {
         lang,
         &format!("❌ Lưu thất bại: {}", err),
         &format!("❌ Save failed: {}", err),
-    )
-}
-
-pub fn proxy_set_ok(lang: Lang, masked: &str, from_step: u32) -> String {
-    pick(
-        lang,
-        &format!(
-            "✅ Đã đặt proxy riêng của bạn.\n{}\n\n\
-             Job tiếp theo sẽ dùng proxy này (ghi đè pool chung từ step {} trở đi).\n\
-             Dùng các nút bên dưới để kiểm tra trạng thái hoặc xóa.",
-            masked, from_step
-        ),
-        &format!(
-            "✅ Your private proxy has been set.\n{}\n\n\
-             Your next job will use this proxy (overrides the global pool from step {} onward).\n\
-             Use the buttons below to check live status or remove it.",
-            masked, from_step
-        ),
     )
 }
 

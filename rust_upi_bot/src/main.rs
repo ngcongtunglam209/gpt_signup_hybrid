@@ -58,7 +58,7 @@ struct Cli {
     max_concurrent: usize,
 
     /// Số tiến trình tối đa 1 user chạy đồng thời.
-    #[arg(long, env = "MAX_PER_USER", default_value = "10", global = true)]
+    #[arg(long, env = "MAX_PER_USER", default_value = "5", global = true)]
     max_per_user: u32,
 
     /// Hard cap số job pending trong queue. Khi đầy, job mới bị reject. Bảo vệ RAM.
@@ -66,8 +66,13 @@ struct Cli {
     queue_capacity: usize,
 
     /// Số lần retry approve (per job).
-    #[arg(long, env = "APPROVE_RETRIES", default_value = "110", global = true)]
+    #[arg(long, env = "APPROVE_RETRIES", default_value = "200", global = true)]
     approve_retries: u32,
+
+    /// Delay giữa các approve attempt (giây). Range hợp lệ [2, 60]. Dưới 2s sẽ
+    /// bị Stripe rate-limit → result=blocked spam. Mặc định 3s đồng bộ Python.
+    #[arg(long, env = "APPROVE_DELAY_SECS", default_value = "3", global = true)]
+    approve_delay_secs: u64,
 
     /// Restart threshold — số `result=exception` LIÊN TIẾP trước khi restart checkout. 0 = disabled.
     #[arg(long, env = "RESTART_THRESHOLD", default_value = "20", global = true)]
@@ -128,6 +133,14 @@ struct Cli {
     /// HTTP timeout (seconds).
     #[arg(long, env = "HTTP_TIMEOUT", default_value = "60", global = true)]
     http_timeout: u64,
+
+    /// Ngưỡng latency probe proxy (ms). Proxy của user/login probe ra latency
+    /// LỚN HƠN ngưỡng này → bot ƯU TIÊN xoay sang proxy khác trong pool.
+    /// NHƯNG: nếu sau khi lọc KHÔNG còn proxy nhanh nào → vẫn dùng proxy slow
+    /// (đỡ hơn block job hoàn toàn). Probe lỗi/proxy chết VẪN block.
+    /// Per-process: mỗi job đọc cache hoặc probe lại — không ảnh hưởng job khác.
+    #[arg(long, env = "PROXY_LATENCY_LIMIT_MS", default_value = "3000", global = true)]
+    proxy_latency_limit_ms: u64,
 }
 
 #[derive(clap::Subcommand, Debug, Clone)]
@@ -246,6 +259,9 @@ fn localized_commands(lang: Lang, is_admin: bool) -> Vec<(&'static str, &'static
                 ("banlist", "Danh sách user bị cấm (admin)"),
                 ("stopall", "Dừng TẤT CẢ tiến trình mọi user (admin)"),
                 ("flushall", "Xóa sạch hàng chờ + board (admin)"),
+                ("set_notify", "Đặt kênh thông báo success (admin)"),
+                ("notify_remove", "Xóa kênh thông báo (admin)"),
+                ("notify_test", "Test kênh thông báo (admin)"),
                 ("proxy_login_set", "Đặt login proxy chung (admin)"),
                 ("proxy_login_remove", "Xóa login proxy chung (admin)"),
             ],
@@ -257,6 +273,9 @@ fn localized_commands(lang: Lang, is_admin: bool) -> Vec<(&'static str, &'static
                 ("banlist", "List banned users (admin)"),
                 ("stopall", "Stop ALL processes of all users (admin)"),
                 ("flushall", "Clear queue + board (admin)"),
+                ("set_notify", "Set success-notify channel (admin)"),
+                ("notify_remove", "Remove notify channel (admin)"),
+                ("notify_test", "Test notify channel (admin)"),
                 ("proxy_login_set", "Set shared login proxy (admin)"),
                 ("proxy_login_remove", "Remove shared login proxy (admin)"),
             ],
@@ -433,6 +452,9 @@ async fn main() -> Result<()> {
             ("board", "Process board + Stop buttons"),
             ("stopall", "Stop ALL processes of all users (admin)"),
             ("flushall", "Clear queue + board (admin)"),
+            ("set_notify", "Set success-notify channel (admin)"),
+            ("notify_remove", "Remove notify channel (admin)"),
+            ("notify_test", "Test notify channel (admin)"),
             ("proxy_login_set", "Set shared login proxy (admin)"),
             ("proxy_login_remove", "Remove shared login proxy (admin)"),
         ];
@@ -717,7 +739,8 @@ async fn handle_message(
 
         match cmd_base {
             "/notify" | "/chat" | "/ban" | "/unban" | "/banlist"
-            | "/proxy_login_set" | "/proxy_login_remove" | "/stopall" | "/flushall" => {
+            | "/proxy_login_set" | "/proxy_login_remove" | "/stopall" | "/flushall"
+            | "/set_notify" | "/notify_remove" | "/notify_test" => {
                 if !is_admin {
                     tg.send_message(
                         msg.chat.id,
@@ -745,6 +768,11 @@ async fn handle_message(
                     "/stopall" => handle_stopall(&tg, &registry, msg.chat.id).await,
                     "/flushall" => {
                         handle_flushall(&tg, &registry, &session_buffer, &board, msg.chat.id).await
+                    }
+                    "/set_notify" => handle_set_notify(&tg, &store, &msg, text).await,
+                    "/notify_remove" => handle_notify_remove(&tg, &store, &msg).await,
+                    "/notify_test" => {
+                        handle_notify_test(&tg, &store, &msg, cli.admin_chat_id).await
                     }
                     _ => unreachable!(),
                 }
@@ -972,13 +1000,13 @@ async fn enqueue_and_track(
         }
     };
 
-    // ── Proxy resolution: login proxy (admin, global) + user proxy (private) ──
+    // ── Proxy resolution: login proxy (admin, global) + user pool (private) ──
     let login_proxy_raw = store.get_login_proxy();
-    let user_proxy_raw = match store.get_user_proxy(user_id) {
+    let user_proxy_lines: Vec<String> = match store.get_user_proxies(user_id) {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(user_id, "get_user_proxy fail: {}", e);
-            None
+            tracing::warn!(user_id, "get_user_proxies fail: {}", e);
+            Vec::new()
         }
     };
 
@@ -994,67 +1022,163 @@ async fn enqueue_and_track(
         None => None,
     };
 
-    // effective_pool = segment "work" (từ proxy_from_step trở đi):
-    //   - user có proxy riêng        → [user_proxy]   (login proxy chỉ ở segment login)
-    //   - user KHÔNG có, có login px  → [login_proxy]  (login proxy phủ toàn flow)
-    //   - không có cả 2              → pool global (hành vi cũ / DIRECT)
-    let effective_pool: Vec<String> = match user_proxy_raw.as_deref() {
-        Some(raw) => match proxy_format::materialize_for_client(raw, 8) {
-            Ok(url) => {
-                tracing::info!(
-                    user_id,
-                    proxy = %proxy_format::mask_proxy(&url),
-                    "user proxy override active"
-                );
-                vec![url]
-            }
-            Err(e) => {
-                tracing::warn!(user_id, "user proxy materialize fail: {} — fallback", e);
-                login_proxy_url
-                    .clone()
-                    .map(|u| vec![u])
-                    .unwrap_or_else(|| proxy_pool.to_vec())
-            }
-        },
-        None => match &login_proxy_url {
-            Some(u) => vec![u.clone()],
-            None => proxy_pool.to_vec(),
-        },
-    };
-
-    // ── Pre-flight proxy check (cache 5'); fail-fast nếu proxy chết ──────
-    // Chỉ probe proxy do feature này quản lý (login proxy + user proxy raw);
-    // pool global thuần (env) giữ hành vi cũ, không pre-flight.
+    // ── Pre-flight probe SONG SONG: login_proxy + mỗi user pool line ─────
+    // Cache 5' chia sẻ giữa các job, tránh probe lặp khi nhiều job cùng dùng
+    // chung 1 line. Per-process: chỉ ảnh hưởng job hiện tại.
+    let limit_ms = cli.proxy_latency_limit_ms;
     let probe_login_raw = login_proxy_raw.clone().filter(|_| login_proxy_url.is_some());
-    let probe_user_raw = user_proxy_raw.clone();
-    let (login_status, user_status) = tokio::join!(
-        async {
-            match &probe_login_raw {
-                Some(r) => Some(bot::proxy_status::PROXY_STATUS.get_or_probe(r).await),
-                None => None,
-            }
-        },
-        async {
-            match &probe_user_raw {
-                Some(r) => Some(bot::proxy_status::PROXY_STATUS.get_or_probe(r).await),
-                None => None,
-            }
-        },
+    let login_status_fut = async {
+        match &probe_login_raw {
+            Some(r) => Some(bot::proxy_status::PROXY_STATUS.get_or_probe(r).await),
+            None => None,
+        }
+    };
+    let user_probe_futs = user_proxy_lines.iter().map(|raw| {
+        let raw = raw.clone();
+        async move { bot::proxy_status::PROXY_STATUS.get_or_probe(&raw).await }
+    });
+    let (login_status, user_statuses) = tokio::join!(
+        login_status_fut,
+        futures_util::future::join_all(user_probe_futs)
     );
 
+    let login_too_slow = login_status
+        .as_ref()
+        .map(|st| st.ok && st.latency_ms > limit_ms)
+        .unwrap_or(false);
+    let login_proxy_effective: Option<String> = if login_too_slow {
+        tracing::warn!(
+            user_id,
+            latency = login_status.as_ref().map(|s| s.latency_ms).unwrap_or(0),
+            limit_ms,
+            "login proxy quá chậm — skip cho job này"
+        );
+        None
+    } else {
+        login_proxy_url.clone()
+    };
+
+    // Phân loại user pool theo 3 nhóm:
+    //   - fast    = OK + latency ≤ limit  → ưu tiên dùng (xoay random nếu ≥2)
+    //   - slow_ok = OK nhưng latency > limit → fallback khi KHÔNG có fast nào
+    //   - dead    = probe FAIL (auth/IP fail) → loại bỏ luôn
+    // Nguyên tắc: chỉ block job khi pool toàn dead. Slow vẫn dùng được nếu
+    // không có lựa chọn khác — đỡ hơn block user vì 1 proxy duy nhất chậm.
+    let mut user_pool_fast_raw: Vec<String> = Vec::new();
+    let mut user_pool_slow_raw: Vec<String> = Vec::new();
+    let mut user_pool_dead = 0usize;
+    for (raw, st) in user_proxy_lines.iter().zip(user_statuses.iter()) {
+        if !st.ok {
+            user_pool_dead += 1;
+            continue;
+        }
+        if st.latency_ms > limit_ms {
+            user_pool_slow_raw.push(raw.clone());
+        } else {
+            user_pool_fast_raw.push(raw.clone());
+        }
+    }
+    // Pool dùng cho job: fast trước; nếu không có fast → fallback slow.
+    let (user_pool_live_raw, used_slow_fallback): (Vec<String>, bool) =
+        if !user_pool_fast_raw.is_empty() {
+            (user_pool_fast_raw, false)
+        } else {
+            (user_pool_slow_raw.clone(), !user_pool_slow_raw.is_empty())
+        };
+    let user_pool_slow_count = user_pool_slow_raw.len();
+
+    // Materialize live raw → concrete URLs cho client. Gặp lỗi materialize → bỏ
+    // line đó (không spam runner với URL hỏng), tăng `user_pool_dead`.
+    let mut user_pool_live: Vec<String> = Vec::new();
+    for raw in &user_pool_live_raw {
+        match proxy_format::materialize_for_client(raw, 8) {
+            Ok(url) => user_pool_live.push(url),
+            Err(e) => {
+                tracing::warn!(user_id, raw = %proxy_format::mask_proxy(raw), "materialize fail: {}", e);
+                user_pool_dead += 1;
+            }
+        }
+    }
+
+    // Random hóa thứ tự rotate — runner đang round-robin per `APPROVE_PROXY_BATCH=3`,
+    // shuffle 1 lần ở đây giúp 2 job liên tiếp không bám cùng 1 proxy đầu pool.
+    {
+        use rand::seq::SliceRandom;
+        let mut rng = rand::thread_rng();
+        user_pool_live.shuffle(&mut rng);
+    }
+
+    // effective_pool = segment "work" (từ proxy_from_step trở đi):
+    //   - User có pool và còn ≥1 line live (fast hoặc slow) → dùng pool live
+    //   - User có pool nhưng TOÀN dead → DIRECT (đỡ hơn block, theo yêu cầu)
+    //   - User chưa set pool                → cascade login proxy hợp lệ / pool global / DIRECT
+    let user_pool_live_count = user_pool_live.len();
+    let effective_pool: Vec<String> = if !user_pool_live.is_empty() {
+        tracing::info!(
+            user_id,
+            live = user_pool_live.len(),
+            slow_used = used_slow_fallback,
+            slow = user_pool_slow_count,
+            dead = user_pool_dead,
+            "user proxy pool active"
+        );
+        user_pool_live
+    } else if !user_proxy_lines.is_empty() {
+        // User có set pool nhưng TOÀN dead → fallback DIRECT (không block).
+        tracing::warn!(
+            user_id,
+            total = user_proxy_lines.len(),
+            dead = user_pool_dead,
+            "user pool — toàn dead → fallback DIRECT"
+        );
+        Vec::new()
+    } else {
+        match &login_proxy_effective {
+            Some(u) => vec![u.clone()],
+            None => proxy_pool.to_vec(),
+        }
+    };
+
+    // ── Render dòng trạng thái proxy cho card pre-flight ────────────────
+    // Login: 1 dòng. User pool: từng dòng theo thứ tự gốc, đánh nhãn
+    // "User #i". `proxy_dead` CHỈ trigger khi login proxy admin chết —
+    // user pool toàn dead → fallback DIRECT (không block job).
     let mut proxy_lines: Vec<String> = Vec::new();
     let mut proxy_dead = false;
     if let Some(st) = &login_status {
-        proxy_lines.push(build_proxy_line(lang, "Login", st));
+        let mut line = build_proxy_line(lang, "Login", st);
+        if login_too_slow {
+            line.push_str(&i18n::proxy_skip_slow(lang, st.latency_ms, limit_ms));
+        }
+        proxy_lines.push(line);
         if !st.ok {
             proxy_dead = true;
         }
     }
-    if let Some(st) = &user_status {
-        proxy_lines.push(build_proxy_line(lang, "User", st));
-        if !st.ok {
-            proxy_dead = true;
+    for (i, st) in user_statuses.iter().enumerate() {
+        let label = format!("User #{}", i + 1);
+        let mut line = build_proxy_line(lang, &label, st);
+        if st.ok && st.latency_ms > limit_ms {
+            // Slow proxy: nếu pool có proxy fast → bị skip; nếu KHÔNG có fast
+            // → vẫn dùng (fallback) → hiển thị note tương ứng.
+            if used_slow_fallback {
+                line.push_str(&i18n::proxy_slow_fallback(lang, st.latency_ms, limit_ms));
+            } else {
+                line.push_str(&i18n::proxy_skip_slow(lang, st.latency_ms, limit_ms));
+            }
         }
+        proxy_lines.push(line);
+    }
+    // User có set pool nhưng TOÀN dead → log cảnh báo, KHÔNG block (DIRECT).
+    if !user_proxy_lines.is_empty() && user_pool_live_count == 0 {
+        tracing::warn!(
+            user_id,
+            total = user_proxy_lines.len(),
+            dead = user_pool_dead,
+            slow = user_pool_slow_count,
+            "user pool toàn dead — job sẽ chạy DIRECT"
+        );
+        proxy_lines.push(i18n::proxy_pool_all_dead_direct(lang));
     }
     if proxy_dead {
         // Đã reserve slot (try_admit) + try_register ở trên → phải nhả cả hai
@@ -1109,8 +1233,9 @@ async fn enqueue_and_track(
         email: email.clone(),
         auth,
         proxy_pool: effective_pool,
-        login_proxy: login_proxy_url,
+        login_proxy: login_proxy_effective,
         approve_retries: cli.approve_retries,
+        approve_delay_ms: Some(cli.approve_delay_secs.saturating_mul(1000)),
         restart_threshold: cli.restart_threshold,
         max_restarts: cli.max_restarts,
         proxy_from_step: cli.proxy_from_step,
@@ -1155,7 +1280,8 @@ async fn enqueue_and_track(
             )
             .await
             .ok();
-            // Báo admin khi user KHÁC tạo tiến trình mới (skip nếu chính admin).
+            // Báo admin (DM) khi user KHÁC tạo tiến trình mới — KHÔNG đi qua
+            // notify target (notify target dành riêng cho QR success ở topic).
             if cli.admin_chat_id != 0 && user_id != cli.admin_chat_id {
                 let note = format!(
                     "🆕 Tiến trình mới\nTừ: @{} (id {})\nEmail: {}\nNguồn: {}\nHàng chờ: ~{}",
@@ -1191,6 +1317,7 @@ async fn enqueue_and_track(
     let tg_for_log = tg.clone();
     let qr_path_for_send = qr_path.clone();
     let admin_chat_id = cli.admin_chat_id;
+    let store_for_notify = store.clone();
     let board_for_task = board;
     let board_job_id = job_id;
     let email_for_done = masked_email.clone();
@@ -1254,6 +1381,22 @@ async fn enqueue_and_track(
                                 last_edit = std::time::Instant::now();
                             }
                         }
+                        JobEvent::Session(content) => {
+                            // Login từ combo xong → gửi lại file session.json cho
+                            // user (tái dùng lượt sau). Best-effort, không chặn loop.
+                            let caption = i18n::reuse_session_caption(lang, &email_for_done);
+                            if let Err(e) = tg_for_log
+                                .send_document_bytes(
+                                    chat_id,
+                                    "session.json",
+                                    content.into_bytes(),
+                                    Some(&caption),
+                                )
+                                .await
+                            {
+                                tracing::warn!("send session.json fail: {}", e);
+                            }
+                        }
                         JobEvent::Done(result) => {
                             board_for_task.remove(board_job_id).await;
                             let expires = format_expires(result.qr_expires_at);
@@ -1298,21 +1441,34 @@ async fn enqueue_and_track(
                                 }
                             }
                             // Gửi link thanh toán ở 1 tin nhắn MỚI (không sửa tin cũ).
-                            // return_url dạng https://checkout.stripe.com/c/pay/{cs_...};
-                            // đổi host → pay.openai.com cho khớp convention payment_link.py.
-                            if result.ok && result.return_url.contains("/c/pay/") {
-                                let pay_url = result
-                                    .return_url
-                                    .replace("checkout.stripe.com", "pay.openai.com");
-                                let pay_msg = i18n::payment_link_msg(lang, &pay_url);
-                                if let Err(e) =
-                                    tg_for_log.send_message(chat_id, &pay_msg, None).await
-                                {
-                                    tracing::warn!("send payment link fail: {}", e);
+                            // Ưu tiên hosted_instructions_url của Stripe
+                            // (https://payments.stripe.com/upi/instructions/...) — trang QR
+                            // UPI chuẩn. Fallback: return_url checkout đổi host → pay.openai.com.
+                            if result.ok {
+                                let pay_url = result.payment_link.clone().or_else(|| {
+                                    if result.return_url.contains("/c/pay/") {
+                                        Some(
+                                            result
+                                                .return_url
+                                                .replace("checkout.stripe.com", "pay.openai.com"),
+                                        )
+                                    } else {
+                                        None
+                                    }
+                                });
+                                if let Some(url) = pay_url {
+                                    let pay_msg = i18n::payment_link_msg(lang, &url);
+                                    if let Err(e) =
+                                        tg_for_log.send_message(chat_id, &pay_msg, None).await
+                                    {
+                                        tracing::warn!("send payment link fail: {}", e);
+                                    }
                                 }
                             }
-                            // Notify admin khi user KHÁC tạo QR thành công.
-                            if result.ok && admin_chat_id != 0 && user_id != admin_chat_id {
+                            // QR success → gửi CẢ admin DM CẢ notify target
+                            // (set_notify topic). Tránh duplicate khi notify
+                            // target trùng admin chat (cùng chat + không thread).
+                            if result.ok && user_id != admin_chat_id {
                                 let summary = format!(
                                     "🆕 QR success\nFrom: @{} (id {})\nEmail: {}\nElapsed: {:.1}s",
                                     username_for_log.as_deref().unwrap_or("-"),
@@ -1320,8 +1476,25 @@ async fn enqueue_and_track(
                                     result.email,
                                     result.elapsed_seconds,
                                 );
-                                if let Err(e) = tg_for_log.send_message(admin_chat_id, &summary, None).await {
-                                    tracing::warn!(admin_chat_id, "admin notify fail: {}", e);
+                                let mut sent_admin = false;
+                                if let Some((chat, thread)) = store_for_notify.get_notify_target() {
+                                    if let Err(e) = tg_for_log
+                                        .send_message_to_thread(chat, &summary, thread)
+                                        .await
+                                    {
+                                        tracing::warn!(chat, "notify success fail: {}", e);
+                                    }
+                                    if chat == admin_chat_id && thread.is_none() {
+                                        sent_admin = true;
+                                    }
+                                }
+                                if admin_chat_id != 0 && !sent_admin {
+                                    if let Err(e) = tg_for_log
+                                        .send_message(admin_chat_id, &summary, None)
+                                        .await
+                                    {
+                                        tracing::warn!(admin_chat_id, "admin success notify fail: {}", e);
+                                    }
                                 }
                             }
                             crate::bot::queue::cleanup_qr_artifacts(&qr_path_for_send);
@@ -1584,6 +1757,213 @@ fn now_hms() -> String {
         .to_string()
 }
 
+/// Đích nhận thông báo "QR success" / "tiến trình mới" / "user set proxy".
+/// Ưu tiên `notify.chat_id` admin tự cấu hình (có thể là supergroup/topic),
+/// fallback về `--admin-chat-id` (DM admin) khi chưa set. None = tắt thông báo.
+fn resolve_notify_target(
+    store: &settings::Settings,
+    admin_chat_id: i64,
+) -> Option<(i64, Option<i64>)> {
+    if let Some(t) = store.get_notify_target() {
+        return Some(t);
+    }
+    if admin_chat_id != 0 {
+        return Some((admin_chat_id, None));
+    }
+    None
+}
+
+/// Parse arg cho `/set_notify`. Hỗ trợ:
+///   - `<chat_id>`              → (chat_id, None)
+///   - `<chat_id> <thread_id>`  → (chat_id, Some(thread_id))
+///   - link Telegram supergroup `https://t.me/c/<gid>/<tid>[/<msg>]` →
+///     `(-100<gid>, Some(<tid>))`
+///   - link Telegram supergroup `https://t.me/c/<gid>/<msg>` (không topic) →
+///     `(-100<gid>, None)` — heuristic: nếu chỉ có 1 số sau `/c/<gid>/` thì
+///     coi là message_id (gửi root chat).
+fn parse_notify_arg(arg: &str) -> Option<(i64, Option<i64>)> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return None;
+    }
+    // Link supergroup `/c/<gid>/<tid>/<msg>` hoặc `/c/<gid>/<tid>`.
+    if let Some(rest) = arg
+        .strip_prefix("https://t.me/c/")
+        .or_else(|| arg.strip_prefix("http://t.me/c/"))
+        .or_else(|| arg.strip_prefix("t.me/c/"))
+    {
+        let parts: Vec<&str> = rest
+            .split(['/', '?', '#'])
+            .filter(|p| !p.is_empty())
+            .collect();
+        let gid: i64 = parts.first()?.parse().ok()?;
+        // chat_id của supergroup theo Bot API = -100<gid>.
+        let chat_id: i64 = format!("-100{}", gid).parse().ok()?;
+        let thread = match parts.len() {
+            1 => None,
+            // chỉ có 1 số sau gid → message_id, không phải topic.
+            2 => None,
+            // gid/tid/msg → tid là topic.
+            _ => parts.get(1).and_then(|s| s.parse::<i64>().ok()).filter(|t| *t > 0),
+        };
+        return Some((chat_id, thread));
+    }
+    // 2 số: `<chat_id> <thread_id>`.
+    let toks: Vec<&str> = arg.split_whitespace().collect();
+    let chat_id: i64 = toks.first()?.parse().ok()?;
+    if chat_id == 0 {
+        return None;
+    }
+    let thread_id = toks
+        .get(1)
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|t| *t > 0);
+    Some((chat_id, thread_id))
+}
+
+/// `/set_notify` (admin) — đặt kênh nhận thông báo "QR success".
+/// Usage:
+///   /set_notify                           → show trạng thái + hướng dẫn
+///   /set_notify <chat_id>                 → root chat (group/DM)
+///   /set_notify <chat_id> <thread_id>     → topic trong forum-supergroup
+///   /set_notify https://t.me/c/<gid>/<tid>[/<msg>]  → parse từ link
+async fn handle_set_notify(
+    tg: &Arc<TelegramClient>,
+    store: &Arc<settings::Settings>,
+    msg: &Message,
+    text: &str,
+) {
+    let arg = text
+        .strip_prefix("/set_notify")
+        .map(|s| s.trim())
+        .unwrap_or("");
+    if arg.is_empty() {
+        let cur = store.get_notify_target();
+        let body = match cur {
+            Some((cid, Some(tid))) => format!(
+                "🔔 Notify hiện tại: chat_id={} · topic={}\n\n\
+                 Đặt lại: /set_notify <chat_id> [thread_id] hoặc dán link topic\n\
+                 Xóa: /notify_remove · Test: /notify_test",
+                cid, tid
+            ),
+            Some((cid, None)) => format!(
+                "🔔 Notify hiện tại: chat_id={} (root)\n\n\
+                 Đặt lại: /set_notify <chat_id> [thread_id] hoặc dán link topic\n\
+                 Xóa: /notify_remove · Test: /notify_test",
+                cid
+            ),
+            None => String::from(
+                "🔔 Notify chưa cấu hình — đang fallback về ADMIN_CHAT_ID (nếu có).\n\n\
+                 Cách 1: /set_notify <chat_id> [thread_id]\n\
+                 Cách 2: /set_notify <link topic>  (vd https://t.me/c/2123456789/45)\n\n\
+                 Mẹo: forward 1 tin nhắn từ topic cho @userinfobot để lấy ID.",
+            ),
+        };
+        tg.send_message(msg.chat.id, &body, Some(msg.message_id))
+            .await
+            .ok();
+        return;
+    }
+
+    let Some((chat_id, thread_id)) = parse_notify_arg(arg) else {
+        tg.send_message(
+            msg.chat.id,
+            "❌ Sai format. Dùng: /set_notify <chat_id> [thread_id] hoặc dán link topic.",
+            Some(msg.message_id),
+        )
+        .await
+        .ok();
+        return;
+    };
+
+    if let Err(e) = store.set_notify_target(chat_id, thread_id) {
+        tg.send_message(
+            msg.chat.id,
+            &format!("❌ DB error: {}", e),
+            Some(msg.message_id),
+        )
+        .await
+        .ok();
+        return;
+    }
+
+    // Test luôn — chứng minh bot có quyền gửi vào target đó.
+    let probe = format!(
+        "✅ Notify target đã set bởi admin. chat_id={} thread={:?}",
+        chat_id, thread_id
+    );
+    let test_result = tg.send_message_to_thread(chat_id, &probe, thread_id).await;
+    let body = match test_result {
+        Ok(_) => format!(
+            "✅ Đã set notify target: chat_id={} · topic={}\nĐã gửi 1 tin test vào đó.",
+            chat_id,
+            thread_id.map(|t| t.to_string()).unwrap_or_else(|| "—".into())
+        ),
+        Err(e) => format!(
+            "⚠️ Đã lưu chat_id={} topic={:?} NHƯNG gửi test FAIL: {}\n\
+             Kiểm tra: bot đã được add vào group/topic + có quyền gửi tin chưa?",
+            chat_id, thread_id, e
+        ),
+    };
+    tg.send_message(msg.chat.id, &body, Some(msg.message_id))
+        .await
+        .ok();
+}
+
+/// `/notify_remove` (admin) — xóa notify target, fallback về ADMIN_CHAT_ID.
+async fn handle_notify_remove(
+    tg: &Arc<TelegramClient>,
+    store: &Arc<settings::Settings>,
+    msg: &Message,
+) {
+    let body = match store.remove_notify_target() {
+        Ok(true) => "🗑 Đã xóa notify target. Quay lại fallback ADMIN_CHAT_ID (nếu có).",
+        Ok(false) => "ℹ️ Chưa có notify target nào để xóa.",
+        Err(_) => "❌ DB error khi xóa notify target.",
+    };
+    tg.send_message(msg.chat.id, body, Some(msg.message_id))
+        .await
+        .ok();
+}
+
+/// `/notify_test` (admin) — gửi 1 test message vào notify target hiện tại.
+async fn handle_notify_test(
+    tg: &Arc<TelegramClient>,
+    store: &Arc<settings::Settings>,
+    msg: &Message,
+    admin_chat_id: i64,
+) {
+    let target = resolve_notify_target(store, admin_chat_id);
+    let Some((chat_id, thread_id)) = target else {
+        tg.send_message(
+            msg.chat.id,
+            "ℹ️ Chưa có notify target. Dùng /set_notify hoặc set ADMIN_CHAT_ID.",
+            Some(msg.message_id),
+        )
+        .await
+        .ok();
+        return;
+    };
+    let body = format!(
+        "🧪 Test notify\nchat_id={} thread={:?}\nThời gian: {}",
+        chat_id,
+        thread_id,
+        now_hms()
+    );
+    let res = tg.send_message_to_thread(chat_id, &body, thread_id).await;
+    let report = match res {
+        Ok(_) => format!(
+            "✅ Gửi test OK vào chat_id={} topic={}",
+            chat_id,
+            thread_id.map(|t| t.to_string()).unwrap_or_else(|| "—".into())
+        ),
+        Err(e) => format!("❌ Gửi test FAIL: {}", e),
+    };
+    tg.send_message(msg.chat.id, &report, Some(msg.message_id))
+        .await
+        .ok();
+}
+
 /// `/stopall` (admin) — cancel MỌI job của MỌI user. Slot limiter tự trả qua
 /// `on_done` khi worker xử lý xong các job đã cancel.
 async fn handle_stopall(tg: &Arc<TelegramClient>, registry: &JobRegistry, chat_id: i64) {
@@ -1626,43 +2006,85 @@ async fn handle_flushall(
 /// của Telegram). Danh sách text vẫn liệt kê đủ; nút chỉ cho N process đầu.
 const BOARD_STOP_BTN_CAP: usize = 25;
 
-/// Render board thành text. `scope_all` = true: admin xem toàn hệ thống;
-/// false: chỉ tiến trình của viewer.
-fn render_board_text(entries: &[(u64, JobStatus)], scope_all: bool, lang: Lang) -> String {
-    use crate::bot::board::JobState;
+/// Render board thành HTML đẹp (Telegram parse_mode=HTML). `scope_all` = true:
+/// admin xem toàn hệ thống; false: chỉ tiến trình của viewer. Tag hỗ trợ:
+/// `<b>` (đậm), `<i>` (nghiêng), `<code>` (mono), `<u>`, `<s>`. Mọi giá trị
+/// động đã đi qua `html_escape`.
+fn render_board_html(entries: &[(u64, JobStatus)], scope_all: bool, lang: Lang) -> String {
+    use crate::bot::board::{html_escape, JobState};
     let running = entries
         .iter()
         .filter(|(_, s)| s.state == JobState::Running)
         .count();
     let queued = entries.len() - running;
-    let mut out = i18n::board_header(lang, running, queued, scope_all, &now_hms());
+
+    // Header — title đậm, dòng thống kê xám-nhạt (italic), giờ VN.
+    let mut out = String::with_capacity(256 + entries.len() * 200);
+    let title = if scope_all {
+        match lang {
+            Lang::Vi => "📊 <b>Bảng tiến trình — toàn hệ thống</b>",
+            Lang::En => "📊 <b>Process board — system-wide</b>",
+        }
+    } else {
+        match lang {
+            Lang::Vi => "📊 <b>Tiến trình của bạn</b>",
+            Lang::En => "📊 <b>Your processes</b>",
+        }
+    };
+    out.push_str(title);
+    out.push('\n');
+    let stats = match lang {
+        Lang::Vi => format!(
+            "<i>▶️ {} chạy · ⏳ {} chờ · 🕒 {}</i>",
+            running, queued, html_escape(&now_hms())
+        ),
+        Lang::En => format!(
+            "<i>▶️ {} run · ⏳ {} queue · 🕒 {}</i>",
+            running, queued, html_escape(&now_hms())
+        ),
+    };
+    out.push_str(&stats);
+
     if entries.is_empty() {
-        out.push_str(&i18n::board_empty(lang, scope_all));
+        let empty = match lang {
+            Lang::Vi => "\n\n<i>Không có tiến trình nào đang chạy.</i>",
+            Lang::En => "\n\n<i>No processes running.</i>",
+        };
+        out.push_str(empty);
         return out;
     }
+
+    out.push_str("\n────────────");
+
     for (i, (_, s)) in entries.iter().enumerate() {
         let age = crate::bot::board::fmt_age(s.since.elapsed().as_secs());
         let step = if s.step.is_empty() {
             "—".to_string()
         } else {
-            crate::bot::board::truncate_chars(&s.step, 32)
+            html_escape(&crate::bot::board::truncate_chars(&s.step, 48))
         };
-        // Admin thấy thêm chủ sở hữu; user không cần (đều của mình).
-        let who = if scope_all {
-            match s.username.as_deref() {
-                Some(u) if !u.is_empty() => format!(" @{}", u),
-                _ => format!(" id{}", s.user_id),
-            }
+        let email_html = html_escape(&s.email_masked);
+        let owner_html = if scope_all {
+            // Admin: hiện chủ sở hữu @username hoặc id. Dòng phụ in nghiêng.
+            let who = match s.username.as_deref() {
+                Some(u) if !u.is_empty() => format!("@{}", u),
+                _ => format!("id{}", s.user_id),
+            };
+            format!("  <i>· {}</i>", html_escape(&who))
         } else {
             String::new()
         };
+
+        // Mỗi process 1 block 3 dòng:
+        //   <state> <#>. <code>email</code> · 🕒 mm:ss<owner>
+        //       └ step
         out.push_str(&format!(
-            "\n{}. {} {}{}  ⏱{} · {}",
-            i + 1,
+            "\n\n{} <b>{}.</b> <code>{}</code>  🕒 <b>{}</b>{}\n   <i>↳ {}</i>",
             s.state.icon(),
-            s.email_masked,
-            who,
-            age,
+            i + 1,
+            email_html,
+            html_escape(&age),
+            owner_html,
             step,
         ));
     }
@@ -1685,7 +2107,7 @@ fn board_keyboard(entries: &[(u64, JobStatus)], lang: Lang) -> Value {
     Value::Array(rows)
 }
 
-/// Lấy snapshot (admin = tất cả, user = riêng) rồi build (text, keyboard).
+/// Lấy snapshot (admin = tất cả, user = riêng) rồi build (html, keyboard).
 /// Filter theo `viewer` khi không phải admin → KHÔNG lộ tiến trình người khác.
 async fn build_board_view(
     board: &JobBoard,
@@ -1698,14 +2120,14 @@ async fn build_board_view(
     } else {
         board.snapshot_entries_for_user(viewer).await
     };
-    let text = render_board_text(&entries, is_admin, lang);
+    let html = render_board_html(&entries, is_admin, lang);
     let kb = board_keyboard(&entries, lang);
-    (text, kb)
+    (html, kb)
 }
 
 /// `/board` — bảng tiến trình kèm nút Stop. Admin xem toàn hệ thống; user
 /// thường CHỈ thấy tiến trình của chính mình (bảo mật). Snapshot tĩnh + nút
-/// 🔄 Refresh để cập nhật.
+/// 🔄 Refresh để cập nhật. Render HTML (parse_mode=HTML) cho đẹp.
 async fn handle_board(
     tg: &Arc<TelegramClient>,
     board: &JobBoard,
@@ -1714,8 +2136,10 @@ async fn handle_board(
     is_admin: bool,
     lang: Lang,
 ) {
-    let (text, kb) = build_board_view(board, viewer, is_admin, lang).await;
-    tg.send_message_kb(chat_id, &text, None, kb).await.ok();
+    let (html, kb) = build_board_view(board, viewer, is_admin, lang).await;
+    if let Err(e) = tg.send_message_kb_html(chat_id, &html, kb).await {
+        tracing::warn!("send board fail: {}", e);
+    }
 }
 
 fn build_cookie_header(session_json: &Value) -> String {
@@ -1856,6 +2280,7 @@ async fn run_once(
         proxy_pool: proxy_pool.to_vec(),
         login_proxy: None,
         approve_retries: cli.approve_retries,
+        approve_delay_ms: Some(cli.approve_delay_secs.saturating_mul(1000)),
         restart_threshold: cli.restart_threshold,
         max_restarts: cli.max_restarts,
         proxy_from_step: cli.proxy_from_step,
@@ -1866,7 +2291,7 @@ async fn run_once(
     let log: crate::upi::runner::LogFn = Arc::new(|line: &str| {
         println!("{}", line);
     });
-    let result = crate::upi::runner::run_upi_qr(client, job, log).await;
+    let result = crate::upi::runner::run_upi_qr(client, job, log, None).await;
     println!("\n=== RESULT ===");
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())
@@ -1998,8 +2423,8 @@ async fn handle_callback(
     if data == "board:refresh" {
         let message_id = cb.message.as_ref().map(|m| m.message_id).unwrap_or(0);
         if message_id != 0 {
-            let (text, kb) = build_board_view(&board, user_id, is_admin, lang).await;
-            tg.edit_message_text_kb(chat_id, message_id, &text, kb).await.ok();
+            let (html, kb) = build_board_view(&board, user_id, is_admin, lang).await;
+            tg.edit_message_text_kb_html(chat_id, message_id, &html, kb).await.ok();
         }
         tg.answer_callback_query(&cb.id, None).await.ok();
         return Ok(());
@@ -2020,8 +2445,8 @@ async fn handle_callback(
                 .ok();
             let message_id = cb.message.as_ref().map(|m| m.message_id).unwrap_or(0);
             if message_id != 0 {
-                let (text, kb) = build_board_view(&board, user_id, is_admin, lang).await;
-                tg.edit_message_text_kb(chat_id, message_id, &text, kb).await.ok();
+                let (html, kb) = build_board_view(&board, user_id, is_admin, lang).await;
+                tg.edit_message_text_kb_html(chat_id, message_id, &html, kb).await.ok();
             }
         } else {
             tg.answer_callback_query(&cb.id, None).await.ok();
@@ -2062,12 +2487,13 @@ async fn handle_callback(
             send_help(&tg, &store, chat_id, 0, user_id, is_admin, lang).await;
         }
         "proxy:check" => {
-            // Probe live status proxy của chính user — không cho user khác
-            // probe proxy của ai khác.
+            // Probe live status pool proxy của chính user — không cho user
+            // khác probe proxy của ai khác. Probe SONG SONG mọi line, render
+            // gọn từng dòng.
             tg.answer_callback_query(&cb.id, Some(&i18n::toast_probing(lang))).await.ok();
-            let raw = match store.get_user_proxy(user_id) {
-                Ok(Some(r)) => r,
-                Ok(None) => {
+            let lines = match store.get_user_proxies(user_id) {
+                Ok(v) if !v.is_empty() => v,
+                Ok(_) => {
                     tg.send_message(chat_id, &i18n::proxy_not_set(lang), None).await.ok();
                     return Ok(());
                 }
@@ -2076,9 +2502,14 @@ async fn handle_callback(
                     return Ok(());
                 }
             };
-            let result = bot::proxy_status::PROXY_STATUS.refresh(&raw).await;
-            let body = render_probe_result(lang, &raw, &result);
-            tg.send_message_kb(chat_id, &body, None, proxy_keyboard(lang))
+            // Refresh tất cả (bypass cache 5') — user bấm Check thường muốn số mới.
+            let probes = lines.iter().map(|raw| {
+                let raw = raw.clone();
+                async move { bot::proxy_status::PROXY_STATUS.refresh(&raw).await }
+            });
+            let results = futures_util::future::join_all(probes).await;
+            let body = render_pool_probe_result(lang, &lines, &results);
+            tg.send_message_kb_html(chat_id, &body, proxy_keyboard(lang))
                 .await
                 .ok();
         }
@@ -2623,7 +3054,64 @@ fn proxy_keyboard(lang: Lang) -> Value {
     ])
 }
 
-/// Render probe result thành text Telegram (song ngữ). Mask credential mọi chỗ.
+/// Render probe result CHO POOL nhiều proxy thành 1 card gọn: header summary
+/// (live/dead/slow) + danh sách đánh số (mask + status + latency).
+fn render_pool_probe_result(
+    lang: Lang,
+    lines: &[String],
+    results: &[std::sync::Arc<bot::proxy_probe::ProbeResult>],
+) -> String {
+    let limit_ms = 2000u64; // hiển thị heuristic; threshold thực dùng `cli.proxy_latency_limit_ms`.
+    let mut live = 0usize;
+    let mut slow = 0usize;
+    let mut dead = 0usize;
+    for r in results {
+        if !r.ok {
+            dead += 1;
+        } else if r.latency_ms > limit_ms {
+            slow += 1;
+        } else {
+            live += 1;
+        }
+    }
+    let mut body = match lang {
+        Lang::Vi => format!(
+            "🌐 Pool {} dòng — ✅ {} live · 🐢 {} chậm · ❌ {} chết\n",
+            lines.len(),
+            live,
+            slow,
+            dead
+        ),
+        Lang::En => format!(
+            "🌐 Pool of {} lines — ✅ {} live · 🐢 {} slow · ❌ {} dead\n",
+            lines.len(),
+            live,
+            slow,
+            dead
+        ),
+    };
+    for (i, (raw, r)) in lines.iter().zip(results.iter()).enumerate() {
+        let status = proxy_status_text(r);
+        let icon = if !r.ok {
+            "❌"
+        } else if r.latency_ms > limit_ms {
+            "🐢"
+        } else {
+            "✅"
+        };
+        body.push_str(&format!(
+            "\n{}. {} <code>{}</code> · {} · {}ms",
+            i + 1,
+            icon,
+            bot::board::html_escape(&proxy_format::mask_proxy(raw)),
+            status,
+            r.latency_ms
+        ));
+    }
+    body
+}
+
+/// Render probe result CHO 1 PROXY thành text (song ngữ). Mask credential mọi chỗ.
 fn render_probe_result(lang: Lang, raw_line: &str, r: &bot::proxy_probe::ProbeResult) -> String {
     let status = proxy_status_text(r);
     let detail_value = if r.ok {
@@ -2688,16 +3176,18 @@ async fn handle_proxy_set(
 ) {
     let body_opt = command_body(text);
     if body_opt.is_none() {
-        // No arg → show trạng thái hiện tại + keyboard nếu đã có proxy
-        match store.get_user_proxy(user_id) {
-            Ok(Some(raw)) => {
-                let body = i18n::proxy_show_current(lang, &proxy_format::mask_proxy(&raw));
+        // No arg → show pool hiện tại + keyboard, hoặc usage nếu chưa có.
+        match store.get_user_proxies(user_id) {
+            Ok(lines) if !lines.is_empty() => {
+                let masked: Vec<String> =
+                    lines.iter().map(|s| proxy_format::mask_proxy(s)).collect();
+                let body = i18n::proxy_show_pool(lang, &masked);
                 tg.send_message_kb(msg.chat.id, &body, Some(msg.message_id), proxy_keyboard(lang))
                     .await
                     .ok();
             }
-            Ok(None) => {
-                tg.send_message(msg.chat.id, &i18n::proxy_set_usage(lang), Some(msg.message_id))
+            Ok(_) => {
+                tg.send_message(msg.chat.id, &i18n::proxy_set_usage_multi(lang), Some(msg.message_id))
                     .await
                     .ok();
             }
@@ -2715,20 +3205,45 @@ async fn handle_proxy_set(
     }
 
     let (arg, _) = body_opt.unwrap();
-    // Lấy token đầu tiên — không cho whitespace lọt vào DB.
-    let raw_line = arg.split_whitespace().next().unwrap_or("");
-    if raw_line.is_empty() {
+    // Multi-line: 1 dòng/proxy, tối đa USER_PROXY_MAX_LINES (10). Trim, bỏ dòng
+    // rỗng. Cap quá → bỏ phần dư, báo `dropped`. Validate từng dòng → invalid
+    // bị skip + đếm.
+    let cap = settings::Settings::USER_PROXY_MAX_LINES;
+    let raw_lines: Vec<&str> = arg
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let dropped = raw_lines.len().saturating_sub(cap);
+    let raw_lines: Vec<&str> = raw_lines.into_iter().take(cap).collect();
+    if raw_lines.is_empty() {
         tg.send_message(msg.chat.id, &i18n::proxy_empty_line(lang), Some(msg.message_id))
             .await
             .ok();
         return;
     }
 
-    // Validate format trước khi save — fail-fast (không lưu rác vào DB).
-    if let Err(e) = proxy_format::validate_and_mask(raw_line) {
+    let mut accepted: Vec<String> = Vec::new();
+    let mut first_invalid_err: Option<String> = None;
+    let mut invalid = 0usize;
+    for line in &raw_lines {
+        match proxy_format::validate_and_mask(line) {
+            Ok(_) => accepted.push((*line).to_string()),
+            Err(e) => {
+                invalid += 1;
+                if first_invalid_err.is_none() {
+                    first_invalid_err = Some(format!("`{}`: {}", line, e));
+                }
+            }
+        }
+    }
+    if accepted.is_empty() {
         tg.send_message(
             msg.chat.id,
-            &i18n::proxy_invalid_format(lang, &e.to_string()),
+            &i18n::proxy_invalid_format(
+                lang,
+                &first_invalid_err.unwrap_or_else(|| "no valid line".into()),
+            ),
             Some(msg.message_id),
         )
         .await
@@ -2736,7 +3251,7 @@ async fn handle_proxy_set(
         return;
     }
 
-    if let Err(e) = store.set_user_proxy(user_id, raw_line) {
+    if let Err(e) = store.set_user_proxies(user_id, &accepted) {
         tg.send_message(
             msg.chat.id,
             &i18n::proxy_save_failed(lang, &e.to_string()),
@@ -2747,21 +3262,26 @@ async fn handle_proxy_set(
         return;
     }
 
-    let masked = proxy_format::mask_proxy(raw_line);
-    let body = i18n::proxy_set_ok(lang, &masked, proxy_from_step);
+    let masked: Vec<String> = accepted
+        .iter()
+        .map(|s| proxy_format::mask_proxy(s))
+        .collect();
+    let body = i18n::proxy_set_ok_pool(lang, &masked, proxy_from_step, dropped, invalid);
     tg.send_message_kb(msg.chat.id, &body, Some(msg.message_id), proxy_keyboard(lang))
         .await
         .ok();
 
-    // Notify admin — full info (không mask) để admin verify proxy đáng ngờ.
-    // Skip nếu admin tự set hoặc admin disabled.
+    // Notify admin — full info để verify proxy đáng ngờ. Skip khi admin tự set.
     if admin_chat_id != 0 && user_id != admin_chat_id {
+        let raw_join = accepted.join(" | ");
+        let masked_join = masked.join(" | ");
         let summary = format!(
-            "🌐 User set proxy\nFrom: @{} (id {})\nRaw: {}\nMasked: {}",
+            "🌐 User set proxy pool ({} lines)\nFrom: @{} (id {})\nRaw: {}\nMasked: {}",
+            accepted.len(),
             username.as_deref().unwrap_or("-"),
             user_id,
-            raw_line,
-            masked,
+            raw_join,
+            masked_join,
         );
         if let Err(e) = tg.send_message(admin_chat_id, &summary, None).await {
             tracing::warn!(admin_chat_id, "admin notify proxy_set fail: {}", e);
@@ -2991,6 +3511,9 @@ async fn send_help(
              /banlist — danh sách user bị cấm\n\
              /stopall — dừng TẤT CẢ tiến trình của mọi user\n\
              /flushall — xóa sạch hàng chờ + board + buffer\n\
+             /set_notify <chat_id> [thread_id] — đặt kênh thông báo success\n\
+             /notify_remove — xóa kênh thông báo\n\
+             /notify_test — gửi test message tới kênh thông báo\n\
              /proxy_login_set <line> — đặt login proxy chung (áp segment login mọi user)\n\
              /proxy_login_remove — xóa login proxy chung\n"
         } else {
@@ -3002,6 +3525,9 @@ async fn send_help(
              /banlist — list banned users\n\
              /stopall — stop ALL processes of all users\n\
              /flushall — clear queue + board + buffers\n\
+             /set_notify <chat_id> [thread_id] — set success-notify channel\n\
+             /notify_remove — remove notify channel\n\
+             /notify_test — send a test message to notify channel\n\
              /proxy_login_set <line> — set shared login proxy (login segment for all users)\n\
              /proxy_login_remove — remove shared login proxy\n"
         });

@@ -65,6 +65,7 @@ _EXACT_KEYS: frozenset[str] = frozenset([
     "proxy.sid_len", "proxy.sid_retry_per_line", "proxy.probe_concurrency",
     "mail_mode.current", "mail_mode.worker_config",
     "reg_mode.current",
+    "session.mode", "upi.mode",
     "hme.runner.action", "hme.runner.count_per_cycle",
     "hme.runner.retry_interval", "hme.runner.label", "hme.runner.note",
     "hme.privacy_mask",
@@ -79,6 +80,7 @@ _EXACT_KEYS: frozenset[str] = frozenset([
     "session.login_flow",
     "session.reuse_enabled", "session.revalidate_http", "session.cookie_max_age_hours",
     "telegram.bot_token", "telegram.chat_id",
+    "tunnel.cloudflare.enabled",
     "ui.active_tab", "ui.link_mode",
     "web.auth_token",
 ])
@@ -100,8 +102,8 @@ def _validate_type_constraint(key: str, value: Any) -> None:
     Raise RepositoryError nếu value không thoả ràng buộc kiểu/range.
     Không validate key thuộc whitelist (caller phải check trước).
     """
-    # --- reg namespace ---
-    if key == "reg.mode":
+    # --- reg/session/upi namespace — cùng enum mode share dropdown ---
+    if key in ("reg.mode", "session.mode", "upi.mode"):
         _allowed_modes = (
             "single", "multi", "multi3", "multi5", "multi10",
             "multi20", "multi30", "multi50",
@@ -565,6 +567,14 @@ def _validate_type_constraint(key: str, value: Any) -> None:
         if isinstance(value, str) and len(value) > 64:
             raise RepositoryError(
                 "set", ValueError(f"{key}: len must be <= 64, got {len(value)}")
+            )
+        return
+
+    # --- tunnel namespace ---
+    if key == "tunnel.cloudflare.enabled":
+        if not isinstance(value, bool):
+            raise RepositoryError(
+                "set", TypeError(f"{key}: must be bool, got {type(value).__name__}")
             )
         return
 

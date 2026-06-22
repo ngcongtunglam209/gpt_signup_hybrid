@@ -18,6 +18,14 @@ use std::sync::Mutex;
 /// Settings key cho login proxy global (admin-only). Dot-namespace theo rule.
 const LOGIN_PROXY_KEY: &str = "proxy.login";
 
+/// Settings key cho kênh nhận thông báo "QR success" do admin cấu hình. Khác
+/// `--admin-chat-id` (DM của admin): notify target có thể là supergroup/topic
+/// để cả team theo dõi success real-time.
+const NOTIFY_CHAT_ID_KEY: &str = "notify.chat_id";
+/// Optional `message_thread_id` (topic ID trong forum-supergroup). 0/missing =
+/// gửi vào root chat. Telegram chỉ chấp nhận thread_id > 0.
+const NOTIFY_THREAD_ID_KEY: &str = "notify.thread_id";
+
 /// 1 dòng trong bảng `bot_bans`, dùng để render `/banlist`.
 #[derive(Debug, Clone)]
 pub struct BanRecord {
@@ -143,6 +151,48 @@ impl Settings {
             params![LOGIN_PROXY_KEY],
         )?;
         Ok(n > 0)
+    }
+
+    // ── notify target (admin-only, global) ────────────────────────────────
+    /// (chat_id, thread_id) — thread_id `Some(n)` chỉ khi > 0. None = chưa cấu
+    /// hình. Caller fallback về `--admin-chat-id` nếu None.
+    pub fn get_notify_target(&self) -> Option<(i64, Option<i64>)> {
+        let chat_id: i64 = self.get(NOTIFY_CHAT_ID_KEY)?.parse().ok()?;
+        if chat_id == 0 {
+            return None;
+        }
+        let thread_id: Option<i64> = self
+            .get(NOTIFY_THREAD_ID_KEY)
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|t| *t > 0);
+        Some((chat_id, thread_id))
+    }
+
+    pub fn set_notify_target(&self, chat_id: i64, thread_id: Option<i64>) -> Result<()> {
+        self.set(NOTIFY_CHAT_ID_KEY, &chat_id.to_string())?;
+        match thread_id {
+            Some(t) if t > 0 => self.set(NOTIFY_THREAD_ID_KEY, &t.to_string())?,
+            _ => {
+                self.lock().execute(
+                    "DELETE FROM settings WHERE key = ?1",
+                    params![NOTIFY_THREAD_ID_KEY],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Xóa notify target. Trả `true` nếu có row bị xóa.
+    pub fn remove_notify_target(&self) -> Result<bool> {
+        let n1 = self.lock().execute(
+            "DELETE FROM settings WHERE key = ?1",
+            params![NOTIFY_CHAT_ID_KEY],
+        )?;
+        let n2 = self.lock().execute(
+            "DELETE FROM settings WHERE key = ?1",
+            params![NOTIFY_THREAD_ID_KEY],
+        )?;
+        Ok(n1 + n2 > 0)
     }
 
     // ── bot_users ───────────────────────────────────────────────────────
@@ -313,9 +363,57 @@ impl Settings {
     }
 
     // ── user_proxies ──────────────────────────────────────────────────────
+    /// Số dòng proxy tối đa user được set (yêu cầu sản phẩm). 1 user = 1
+    /// pool nhỏ, mỗi dòng = 1 proxy line/template.
+    pub const USER_PROXY_MAX_LINES: usize = 10;
+
+    /// Set danh sách proxy cho user (tối đa `USER_PROXY_MAX_LINES`). Caller
+    /// PHẢI validate từng line bằng `proxy_format::validate_and_mask` trước.
+    /// Lưu dạng newline-separated trong cột `raw` để giữ schema hiện tại.
+    /// `lines` rỗng → xóa entry (gọi `remove_user_proxy` cho rõ ràng hơn).
+    pub fn set_user_proxies(&self, user_id: i64, lines: &[String]) -> Result<()> {
+        let cleaned: Vec<&str> = lines
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .take(Self::USER_PROXY_MAX_LINES)
+            .collect();
+        if cleaned.is_empty() {
+            self.remove_user_proxy(user_id)?;
+            return Ok(());
+        }
+        let joined = cleaned.join("\n");
+        self.set_user_proxy(user_id, &joined)
+    }
+
+    /// Đọc danh sách proxy của user (newline-separated). Trim + dedupe + cap
+    /// `USER_PROXY_MAX_LINES`. Empty list nếu user chưa set.
+    pub fn get_user_proxies(&self, user_id: i64) -> Result<Vec<String>> {
+        let raw = match self.get_user_proxy(user_id)? {
+            Some(s) => s,
+            None => return Ok(Vec::new()),
+        };
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for line in raw.lines() {
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if seen.insert(t.to_string()) {
+                out.push(t.to_string());
+                if out.len() >= Self::USER_PROXY_MAX_LINES {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Set proxy raw line cho user (upsert). Caller PHẢI validate qua
     /// `proxy_format::validate_and_mask` trước. `raw` lưu nguyên (template/SID
-    /// cho rotate sticky session ở consumer).
+    /// cho rotate sticky session ở consumer). Cho multi-line: dùng
+    /// `set_user_proxies`.
     pub fn set_user_proxy(&self, user_id: i64, raw: &str) -> Result<()> {
         self.lock().execute(
             "INSERT INTO user_proxies(user_id, raw) VALUES(?1, ?2)

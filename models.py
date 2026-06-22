@@ -48,19 +48,28 @@ class SignupRequest(BaseModel):
         ),
     )
 
-    # Polling OTP — chọn 1 trong 3 provider:
+    # Polling OTP — chọn 1 trong các provider:
     #   - Worker logs API (icloud-cf-mail style) — default cho mail @icloud.com qua relay.
     #   - Outlook combo (Microsoft Graph) — cho mail @hotmail.com / @outlook.com.
     #   - Gmail Advanced (checkgmail.live API) — cho mail @gmail.com mua qua dịch vụ.
+    #   - China iCloud (icloudapi.xyz) — viewer URL riêng cho mỗi alias HME.
     mail_provider: str = Field(
         default="worker",
-        description="Provider: 'worker', 'outlook', 'dongvanfb', hoặc 'gmail_advanced'.",
-        pattern="^(worker|outlook|dongvanfb|gmail_advanced)$",
+        description="Provider: 'worker', 'outlook', 'dongvanfb', 'gmail_advanced', hoặc 'china_icloud'.",
+        pattern="^(worker|outlook|dongvanfb|gmail_advanced|china_icloud)$",
     )
     # Gmail Advanced config
     gmail_api_url: str | None = Field(
         default=None,
         description="API URL checkgmail.live (dùng khi mail_provider='gmail_advanced').",
+    )
+    # China iCloud config
+    china_icloud_url: str | None = Field(
+        default=None,
+        description=(
+            "Viewer URL mailbox icloudapi.xyz "
+            "(dùng khi mail_provider='china_icloud'). Format: http(s)://.../show/<token>/<email>."
+        ),
     )
     # Worker config
     email_logs_url: str = Field(

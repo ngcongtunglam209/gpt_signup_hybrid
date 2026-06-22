@@ -75,7 +75,7 @@ pub async fn fetch_bundles_live(
         return Err(anyhow!(
             "entry HTTP {}: {}",
             entry_resp.status,
-            &entry_resp.body[..entry_resp.body.len().min(200)]
+            entry_resp.body.chars().take(200).collect::<String>()
         ));
     }
     let entry_src = entry_resp.body;
@@ -146,7 +146,7 @@ pub async fn fetch_bundles_live(
         return Err(anyhow!(
             "custom_checkout HTTP {}: {}",
             cc_resp.status,
-            &cc_resp.body[..cc_resp.body.len().min(200)]
+            cc_resp.body.chars().take(200).collect::<String>()
         ));
     }
     let cc_src = cc_resp.body;

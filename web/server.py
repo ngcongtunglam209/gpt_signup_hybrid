@@ -98,6 +98,15 @@ async def on_startup():
     from .telegram_notifier import get_telegram_notifier
     get_telegram_notifier().apply_settings(all_settings)
 
+    # Cloudflare Quick Tunnel — hydrate enabled từ DB; auto-start nếu bật.
+    # CLI đã set local endpoint (host/port) trước khi gọi uvicorn.run.
+    from .cloudflare_tunnel import get_cloudflare_tunnel
+    tunnel = get_cloudflare_tunnel()
+    tunnel.apply_settings(all_settings)
+    if tunnel.enabled:
+        # Schedule task — start_async đợi URL nên không block startup.
+        asyncio.create_task(tunnel.start_async(), name="cloudflare-tunnel-start")
+
     # ── Session cache (feature: session-cookie-cache) ──
     # SessionStore per-instance (cô lập theo db stem) + SessionProvider singleton.
     # Seed một lần từ session_results (row có cookie session-token) → tái dùng ngay.
@@ -264,7 +273,7 @@ class AddJobsRequest(BaseModel):
     )
     mail_mode: str = Field(
         default="outlook",
-        description="Mail mode: 'outlook', 'worker', hoặc 'gmail_advanced'.",
+        description="Mail mode: 'outlook', 'worker', 'gmail_advanced', hoặc 'china_icloud'.",
     )
     reg_mode: str = Field(
         default="pure_request",
@@ -855,6 +864,14 @@ async def on_shutdown():
     if autoreg_runner is not None and autoreg_runner.is_running:
         autoreg_runner.stop()
         _log.info("shutdown: AutoRegRunner stopped")
+
+    # Stop Cloudflare Tunnel — graceful, swallow lỗi để không block shutdown.
+    try:
+        from .cloudflare_tunnel import get_cloudflare_tunnel
+        await get_cloudflare_tunnel().stop_async()
+        _log.info("shutdown: cloudflare tunnel stopped")
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("shutdown: stop cloudflare tunnel failed: %s", exc)
 
     # 2. Close SQLite engine (wait for in-flight transactions)
     if _engine is not None:
@@ -2042,6 +2059,67 @@ async def debug_telegram() -> JSONResponse:
         "bot_token_preview": (token[:8] + "..." + token[-4:]) if len(token) >= 16 else (token[:4] + "..." if token else ""),
         "chat_id": n.chat_id or "",
     })
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Cloudflare Quick Tunnel
+# ─────────────────────────────────────────────────────────────────────
+
+
+class SetTunnelConfigRequest(BaseModel):
+    enabled: bool = Field(..., description="Bật/tắt Cloudflare Quick Tunnel.")
+
+
+@app.get("/api/tunnel/status")
+async def get_tunnel_status() -> JSONResponse:
+    """Trả status tunnel: enabled, status, url, error, log_tail."""
+    from .cloudflare_tunnel import get_cloudflare_tunnel
+    return JSONResponse(get_cloudflare_tunnel().to_status_dict())
+
+
+@app.post("/api/tunnel/config")
+async def set_tunnel_config(payload: SetTunnelConfigRequest) -> JSONResponse:
+    """Bật/tắt tunnel + write-through DB.
+
+    Khi enabled=True: spawn cloudflared, đợi URL (timeout 30s).
+    Khi enabled=False: stop subprocess.
+    Trả về status snapshot sau khi áp dụng.
+    """
+    from .cloudflare_tunnel import get_cloudflare_tunnel
+
+    tunnel = get_cloudflare_tunnel()
+    enabled = bool(payload.enabled)
+
+    persist_error: str | None = None
+    try:
+        _get_settings_repo().bulk_set({"tunnel.cloudflare.enabled": enabled})
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("tunnel config write-through failed: %s", exc)
+        persist_error = str(exc)
+
+    # Áp dụng state vào manager (giữ in-memory đồng bộ với DB).
+    tunnel.apply_settings({"tunnel.cloudflare.enabled": enabled})
+
+    if enabled:
+        await tunnel.start_async()
+    else:
+        await tunnel.stop_async()
+
+    body = tunnel.to_status_dict()
+    if persist_error:
+        body["settings_persist_error"] = persist_error
+    return JSONResponse(body)
+
+
+@app.post("/api/tunnel/restart")
+async def restart_tunnel() -> JSONResponse:
+    """Restart tunnel (URL mới được cấp). Chỉ có nghĩa khi enabled=True."""
+    from .cloudflare_tunnel import get_cloudflare_tunnel
+    tunnel = get_cloudflare_tunnel()
+    if not tunnel.enabled:
+        raise HTTPException(400, "tunnel chưa bật — bật ở /api/tunnel/config trước")
+    await tunnel.restart_async()
+    return JSONResponse(tunnel.to_status_dict())
 
 
 @app.post("/api/upi/jobs/{job_id}/notify")

@@ -1332,6 +1332,7 @@ body {
 .badge-mode-worker  { background: rgba(216,180,93,0.13); color: var(--yellow); }
 .badge-mode-dongvanfb { background: rgba(155,176,197,0.12); color: var(--accent); }
 .badge-mode-gmail_advanced { background: rgba(155,176,197,0.12); color: var(--accent); }
+.badge-mode-china_icloud { background: rgba(216,180,93,0.13); color: var(--yellow); }
 
 
 /* ── Proxy status dot (dùng trong tab Settings > Proxies) ───────── */
@@ -3766,3 +3767,61 @@ body {
   }
   .settings-divider { display: none; }
 }
+
+/* ─────────────────────────────────────────────────────────────────
+   Cloudflare Tunnel section (settings)
+   ───────────────────────────────────────────────────────────────── */
+.tunnel-url-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.tunnel-url-box input[type="text"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  padding: 6px 9px;
+  background: var(--bg-elev-2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.tunnel-url-box input[type="text"]:read-only {
+  cursor: text;
+}
+
+.tunnel-log-details {
+  margin-top: 12px;
+}
+
+.tunnel-log-details summary {
+  cursor: pointer;
+  font-size: 11.5px;
+  font-family: var(--font-mono);
+  padding: 4px 0;
+}
+
+.tunnel-log-tail {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--fg-mute);
+}
+
+#tunnel-status-badge.badge-success { background: var(--green); color: var(--bg); }
+#tunnel-status-badge.badge-warn { background: var(--yellow); color: var(--bg); }
+#tunnel-status-badge.badge-danger { background: var(--red); color: var(--bg); }

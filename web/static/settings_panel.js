@@ -84,6 +84,16 @@
     dom.tgTest = $("telegram-test");
     dom.tgStatus = $("telegram-status");
     dom.tgBadge = $("telegram-status-badge");
+    // Tunnel section
+    dom.tunToggle = $("tunnel-enabled-toggle");
+    dom.tunToggleLabel = $("tunnel-toggle-label");
+    dom.tunBadge = $("tunnel-status-badge");
+    dom.tunUrlInput = $("tunnel-url-input");
+    dom.tunUrlCopy = $("tunnel-url-copy");
+    dom.tunUrlOpen = $("tunnel-url-open");
+    dom.tunRestart = $("tunnel-restart");
+    dom.tunStatus = $("tunnel-status-line");
+    dom.tunLogTail = $("tunnel-log-tail");
   }
 
   // ── Sidebar section switching ────────────────────────────────────────────
@@ -329,6 +339,162 @@
       });
   }
 
+  // ── Cloudflare Tunnel section ────────────────────────────────────────
+  var tunState = { loaded: false, busy: false, polling: null };
+
+  function setTunStatusLine(text, kind) {
+    if (!dom.tunStatus) return;
+    dom.tunStatus.textContent = text || "";
+    dom.tunStatus.className = "proxy-pool-status muted" + (kind ? " proxy-pool-status-" + kind : "");
+  }
+
+  function renderTunnelSnapshot(snap) {
+    if (!dom.tunBadge) return;
+    var status = snap.status || "stopped";
+    var enabled = !!snap.enabled;
+    var url = snap.url || "";
+
+    var badgeMap = {
+      stopped: ["badge-muted", "stopped"],
+      starting: ["badge-warn", "starting"],
+      running: ["badge-success", "running"],
+      failed: ["badge-danger", "failed"],
+    };
+    var bm = badgeMap[status] || badgeMap.stopped;
+    dom.tunBadge.className = "badge " + bm[0];
+    dom.tunBadge.textContent = bm[1];
+
+    // Toggle (chỉ update nếu user không đang thao tác).
+    if (!tunState.busy) {
+      dom.tunToggle.checked = enabled;
+    }
+    dom.tunToggleLabel.textContent = enabled ? "Đang bật" : "Đang tắt";
+
+    dom.tunUrlInput.value = url;
+    dom.tunUrlInput.placeholder = enabled
+      ? (status === "starting" ? "Đang xin URL từ Cloudflare…" : "(chưa có URL)")
+      : "(tunnel đang tắt)";
+    dom.tunUrlCopy.disabled = !url;
+    dom.tunUrlOpen.disabled = !url;
+    dom.tunRestart.disabled = !enabled || tunState.busy;
+
+    if (snap.error) {
+      setTunStatusLine("Lỗi: " + snap.error, "fail");
+    } else if (status === "running" && snap.uptime_sec != null) {
+      setTunStatusLine("Đang chạy · uptime " + snap.uptime_sec + "s · trỏ về " +
+        (snap.local_host + ":" + snap.local_port), "ok");
+    } else if (status === "starting") {
+      setTunStatusLine("Đang khởi động cloudflared…", null);
+    } else if (status === "stopped") {
+      setTunStatusLine("Tunnel đã tắt.", null);
+    }
+
+    if (dom.tunLogTail) {
+      var lines = (snap.log_tail || []).join("\n");
+      dom.tunLogTail.textContent = lines || "(chưa có log)";
+    }
+  }
+
+  function refreshTunnelStatus() {
+    return api("/api/tunnel/status")
+      .then(function (snap) {
+        tunState.loaded = true;
+        renderTunnelSnapshot(snap);
+        return snap;
+      })
+      .catch(function (err) {
+        setTunStatusLine("Load tunnel status thất bại: " + err.message, "fail");
+      });
+  }
+
+  function ensureTunnelPolling(active) {
+    if (active) {
+      if (tunState.polling) return;
+      tunState.polling = setInterval(function () {
+        var tabActive = document.getElementById("tab-settings").classList.contains("active");
+        var paneEl = document.querySelector('[data-settings-pane="tunnel"]');
+        var paneActive = paneEl && paneEl.classList.contains("active");
+        if (!tabActive || !paneActive) return;
+        refreshTunnelStatus();
+      }, 3000);
+    } else {
+      if (tunState.polling) {
+        clearInterval(tunState.polling);
+        tunState.polling = null;
+      }
+    }
+  }
+
+  function toggleTunnel() {
+    if (tunState.busy) return;
+    var want = !!dom.tunToggle.checked;
+    tunState.busy = true;
+    dom.tunToggle.disabled = true;
+    setTunStatusLine(want ? "Đang bật tunnel (lần đầu sẽ tải cloudflared)…" : "Đang tắt tunnel…", null);
+    api("/api/tunnel/config", {
+      method: "POST",
+      body: JSON.stringify({ enabled: want }),
+    })
+      .then(function (snap) {
+        renderTunnelSnapshot(snap);
+        if (snap.settings_persist_error) {
+          setTunStatusLine("Đã áp dụng nhưng lưu DB lỗi: " + snap.settings_persist_error, "fail");
+        }
+      })
+      .catch(function (err) {
+        setTunStatusLine("Bật/tắt thất bại: " + err.message, "fail");
+        dom.tunToggle.checked = !want;
+      })
+      .finally(function () {
+        tunState.busy = false;
+        dom.tunToggle.disabled = false;
+      });
+  }
+
+  function restartTunnel() {
+    if (tunState.busy) return;
+    tunState.busy = true;
+    dom.tunRestart.disabled = true;
+    setTunStatusLine("Đang xin URL mới…", null);
+    api("/api/tunnel/restart", { method: "POST" })
+      .then(function (snap) {
+        renderTunnelSnapshot(snap);
+        if (snap.status === "running") {
+          setTunStatusLine("Đã cấp URL mới.", "ok");
+        }
+      })
+      .catch(function (err) {
+        setTunStatusLine("Restart thất bại: " + err.message, "fail");
+      })
+      .finally(function () {
+        tunState.busy = false;
+        dom.tunRestart.disabled = false;
+      });
+  }
+
+  function copyTunnelUrl() {
+    var url = dom.tunUrlInput.value;
+    if (!url) return;
+    var done = function () { setTunStatusLine("Đã copy URL.", "ok"); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(url).then(done).catch(function () {
+        dom.tunUrlInput.select();
+        document.execCommand("copy");
+        done();
+      });
+    } else {
+      dom.tunUrlInput.select();
+      document.execCommand("copy");
+      done();
+    }
+  }
+
+  function openTunnelUrl() {
+    var url = dom.tunUrlInput.value;
+    if (!url) return;
+    window.open(url, "_blank", "noopener,noreferrer");
+  }
+
   function saveTelegram() {
     if (tgState.busy) return;
     tgState.busy = true;
@@ -417,6 +583,9 @@
     dom.navItems.forEach(function (btn) {
       btn.addEventListener("click", function () {
         activateSection(btn.dataset.settingsSection);
+        if (btn.dataset.settingsSection === "tunnel") {
+          refreshTunnelStatus();
+        }
       });
     });
 
@@ -436,6 +605,11 @@
     if (dom.tgSave) dom.tgSave.addEventListener("click", saveTelegram);
     if (dom.tgTest) dom.tgTest.addEventListener("click", testTelegram);
     if (dom.loginFlow) dom.loginFlow.addEventListener("change", saveLoginFlow);
+
+    if (dom.tunToggle) dom.tunToggle.addEventListener("change", toggleTunnel);
+    if (dom.tunRestart) dom.tunRestart.addEventListener("click", restartTunnel);
+    if (dom.tunUrlCopy) dom.tunUrlCopy.addEventListener("click", copyTunnelUrl);
+    if (dom.tunUrlOpen) dom.tunUrlOpen.addEventListener("click", openTunnelUrl);
 
     dom.modeSelect.addEventListener("change", function () {
       state.mode = dom.modeSelect.value;
@@ -481,12 +655,22 @@
       if (e.detail && e.detail.tab === "settings" && !tgState.loaded) {
         loadTelegram();
       }
+      if (e.detail && e.detail.tab === "settings" && !tunState.loaded) {
+        refreshTunnelStatus();
+      }
+      if (e.detail && e.detail.tab === "settings") {
+        ensureTunnelPolling(true);
+      } else {
+        ensureTunnelPolling(false);
+      }
     });
 
     // Nếu tab settings đã active sẵn lúc reload (ui.active_tab persisted)
     if (document.getElementById("tab-settings").classList.contains("active") && !state.loaded) {
       load();
       loadTelegram();
+      refreshTunnelStatus();
+      ensureTunnelPolling(true);
     }
   }
 

@@ -574,13 +574,70 @@
   }
 
   // ── Mode → concurrency mapping ────────────────────────────────────
-  // Reg cap [1, 5] — dropdown share giữa các tab có Multi (10..200). Ở Reg,
-  // mọi giá trị > 5 đều silent clamp xuống 5 (yêu cầu sản phẩm).
+  // Mỗi tab có default + cap (max) riêng — UI render options theo cap, lưu
+  // key Settings store theo tab. Backend chỉ validate enum, cap kiểm soát FE.
+  const _ALL_MODE_OPTIONS = Object.freeze([
+    { value: 'single',   label: 'Single (1)',  n: 1 },
+    { value: 'multi',    label: 'Multi (2)',   n: 2 },
+    { value: 'multi3',   label: 'Multi (3)',   n: 3 },
+    { value: 'multi5',   label: 'Multi (5)',   n: 5 },
+    { value: 'multi10',  label: 'Multi (10)',  n: 10 },
+    { value: 'multi20',  label: 'Multi (20)',  n: 20 },
+    { value: 'multi30',  label: 'Multi (30)',  n: 30 },
+    { value: 'multi50',  label: 'Multi (50)',  n: 50 },
+    { value: 'multi100', label: 'Multi (100)', n: 100 },
+    { value: 'multi200', label: 'Multi (200)', n: 200 },
+  ]);
+  const MODE_TAB_CONFIG = Object.freeze({
+    reg:     { defaultMode: 'multi10', cap: 30 },
+    session: { defaultMode: 'multi10', cap: 30 },
+    upi:     { defaultMode: 'multi30', cap: 200 },
+  });
+
   function _modeToConcurrency(mode) {
-    const map = { single: 1, multi: 2, multi3: 3, multi5: 5, multi10: 10, multi20: 20, multi30: 30, multi50: 50, multi100: 100, multi200: 200 };
-    const raw = map[mode] || 1;
-    return Math.min(raw, 5);
+    const opt = _ALL_MODE_OPTIONS.find(o => o.value === mode);
+    return opt ? opt.n : 1;
   }
+
+  function _renderModeOptionsForTab(tabId) {
+    const cfg = MODE_TAB_CONFIG[tabId];
+    const wrap = dom.modeSelect.closest('.select-wrap') || dom.modeSelect.parentElement;
+    if (!cfg) {
+      // Tab không có mode (settings, link, hme...) → ẩn select hoàn toàn
+      if (wrap) wrap.style.display = 'none';
+      return;
+    }
+    if (wrap) wrap.style.display = '';
+    const html = _ALL_MODE_OPTIONS
+      .filter(o => o.n <= cfg.cap)
+      .map(o => `<option value="${o.value}">${o.label}</option>`)
+      .join('');
+    dom.modeSelect.innerHTML = html;
+  }
+
+  function _loadModeForTab(tabId) {
+    const cfg = MODE_TAB_CONFIG[tabId];
+    if (!cfg) return null;
+    const validValues = _ALL_MODE_OPTIONS.filter(o => o.n <= cfg.cap).map(o => o.value);
+    const saved = Settings.get(`${tabId}.mode`);
+    if (saved && validValues.includes(saved)) return saved;
+    return cfg.defaultMode;
+  }
+
+  function _applyTabMode(tabId) {
+    _renderModeOptionsForTab(tabId);
+    const cfg = MODE_TAB_CONFIG[tabId];
+    if (!cfg) return;
+    const mode = _loadModeForTab(tabId);
+    dom.modeSelect.value = mode;
+    if (tabId === 'reg') state.mode = mode;
+  }
+
+  // Switch tab → re-render Mode dropdown theo cap + load value đã save cho tab.
+  // Listener bind sớm để bắt event 'gpt:tab' đầu tiên dispatch từ initTabs().
+  document.addEventListener('gpt:tab', (e) => {
+    _applyTabMode(e.detail && e.detail.tab);
+  });
 
   // ── Run button ───────────────────────────────────────────────────
   dom.btnRun.addEventListener('click', async () => {
@@ -673,19 +730,28 @@
   });
 
   dom.modeSelect.addEventListener('change', async () => {
-    state.mode = dom.modeSelect.value;
-    const target = _modeToConcurrency(state.mode);
-    try {
-      await api('/api/config', {
-        method: 'POST',
-        body: JSON.stringify({ max_concurrent: target }),
-      });
-      state.maxConcurrent = target;
-    } catch (err) {
-      console.error(err);
+    const tabId = _activeTabId;
+    const cfg = MODE_TAB_CONFIG[tabId];
+    if (!cfg) return; // tab không có mode (settings) — ignore
+    const newMode = dom.modeSelect.value;
+    Settings.save(`${tabId}.mode`, newMode, getAuthToken());
+
+    // Reg có server-side concurrency config (POST /api/config). Session/UPI
+    // sync max_concurrent ngay tại lúc Run trong session.js / upi.js, không
+    // cần round-trip thừa ở đây.
+    if (tabId === 'reg') {
+      state.mode = newMode;
+      const target = _modeToConcurrency(newMode);
+      try {
+        await api('/api/config', {
+          method: 'POST',
+          body: JSON.stringify({ max_concurrent: target }),
+        });
+        state.maxConcurrent = target;
+      } catch (err) {
+        console.error(err);
+      }
     }
-    // Persist reg.mode to Settings store (R6.1 — no dedicated endpoint for mode)
-    Settings.save('reg.mode', state.mode, getAuthToken());
   });
 
   dom.headlessToggle.addEventListener('change', async () => {
@@ -1042,11 +1108,9 @@
     const token = getAuthToken();
     await Settings.bootstrap(token);
 
-    // Hydrate state + UI controls từ Settings store (DB-backed)
-    const mode = Settings.get('reg.mode');
-    if (mode) state.mode = mode;
-    dom.modeSelect.value = state.mode;
-
+    // Hydrate state + UI controls từ Settings store (DB-backed).
+    // Mode select KHÔNG hydrate ở đây — sẽ apply qua `_applyTabMode` khi
+    // initTabs() chạy (event 'gpt:tab' → load `<tab>.mode` per-tab).
     const headless = Settings.get('reg.headless');
     if (typeof headless === 'boolean') state.headless = headless;
     dom.headlessToggle.checked = state.headless;

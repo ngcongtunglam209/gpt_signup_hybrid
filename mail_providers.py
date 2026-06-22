@@ -1,10 +1,11 @@
 """Mail providers cho OTP polling.
 
-4 backends + 1 wrapper:
+5 backends + 1 wrapper:
     - WorkerMailProvider:          Cloudflare Worker logs API (icloud-cf-mail style).
     - OutlookMailProvider:         Microsoft Graph API qua refresh_token (combo Outlook).
     - DongVanFBOutlookProvider:    tools.dongvanfb.net API qua refresh_token (combo Outlook).
     - GmailAdvancedProvider:       checkotpgmail.live API.
+    - ChinaICloudProvider:         icloudapi.xyz mailbox viewer (HTML response).
     - OutlookCascadeProvider:      Wrapper — DongVanFB trước, fallback Microsoft Graph
                                    khi DongVanFB API down hoặc poll timeout. Sticky
                                    bypass khi DongVanFB fail trong cùng process.
@@ -1277,3 +1278,219 @@ def build_provider_dongvanfb(
 ) -> DongVanFBOutlookProvider:
     parsed = OutlookCombo.parse(combo)
     return DongVanFBOutlookProvider(combo=parsed, proxy=proxy)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# China iCloud provider (icloudapi.xyz mailbox viewer)
+# ─────────────────────────────────────────────────────────────────────
+#
+# Mỗi mailbox iCloud (alias HME) có URL viewer riêng do user mua qua dịch vụ
+# tại icloudapi.xyz. URL pattern:
+#       http(s)://icloudapi.xyz/show/<base64_token>/<email_url_encoded>
+# Server trả `text/html`:
+#   - Mailbox trống:  '<h1>错误</h1><p>No email found for recipient</p>'
+#   - Có mail:        HTML page render mail mới nhất (subject + body raw)
+# Vì URL gắn cứng vào 1 mailbox + token riêng, không cần lọc sender/date —
+# bất kỳ 6 chữ số nào trên HTML đều là OTP của mailbox đó. Caller dedup qua
+# `tried_codes` ở browser_phase / request_phase nên thử mã mới-nhất trước.
+
+# Ngưỡng số code lấy về trong 1 lần `poll_all_codes` (mới→cũ theo thứ tự HTML).
+_CHINA_ICLOUD_MAX_CODES = 5
+
+# Marker server trả khi mailbox trống. Stripped HTML = "错误 No email found for recipient".
+# Check substring là đủ: cả 2 marker xuất hiện cùng nhau, hiếm khi lẫn vào
+# nội dung mail thật (mail OTP OpenAI viết tiếng Anh, không có "No email found").
+_CHINA_ICLOUD_EMPTY_MARKERS: tuple[str, ...] = (
+    "No email found for recipient",
+    "No email found",
+)
+
+
+class ChinaICloudParseError(Exception):
+    """Parse line fail cho China iCloud mode."""
+
+
+class ChinaICloudProvider:
+    """Poll OTP qua mailbox viewer URL của icloudapi.xyz.
+
+    Format input mỗi dòng: `email----url` (separator 4 dấu gạch ngang).
+    Provider GET URL → HTML → strip tag → regex 6 số (`_extract_otp`).
+    KHÔNG lọc theo `started_at` (URL viewer = 1 mailbox riêng, mail mới luôn
+    ghi đè trên page; caller dedup qua tried_codes).
+    """
+
+    SEPARATOR = "----"
+
+    def __init__(self, *, email: str, api_url: str, proxy: str | None = None):
+        if not email or "@" not in email:
+            raise ValueError(f"china_icloud: invalid email {email!r}")
+        if not api_url or not api_url.startswith(("http://", "https://")):
+            raise ValueError(
+                f"china_icloud: api_url phải http(s)://, nhận {api_url[:80]!r}"
+            )
+        self.email = email.strip().lower()
+        self.api_url = api_url.strip()
+        self.proxy = proxy
+
+    @classmethod
+    def parse_line(cls, line: str) -> tuple[str, str]:
+        """Parse `email{SEPARATOR}url` → (email, api_url).
+
+        Raise ChinaICloudParseError nếu format sai.
+        """
+        stripped = line.strip()
+        if not stripped:
+            raise ChinaICloudParseError("dòng trống")
+        if cls.SEPARATOR not in stripped:
+            raise ChinaICloudParseError(
+                f"format phải là email{cls.SEPARATOR}url, nhận: {line[:80]}"
+            )
+        email_part, _, url_part = stripped.partition(cls.SEPARATOR)
+        email_part = email_part.strip()
+        url_part = url_part.strip()
+        if "@" not in email_part or " " in email_part:
+            raise ChinaICloudParseError(f"email không hợp lệ: {email_part!r}")
+        if not url_part.startswith(("http://", "https://")):
+            raise ChinaICloudParseError(
+                f"url phải bắt đầu http(s)://: {url_part[:60]}"
+            )
+        return email_part, url_part
+
+    @staticmethod
+    def _is_empty_mailbox(text: str) -> bool:
+        """True nếu HTML là dấu hiệu mailbox chưa có mail."""
+        if not text:
+            return True
+        for marker in _CHINA_ICLOUD_EMPTY_MARKERS:
+            if marker in text:
+                return True
+        return False
+
+    @staticmethod
+    def _client_kwargs() -> dict[str, Any]:
+        return {
+            "timeout": 20.0,
+            "follow_redirects": True,
+            "headers": {
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "User-Agent": _BROWSER_UA,
+            },
+        }
+
+    async def poll_otp(
+        self,
+        *,
+        recipient: str,
+        started_at: datetime,
+        timeout_seconds: float,
+        poll_interval_seconds: float,
+        log,
+    ) -> str:
+        deadline = time.monotonic() + max(timeout_seconds, 1.0)
+        log(
+            f"[otp:china_icloud] polling {self.email} "
+            f"(timeout {timeout_seconds:.0f}s)"
+        )
+        log(f"[otp:china_icloud] api: {self.api_url}")
+
+        attempt = 0
+        consecutive_errors = 0
+        max_consecutive = 3
+
+        async with httpx.AsyncClient(**self._client_kwargs()) as client:
+            while True:
+                attempt += 1
+                try:
+                    resp = await client.get(self.api_url)
+                    if resp.status_code != 200:
+                        consecutive_errors += 1
+                        log(
+                            f"[otp:china_icloud] HTTP {resp.status_code} attempt {attempt}"
+                        )
+                        if consecutive_errors >= max_consecutive:
+                            raise TimeoutError(
+                                f"China iCloud HTTP error {consecutive_errors} lần liên tiếp "
+                                f"(last status={resp.status_code})"
+                            )
+                    else:
+                        consecutive_errors = 0
+                        text = resp.text or ""
+                        if self._is_empty_mailbox(text):
+                            if attempt <= 3 or attempt % 5 == 0:
+                                log(
+                                    f"[otp:china_icloud] mailbox trống attempt {attempt}"
+                                )
+                        else:
+                            code = _extract_otp("", text)
+                            if code:
+                                log(
+                                    f"[otp:china_icloud] found {code} (attempt {attempt})"
+                                )
+                                return code
+                            if attempt <= 3 or attempt % 5 == 0:
+                                log(
+                                    f"[otp:china_icloud] HTML có nội dung nhưng "
+                                    f"chưa thấy code 6 số attempt {attempt}"
+                                )
+                except (httpx.HTTPError, ValueError) as exc:
+                    consecutive_errors += 1
+                    log(
+                        f"[otp:china_icloud] error attempt {attempt} "
+                        f"({consecutive_errors}/{max_consecutive}): "
+                        f"{type(exc).__name__}: {exc!r}"
+                    )
+                    if consecutive_errors >= max_consecutive:
+                        raise TimeoutError(
+                            f"China iCloud network error {consecutive_errors} lần liên tiếp: "
+                            f"{type(exc).__name__}: {exc}"
+                        ) from exc
+
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"OTP timeout after {timeout_seconds}s for {self.email} (china_icloud)"
+                    )
+                await asyncio.sleep(min(poll_interval_seconds, remaining))
+
+    async def poll_all_codes(
+        self,
+        *,
+        recipient: str,
+        started_at: datetime,
+        log,
+    ) -> list[str]:
+        """Lấy tất cả OTP codes phát hiện trên page (theo thứ tự xuất hiện).
+
+        Mục đích: caller dùng để fallback thử mã khác khi mã hiện tại reject
+        (mail-delay, multiple OTP requests). Không block; chỉ fetch 1 lần.
+        """
+        try:
+            async with httpx.AsyncClient(**self._client_kwargs()) as client:
+                resp = await client.get(self.api_url)
+                if resp.status_code != 200:
+                    return []
+                text = resp.text or ""
+                if self._is_empty_mailbox(text):
+                    return []
+                cleaned = re.sub(r"<[^>]*>", " ", text)
+                cleaned = re.sub(r"https?://\S+", " ", cleaned)
+                codes: list[str] = []
+                seen: set[str] = set()
+                for match in re.finditer(r"(?<!\d)(\d{6})(?!\d)", cleaned):
+                    code = match.group(1)
+                    if code in seen:
+                        continue
+                    seen.add(code)
+                    codes.append(code)
+                    if len(codes) >= _CHINA_ICLOUD_MAX_CODES:
+                        break
+                return codes
+        except Exception:  # noqa: BLE001
+            return []
+
+
+def build_provider_china_icloud(
+    *, email: str, api_url: str, proxy: str | None = None,
+) -> ChinaICloudProvider:
+    return ChinaICloudProvider(email=email, api_url=api_url, proxy=proxy)

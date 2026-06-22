@@ -195,6 +195,37 @@ impl TelegramClient {
         self.send_message_inner(chat_id, text, reply_to, None).await
     }
 
+    /// Gửi message tới group/supergroup, có hỗ trợ topic (forum thread_id).
+    /// Khi `thread_id = Some(n)` Telegram sẽ gửi vào đúng topic đó. Dùng cho
+    /// kênh thông báo `notify.chat_id` admin tự cấu hình.
+    pub async fn send_message_to_thread(
+        &self,
+        chat_id: i64,
+        text: &str,
+        thread_id: Option<i64>,
+    ) -> Result<i64> {
+        let url = format!("{}/sendMessage", self.base_url);
+        let mut body = json!({
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": true,
+        });
+        if let Some(t) = thread_id {
+            if t > 0 {
+                body["message_thread_id"] = json!(t);
+            }
+        }
+        let resp = self.http.post(&url).json(&body).send().await?;
+        let v: Value = resp.json().await?;
+        if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
+            return Err(anyhow!(
+                "sendMessage(thread) fail: {}",
+                v.get("description").and_then(|s| s.as_str()).unwrap_or("?")
+            ));
+        }
+        Ok(v["result"]["message_id"].as_i64().unwrap_or(0))
+    }
+
     /// Gửi message kèm inline keyboard. `keyboard` là JSON array of array of
     /// button objects (chuẩn Telegram InlineKeyboardMarkup).
     pub async fn send_message_kb(
@@ -206,6 +237,35 @@ impl TelegramClient {
     ) -> Result<i64> {
         self.send_message_inner(chat_id, text, reply_to, Some(keyboard))
             .await
+    }
+
+    /// Gửi message HTML (parse_mode=HTML) + inline keyboard. Caller PHẢI escape
+    /// các giá trị dynamic (email, username, ...) bằng `html_escape` trước khi
+    /// nhúng vào html — Telegram parse rất chặt, ký tự `<`/`>`/`&` không escape
+    /// sẽ làm fail toàn bộ message.
+    pub async fn send_message_kb_html(
+        &self,
+        chat_id: i64,
+        html: &str,
+        keyboard: Value,
+    ) -> Result<i64> {
+        let url = format!("{}/sendMessage", self.base_url);
+        let body = json!({
+            "chat_id": chat_id,
+            "text": html,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true,
+            "reply_markup": { "inline_keyboard": keyboard },
+        });
+        let resp = self.http.post(&url).json(&body).send().await?;
+        let v: Value = resp.json().await?;
+        if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
+            return Err(anyhow!(
+                "sendMessage(html) fail: {}",
+                v.get("description").and_then(|s| s.as_str()).unwrap_or("?")
+            ));
+        }
+        Ok(v["result"]["message_id"].as_i64().unwrap_or(0))
     }
 
     async fn send_message_inner(
@@ -290,6 +350,37 @@ impl TelegramClient {
             .await
     }
 
+    /// Edit message HTML (parse_mode=HTML) + giữ inline keyboard. Dùng cho
+    /// `/board` refresh để cập nhật bảng tiến trình mà không vỡ định dạng.
+    /// `message is not modified` được coi là OK (no-op).
+    pub async fn edit_message_text_kb_html(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        html: &str,
+        keyboard: Value,
+    ) -> Result<()> {
+        let url = format!("{}/editMessageText", self.base_url);
+        let body = json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": html,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true,
+            "reply_markup": { "inline_keyboard": keyboard },
+        });
+        let resp = self.http.post(&url).json(&body).send().await?;
+        let v: Value = resp.json().await?;
+        if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
+            let desc = v.get("description").and_then(|s| s.as_str()).unwrap_or("?");
+            if desc.contains("message is not modified") {
+                return Ok(());
+            }
+            tracing::debug!("editMessageText(html) warn: {}", desc);
+        }
+        Ok(())
+    }
+
     async fn edit_message_text_inner(
         &self,
         chat_id: i64,
@@ -349,6 +440,36 @@ impl TelegramClient {
         if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
             return Err(anyhow!(
                 "sendPhoto fail: {}",
+                v.get("description").and_then(|s| s.as_str()).unwrap_or("?")
+            ));
+        }
+        Ok(())
+    }
+
+    /// Gửi 1 file (document) từ bytes in-memory — dùng để trả session.json
+    /// cho user sau khi login từ combo thành công.
+    pub async fn send_document_bytes(
+        &self,
+        chat_id: i64,
+        file_name: &str,
+        bytes: Vec<u8>,
+        caption: Option<&str>,
+    ) -> Result<()> {
+        let url = format!("{}/sendDocument", self.base_url);
+        let part = Part::bytes(bytes)
+            .file_name(file_name.to_string())
+            .mime_str("application/json")?;
+        let mut form = Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("document", part);
+        if let Some(c) = caption {
+            form = form.text("caption", c.to_string());
+        }
+        let resp = self.http.post(&url).multipart(form).send().await?;
+        let v: Value = resp.json().await?;
+        if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
+            return Err(anyhow!(
+                "sendDocument fail: {}",
                 v.get("description").and_then(|s| s.as_str()).unwrap_or("?")
             ));
         }

@@ -11,7 +11,14 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from mail_providers import OutlookCombo, OutlookComboError, GmailAdvancedProvider, GmailAdvancedParseError
+from mail_providers import (
+    ChinaICloudParseError,
+    ChinaICloudProvider,
+    GmailAdvancedParseError,
+    GmailAdvancedProvider,
+    OutlookCombo,
+    OutlookComboError,
+)
 from models import SignupRequest
 
 
@@ -233,6 +240,63 @@ GMAIL_ADVANCED_MODE = MailModeSpec(
 )
 
 
+# ─── China iCloud mode (icloudapi.xyz) ────────────────────────────────
+
+
+def _parse_china_icloud_line(line: str) -> ParsedLine:
+    """Parse line `email----url` cho China iCloud."""
+    try:
+        email, _api_url = ChinaICloudProvider.parse_line(line)
+    except ChinaICloudParseError as exc:
+        raise MailModeParseError(str(exc)) from exc
+    return ParsedLine(email=email, raw=line)
+
+
+def _build_china_icloud_request(
+    parsed: ParsedLine,
+    *,
+    worker_config: dict[str, str] | None = None,
+    password: str | None = None,
+    headless: bool = True,
+    keep_browser_open: bool = False,
+    proxy: str | None = None,
+    reg_mode: str = "browser",
+) -> SignupRequest:
+    email, api_url = ChinaICloudProvider.parse_line(parsed.raw)
+    from config import env_insecure_tls
+    return SignupRequest(
+        email=email,
+        mail_provider="china_icloud",
+        china_icloud_url=api_url,
+        # Mailbox HME relay có thể trễ vài phút — giữ cùng budget với Worker iCloud.
+        otp_timeout_seconds=300.0,
+        otp_poll_interval_seconds=5.0,
+        otp_resend_after_seconds=120.0,
+        headless=headless,
+        keep_browser_open=keep_browser_open,
+        password=password,
+        proxy=proxy,
+        tls_insecure=env_insecure_tls(),
+        reg_mode=reg_mode,
+    )
+
+
+CHINA_ICLOUD_MODE = MailModeSpec(
+    id="china_icloud",
+    label="China iCloud (icloudapi.xyz)",
+    input_placeholder=(
+        "user+alias@icloud.com----http://icloudapi.xyz/show/<token>/<email_url_encoded>"
+    ),
+    input_help=(
+        "Mỗi dòng 1 cặp `email----url` (separator 4 dấu gạch). "
+        "URL là viewer mailbox riêng cho email đó."
+    ),
+    config_schema=[],
+    parse_line=_parse_china_icloud_line,
+    build_request=_build_china_icloud_request,
+)
+
+
 # ─── DongVanFB Outlook mode (legacy, ẨN khỏi UI) ──────────────────────
 #
 # Trước đây DongVanFB là 1 mode riêng trên UI. Đã gộp vào "outlook" mode (cascade
@@ -292,6 +356,7 @@ _REGISTRY: dict[str, MailModeSpec] = {
     OUTLOOK_MODE.id: OUTLOOK_MODE,
     WORKER_MODE.id: WORKER_MODE,
     GMAIL_ADVANCED_MODE.id: GMAIL_ADVANCED_MODE,
+    CHINA_ICLOUD_MODE.id: CHINA_ICLOUD_MODE,
 }
 
 # Lookup registry — dùng cho `get_spec(mail_mode)` ở backend khi resume job DB

@@ -15,6 +15,10 @@ pub struct UpiQrResult {
     pub qr_source_url: Option<String>,
     pub qr_reason: Option<String>,
     pub qr_expires_at: Option<i64>,
+    /// hosted_instructions_url của UPI (`https://payments.stripe.com/upi/instructions/...`)
+    /// — trang QR + nút mở app UPI hosted bởi Stripe. Đây là "payment link"
+    /// đúng dạng user cần. Port từ Python `UpiQrResult.payment_link`.
+    pub payment_link: Option<String>,
     pub has_upi_uri: bool,
     pub has_qr_image_url: bool,
     pub confirm_attempts: Vec<ConfirmAttemptSummary>,
