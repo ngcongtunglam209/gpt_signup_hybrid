@@ -42,8 +42,7 @@ class SessionError(Exception):
 
 # Login errors vĩnh viễn (fatal) — KHÔNG retry để tránh login spam → lockout /
 # mail-provider rate-limit. Nguồn chân lý DUY NHẤT (trước đây trùng ở
-# web/manager.py + web/upi_runner.py). Dùng cho retry-gate + SessionProvider
-# fatal_classifier (xoá record cache khi login fatal).
+# web/manager.py + web/upi_runner.py). Dùng cho retry-gate login.
 NON_RETRYABLE_LOGIN_PATTERNS: tuple[str, ...] = (
     "password verify failed",
     "mfa verify failed",
@@ -64,6 +63,14 @@ def is_fatal_login_error(exc: BaseException | str) -> bool:
     msg = exc if isinstance(exc, str) else str(exc)
     lower = msg.lower()
     return any(pat in lower for pat in NON_RETRYABLE_LOGIN_PATTERNS)
+
+
+def strip_cookies(session: dict[str, Any]) -> dict[str, Any]:
+    """Bản copy bỏ key ``__cookies`` — flow gọi TRƯỚC khi broadcast SSE / persist
+    DB jobs (R4.5). UPI giữ ``__cookies`` (cần để fill auth_sink/check_plan)."""
+    if not isinstance(session, dict) or "__cookies" not in session:
+        return session
+    return {k: v for k, v in session.items() if k != "__cookies"}
 
 
 # JS: fetch /api/auth/session trong page context chatgpt.com
@@ -388,9 +395,9 @@ async def _get_session_browser(
             f"{session_data.get('user', {}).get('email', '?')}"
         )
 
-        # Capture cookies cho session-cookie-cache: gắn __cookies (đồng nhất với
-        # get_session_pure_request) để SessionProvider lưu lại tái dùng. Caller
-        # PHẢI strip __cookies trước khi broadcast SSE / persist DB.
+        # Gắn __cookies vào session (đồng nhất với get_session_pure_request):
+        # UPI cần cookies cho auth_sink/check_plan. Caller KHÔNG dùng cookies
+        # (Get Session) PHẢI strip __cookies trước khi broadcast SSE / persist DB.
         try:
             session_data["__cookies"] = await ctx.cookies("https://chatgpt.com/")
         except Exception as exc:

@@ -130,21 +130,56 @@ impl Settings {
     }
 
     // ── login proxy (admin-only, global) ──────────────────────────────────
-    /// Raw login proxy line do admin set (key `proxy.login`). None nếu chưa set
-    /// hoặc rỗng. Mọi consumer PHẢI materialize trước khi feed client.
-    pub fn get_login_proxy(&self) -> Option<String> {
-        self.get(LOGIN_PROXY_KEY)
-            .map(|s| s.trim().to_string())
+    /// Số dòng login proxy tối đa admin được set. Tương tự `USER_PROXY_MAX_LINES`
+    /// nhưng cho login segment (step < proxy_from_step). 1 admin = 1 pool nhỏ,
+    /// mỗi job pick random 1 line.
+    pub const LOGIN_PROXY_MAX_LINES: usize = 10;
+
+    /// Đọc danh sách login proxy raw (newline-separated, key `proxy.login`).
+    /// Trim + dedupe + cap `LOGIN_PROXY_MAX_LINES`. Empty = chưa set.
+    /// Mọi consumer PHẢI materialize trước khi feed client.
+    pub fn get_login_proxies(&self) -> Vec<String> {
+        let raw = match self.get(LOGIN_PROXY_KEY) {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for line in raw.lines() {
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if seen.insert(t.to_string()) {
+                out.push(t.to_string());
+                if out.len() >= Self::LOGIN_PROXY_MAX_LINES {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Set danh sách login proxy (tối đa `LOGIN_PROXY_MAX_LINES`). Caller PHẢI
+    /// validate từng line bằng `proxy_format::validate_and_mask` trước. Lưu
+    /// dạng newline-separated trong cột `value`. `lines` rỗng → xóa entry
+    /// (caller nên gọi `remove_login_proxy` cho rõ ràng).
+    pub fn set_login_proxies(&self, lines: &[String]) -> Result<()> {
+        let cleaned: Vec<&str> = lines
+            .iter()
+            .map(|s| s.trim())
             .filter(|s| !s.is_empty())
+            .take(Self::LOGIN_PROXY_MAX_LINES)
+            .collect();
+        if cleaned.is_empty() {
+            self.remove_login_proxy()?;
+            return Ok(());
+        }
+        let joined = cleaned.join("\n");
+        self.set(LOGIN_PROXY_KEY, &joined)
     }
 
-    /// Set login proxy raw line (caller PHẢI validate qua
-    /// `proxy_format::validate_and_mask` trước).
-    pub fn set_login_proxy(&self, raw: &str) -> Result<()> {
-        self.set(LOGIN_PROXY_KEY, raw)
-    }
-
-    /// Xóa login proxy. Trả `true` nếu có row bị xóa.
+    /// Xóa toàn bộ login proxy. Trả `true` nếu có row bị xóa.
     pub fn remove_login_proxy(&self) -> Result<bool> {
         let n = self.lock().execute(
             "DELETE FROM settings WHERE key = ?1",

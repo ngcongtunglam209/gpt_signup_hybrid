@@ -107,29 +107,6 @@ async def on_startup():
         # Schedule task — start_async đợi URL nên không block startup.
         asyncio.create_task(tunnel.start_async(), name="cloudflare-tunnel-start")
 
-    # ── Session cache (feature: session-cookie-cache) ──
-    # SessionStore per-instance (cô lập theo db stem) + SessionProvider singleton.
-    # Seed một lần từ session_results (row có cookie session-token) → tái dùng ngay.
-    try:
-        from pathlib import Path as _Path
-        from config import load_settings as _load_settings
-        from session_store import SessionStore
-        from session_provider import (
-            SessionProvider,
-            set_session_provider,
-            seed_from_session_results,
-        )
-
-        _store = SessionStore(
-            instance_id=_Path(_engine.db_path).stem,
-            runtime_dir=_load_settings().runtime_dir,
-        )
-        set_session_provider(SessionProvider(_store, settings_repo=settings_repo))
-        seeded = seed_from_session_results(_store, session_repo, log=_log.info)
-        _log.info("session-cache: store instance=%s, seeded=%d", _store.instance_id, seeded)
-    except Exception as exc:  # noqa: BLE001 — feature degrade an toàn, không chặn startup
-        _log.warning("session-cache init failed (degrade to per-flow login): %s", exc)
-
     _log.info("startup: SQLite engine initialized, settings hydrated, job recovery done")
 
     # ── Register SseMux snapshot functions (Requirements 5.1, 5.2, 5.3) ──
@@ -1872,6 +1849,18 @@ async def clear_all_upi_jobs() -> JSONResponse:
     um = get_upi_manager()
     removed = await um.clear_all()
     return JSONResponse({"removed": removed})
+
+
+@app.delete("/api/upi/cookies")
+async def clear_all_upi_cookies() -> JSONResponse:
+    """Xoá toàn bộ cache cookie+token UPI của instance hiện tại.
+
+    Lần chạy job UPI tiếp theo sẽ login lại từ đầu (không reuse). KHÔNG
+    ảnh hưởng cookie/session in-memory của job đang chạy — chỉ xoá file cache.
+    """
+    from .upi_session_cache import UpiSessionCache
+    n = UpiSessionCache.singleton().clear_all()
+    return JSONResponse({"cleared": n})
 
 
 @app.post("/api/upi/jobs/retry-failed")

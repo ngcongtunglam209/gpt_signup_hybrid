@@ -12,13 +12,20 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
-#[derive(Debug, Clone)]
+use crate::bot::send_gate::SendGate;
+
+#[derive(Clone)]
 pub struct TelegramClient {
     base_url: String,
     file_base_url: String,
     http: Client,
+    /// Bộ điều phối chống 429 — pace per-chat + honor retry_after. Mọi outbound
+    /// tới 1 chat đi qua `gate.acquire(chat_id)` trước, và parse `retry_after`
+    /// để `gate.penalize` khi dính 429.
+    gate: Arc<SendGate>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -87,7 +94,37 @@ impl TelegramClient {
             base_url: format!("https://api.telegram.org/bot{}", token),
             file_base_url: format!("https://api.telegram.org/file/bot{}", token),
             http,
+            gate: Arc::new(SendGate::new()),
         })
+    }
+
+    /// Bộ điều phối gửi (dùng cho vacuum loop dọn map).
+    pub fn gate(&self) -> &Arc<SendGate> {
+        &self.gate
+    }
+
+    /// Parse `retry_after` từ response 429 → đẩy mốc gửi tiếp của chat. Gọi sau
+    /// MỌI response gửi-tới-chat khi `ok != true`. Telegram đặt `retry_after`
+    /// trong `parameters` (đôi khi cũng nhúng trong description "retry after N").
+    async fn note_429(&self, chat_id: i64, v: &Value) {
+        if v.get("ok").and_then(|b| b.as_bool()) == Some(true) {
+            return;
+        }
+        let ra = v
+            .get("parameters")
+            .and_then(|p| p.get("retry_after"))
+            .and_then(|x| x.as_u64())
+            .or_else(|| {
+                v.get("description")
+                    .and_then(|s| s.as_str())
+                    .filter(|s| s.contains("retry after"))
+                    .and_then(|s| s.rsplit("retry after").next())
+                    .and_then(|tail| tail.trim().split_whitespace().next())
+                    .and_then(|n| n.parse::<u64>().ok())
+            });
+        if let Some(secs) = ra {
+            self.gate.penalize(chat_id, secs).await;
+        }
     }
 
     pub async fn get_updates(&self, offset: i64, timeout: u64) -> Result<Vec<Update>> {
@@ -215,8 +252,10 @@ impl TelegramClient {
                 body["message_thread_id"] = json!(t);
             }
         }
+        self.gate.acquire(chat_id).await;
         let resp = self.http.post(&url).json(&body).send().await?;
         let v: Value = resp.json().await?;
+        self.note_429(chat_id, &v).await;
         if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
             return Err(anyhow!(
                 "sendMessage(thread) fail: {}",
@@ -257,8 +296,10 @@ impl TelegramClient {
             "disable_web_page_preview": true,
             "reply_markup": { "inline_keyboard": keyboard },
         });
+        self.gate.acquire(chat_id).await;
         let resp = self.http.post(&url).json(&body).send().await?;
         let v: Value = resp.json().await?;
+        self.note_429(chat_id, &v).await;
         if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
             return Err(anyhow!(
                 "sendMessage(html) fail: {}",
@@ -266,6 +307,39 @@ impl TelegramClient {
             ));
         }
         Ok(v["result"]["message_id"].as_i64().unwrap_or(0))
+    }
+
+    /// Edit message HTML (parse_mode=HTML) + giữ inline keyboard. Dùng cho
+    /// dashboard per-user (cập nhật bảng tiến trình). `message is not modified`
+    /// coi như OK (no-op).
+    pub async fn edit_message_kb_html(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        html: &str,
+        keyboard: Value,
+    ) -> Result<()> {
+        let url = format!("{}/editMessageText", self.base_url);
+        let body = json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": html,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true,
+            "reply_markup": { "inline_keyboard": keyboard },
+        });
+        self.gate.acquire(chat_id).await;
+        let resp = self.http.post(&url).json(&body).send().await?;
+        let v: Value = resp.json().await?;
+        self.note_429(chat_id, &v).await;
+        if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
+            let desc = v.get("description").and_then(|s| s.as_str()).unwrap_or("?");
+            if desc.contains("message is not modified") {
+                return Ok(());
+            }
+            return Err(anyhow!("editMessageText(html) fail: {}", desc));
+        }
+        Ok(())
     }
 
     async fn send_message_inner(
@@ -287,8 +361,10 @@ impl TelegramClient {
         if let Some(kb) = reply_markup {
             body["reply_markup"] = json!({ "inline_keyboard": kb });
         }
+        self.gate.acquire(chat_id).await;
         let resp = self.http.post(&url).json(&body).send().await?;
         let v: Value = resp.json().await?;
+        self.note_429(chat_id, &v).await;
         if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
             return Err(anyhow!(
                 "sendMessage fail: {}",
@@ -318,8 +394,10 @@ impl TelegramClient {
                 body["entities"] = Value::Array(ents);
             }
         }
+        self.gate.acquire(chat_id).await;
         let resp = self.http.post(&url).json(&body).send().await?;
         let v: Value = resp.json().await?;
+        self.note_429(chat_id, &v).await;
         if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
             return Err(anyhow!(
                 "sendMessage fail: {}",
@@ -336,18 +414,6 @@ impl TelegramClient {
         text: &str,
     ) -> Result<()> {
         self.edit_message_text_inner(chat_id, message_id, text, None).await
-    }
-
-    /// Edit message giữ inline keyboard (vd nút Stop của tiến trình).
-    pub async fn edit_message_text_kb(
-        &self,
-        chat_id: i64,
-        message_id: i64,
-        text: &str,
-        keyboard: Value,
-    ) -> Result<()> {
-        self.edit_message_text_inner(chat_id, message_id, text, Some(keyboard))
-            .await
     }
 
     /// Gửi `sendRichMessage` (Bot API 10.1+) — message giàu định dạng với
@@ -370,8 +436,10 @@ impl TelegramClient {
             "rich_message": { "html": rich_html },
             "reply_markup": { "inline_keyboard": keyboard },
         });
+        self.gate.acquire(chat_id).await;
         let resp = self.http.post(&url).json(&body).send().await?;
         let v: Value = resp.json().await?;
+        self.note_429(chat_id, &v).await;
         if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
             return Err(anyhow!(
                 "sendRichMessage fail: {}",
@@ -397,8 +465,10 @@ impl TelegramClient {
             "rich_message": { "html": rich_html },
             "reply_markup": { "inline_keyboard": keyboard },
         });
+        self.gate.acquire(chat_id).await;
         let resp = self.http.post(&url).json(&body).send().await?;
         let v: Value = resp.json().await?;
+        self.note_429(chat_id, &v).await;
         if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
             let desc = v.get("description").and_then(|s| s.as_str()).unwrap_or("?");
             if desc.contains("message is not modified") {
@@ -426,8 +496,10 @@ impl TelegramClient {
         if let Some(kb) = reply_markup {
             body["reply_markup"] = json!({ "inline_keyboard": kb });
         }
+        self.gate.acquire(chat_id).await;
         let resp = self.http.post(&url).json(&body).send().await?;
         let v: Value = resp.json().await?;
+        self.note_429(chat_id, &v).await;
         if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
             tracing::debug!(
                 "editMessageText warn: {}",
@@ -463,41 +535,13 @@ impl TelegramClient {
         if let Some(r) = reply_to {
             form = form.text("reply_to_message_id", r.to_string());
         }
+        self.gate.acquire(chat_id).await;
         let resp = self.http.post(&url).multipart(form).send().await?;
         let v: Value = resp.json().await?;
+        self.note_429(chat_id, &v).await;
         if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
             return Err(anyhow!(
                 "sendPhoto fail: {}",
-                v.get("description").and_then(|s| s.as_str()).unwrap_or("?")
-            ));
-        }
-        Ok(())
-    }
-
-    /// Gửi 1 file (document) từ bytes in-memory — dùng để trả session.json
-    /// cho user sau khi login từ combo thành công.
-    pub async fn send_document_bytes(
-        &self,
-        chat_id: i64,
-        file_name: &str,
-        bytes: Vec<u8>,
-        caption: Option<&str>,
-    ) -> Result<()> {
-        let url = format!("{}/sendDocument", self.base_url);
-        let part = Part::bytes(bytes)
-            .file_name(file_name.to_string())
-            .mime_str("application/json")?;
-        let mut form = Form::new()
-            .text("chat_id", chat_id.to_string())
-            .part("document", part);
-        if let Some(c) = caption {
-            form = form.text("caption", c.to_string());
-        }
-        let resp = self.http.post(&url).multipart(form).send().await?;
-        let v: Value = resp.json().await?;
-        if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
-            return Err(anyhow!(
-                "sendDocument fail: {}",
                 v.get("description").and_then(|s| s.as_str()).unwrap_or("?")
             ));
         }

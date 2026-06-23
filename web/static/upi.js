@@ -40,6 +40,7 @@
     btnCopyError:  $('upi-btn-copy-error'),
     btnClearDone:  $('upi-btn-clear-done'),
     btnClearAll:   $('upi-btn-clear-all'),
+    btnClearCookies: $('upi-btn-clear-cookies'),
     btnRetryFailed:$('upi-btn-retry-failed'),
     btnRetryExpiredFree: $('upi-btn-retry-expired-free'),
     // Modal
@@ -925,6 +926,21 @@
     try {
       const res = await api('/api/upi/jobs/clear-all', { method: 'POST' });
       console.log('[upi] clear-all:', res.removed);
+    } catch (err) {
+      await Dialog.alert({ message: 'Error: ' + err.message });
+    }
+  });
+
+  dom.btnClearCookies.addEventListener('click', async () => {
+    if (!(await Dialog.confirm({
+      message: 'Xoá toàn bộ cookie cache UPI? Lần chạy tiếp theo sẽ login lại từ đầu.',
+      danger: true,
+      confirmLabel: 'Xoá',
+    }))) return;
+    try {
+      const res = await api('/api/upi/cookies', { method: 'DELETE' });
+      const n = (res && typeof res.cleared === 'number') ? res.cleared : 0;
+      window.GptUi?.toast?.(`Đã xoá ${n} cookie cache`, { type: 'success' });
     } catch (err) {
       await Dialog.alert({ message: 'Error: ' + err.message });
     }

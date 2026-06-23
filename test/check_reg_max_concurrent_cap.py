@@ -1,116 +1,55 @@
-"""Smoke check: Reg max_concurrent cap = 5 ở mọi nguồn (Settings, Manager, Server)."""
+"""Check cap reg.max_concurrent đã nâng lên 30 (đồng bộ UI).
+
+Chạy: .venv/bin/python test/check_reg_max_concurrent_cap.py
+"""
 from __future__ import annotations
 
-import ast
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from db.repositories import _validate_type_constraint, RepositoryError  # noqa: E402
 
-def parse(p: Path) -> ast.AST:
-    src = p.read_text(encoding="utf-8")
-    return ast.parse(src, filename=str(p))
+_fails = 0
+
+
+def _check(ok: bool, tag: str, desc: str, detail: str = "") -> None:
+    global _fails
+    status = "PASS" if ok else "FAIL"
+    if not ok:
+        _fails += 1
+    print(f"[{status}] {tag} — {desc} :: {detail}", flush=True)
 
 
 def main() -> int:
-    failures: list[str] = []
-
-    # 1. Syntax check toàn bộ file đã sửa
-    files = [
-        ROOT / "web" / "server.py",
-        ROOT / "web" / "manager.py",
-        ROOT / "db" / "repositories.py",
-    ]
-    for f in files:
-        try:
-            parse(f)
-            print(f"[PASS] syntax {f.relative_to(ROOT)}", flush=True)
-        except SyntaxError as e:
-            failures.append(f"syntax {f}: {e}")
-            print(f"[FAIL] syntax {f.relative_to(ROOT)} :: {e}", flush=True)
-
-    # 2. SettingsRepository validate reg.max_concurrent ∈ [1, 5]
-    from db.repositories import _validate_type_constraint, RepositoryError
-
-    # 1..5 phải pass
-    for v in (1, 2, 3, 5):
+    # Trường hợp gây lỗi user báo: 10, 20 — phải PASS sau fix.
+    for i, v in enumerate([1, 5, 10, 20, 30], 1):
         try:
             _validate_type_constraint("reg.max_concurrent", v)
-            print(f"[PASS] settings accept reg.max_concurrent={v}", flush=True)
-        except RepositoryError as e:
-            failures.append(f"settings reject {v}: {e}")
-            print(f"[FAIL] settings reject {v} :: {e}", flush=True)
+            _check(True, f"OK-{i:02d}", f"reg.max_concurrent={v} chấp nhận")
+        except RepositoryError as exc:
+            _check(False, f"OK-{i:02d}", f"reg.max_concurrent={v} BỊ TỪ CHỐI", str(exc))
 
-    # 6, 10, 20 phải bị reject
-    for v in (6, 10, 20):
+    # Trường hợp boundary: 0, 31 phải reject.
+    for i, v in enumerate([0, 31, 100, -1], 1):
         try:
             _validate_type_constraint("reg.max_concurrent", v)
-            failures.append(f"settings ACCEPT {v} (expected reject)")
-            print(f"[FAIL] settings ACCEPT {v} (expected reject)", flush=True)
-        except RepositoryError as e:
-            print(f"[PASS] settings reject reg.max_concurrent={v} :: {e.cause}", flush=True)
+            _check(False, f"BAD-{i:02d}", f"reg.max_concurrent={v} bị accept (phải reject)")
+        except RepositoryError:
+            _check(True, f"BAD-{i:02d}", f"reg.max_concurrent={v} reject đúng")
 
-    # 3. JobManager.set_max_concurrent
-    import asyncio
-    from web.manager import JobManager
+    # Type mismatch.
+    for i, v in enumerate([True, "10", 10.5, None], 1):
+        try:
+            _validate_type_constraint("reg.max_concurrent", v)
+            _check(False, f"TYPE-{i:02d}", f"reg.max_concurrent={v!r} bị accept")
+        except RepositoryError:
+            _check(True, f"TYPE-{i:02d}", f"reg.max_concurrent={v!r} reject đúng")
 
-    async def _check_jm() -> list[str]:
-        local_fail: list[str] = []
-        jm = JobManager(max_concurrent=1)
-        for v in (2, 3, 5):
-            try:
-                jm.set_max_concurrent(v)
-                print(f"[PASS] JobManager.set_max_concurrent({v}) ok, _max={jm.max_concurrent}", flush=True)
-            except ValueError as e:
-                local_fail.append(f"JobManager {v} fail: {e}")
-                print(f"[FAIL] JobManager.set_max_concurrent({v}) :: {e}", flush=True)
-
-        for v in (6, 10, 20):
-            try:
-                jm.set_max_concurrent(v)
-                local_fail.append(f"JobManager ACCEPT {v}")
-                print(f"[FAIL] JobManager.set_max_concurrent({v}) ACCEPT (expected raise)", flush=True)
-            except ValueError as e:
-                print(f"[PASS] JobManager reject {v} :: {e}", flush=True)
-
-        # apply_settings cap
-        jm2 = JobManager(max_concurrent=1)
-        jm2.apply_settings({"reg.max_concurrent": 7})
-        if jm2.max_concurrent == 5:
-            print(f"[PASS] apply_settings cap 7 → 5", flush=True)
-        else:
-            local_fail.append(f"apply_settings 7 → {jm2.max_concurrent} (expected 5)")
-            print(f"[FAIL] apply_settings 7 → {jm2.max_concurrent}", flush=True)
-        return local_fail
-
-    failures.extend(asyncio.run(_check_jm()))
-
-    # 5. Server set_config clamp logic — kiểm tra qua đọc nguồn
-    server_src = (ROOT / "web" / "server.py").read_text(encoding="utf-8")
-    if "max(1, min(payload.max_concurrent, 5))" in server_src:
-        print(f"[PASS] server.py clamp max_concurrent → 5", flush=True)
-    else:
-        failures.append("server.py không clamp về 5")
-        print(f"[FAIL] server.py không thấy clamp về 5", flush=True)
-
-    # 6. Frontend cap
-    js_src = (ROOT / "web" / "static" / "app.js").read_text(encoding="utf-8")
-    if "Math.min(raw, 5)" in js_src:
-        print(f"[PASS] app.js cap _modeToConcurrency → 5", flush=True)
-    else:
-        failures.append("app.js không cap _modeToConcurrency về 5")
-        print(f"[FAIL] app.js không cap _modeToConcurrency về 5", flush=True)
-
-    print("", flush=True)
-    if failures:
-        print(f"=== {len(failures)} FAILURE(S) ===", flush=True)
-        for x in failures:
-            print(f"  - {x}", flush=True)
-        return 1
-    print("=== ALL PASS ===", flush=True)
-    return 0
+    print(f"\n=== {'ALL PASS' if _fails == 0 else str(_fails) + ' FAIL'} ===", flush=True)
+    return 1 if _fails else 0
 
 
 if __name__ == "__main__":

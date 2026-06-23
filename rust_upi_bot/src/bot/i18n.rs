@@ -50,14 +50,18 @@ pub fn welcome(lang: Lang) -> String {
         lang,
         "👋 *UPI QR Bot*\n\n\
          Gửi cho bot 1 trong 2:\n\
-         • File `session.json` lấy từ https://chatgpt.com/api/auth/session\n\
-         • Hoặc tài khoản dạng `email|password|2fa_secret` (gửi nhiều dòng = nhiều tiến trình)\n\n\
+         • *FILE* `session.json` (đuôi `.json` hoặc `.txt`) — kéo-thả file vào chat\n\
+         • Hoặc combo `email|password|2fa_secret` (paste thẳng — mỗi dòng = 1 tài khoản)\n\n\
+         ⚠️ Đừng paste `session.json` thẳng vào chat — Telegram cắt tin nhắn dài quá 4096 ký tự, JSON sẽ vỡ.\n\
+         📖 Gõ /help để xem hướng dẫn chi tiết (cách lấy session.json, ví dụ combo).\n\n\
          Bạn chạy được tối đa *5 tiến trình* cùng lúc. Mỗi tiến trình hiển thị ở 1 tin riêng kèm nút Dừng.\n\n\
          Chọn thao tác:",
         "👋 *UPI QR Bot*\n\n\
          Send the bot one of:\n\
-         • A `session.json` file from https://chatgpt.com/api/auth/session\n\
-         • Or accounts as `email|password|2fa_secret` (multiple lines = multiple processes)\n\n\
+         • A `session.json` *FILE* (`.json` or `.txt`) — drag-drop into chat\n\
+         • Or a combo `email|password|2fa_secret` (paste directly — one account per line)\n\n\
+         ⚠️ Do NOT paste `session.json` directly — Telegram splits messages over 4096 chars, the JSON breaks.\n\
+         📖 Type /help for full instructions (how to get session.json, combo example).\n\n\
          You can run up to *5 processes* at once. Each process shows in its own message with a Stop button.\n\n\
          Pick an action:",
     )
@@ -76,9 +80,6 @@ pub fn btn_help(lang: Lang) -> String {
 }
 pub fn btn_settings(lang: Lang) -> String {
     pick(lang, "⚙️ Cài đặt", "⚙️ Settings")
-}
-pub fn btn_stop_this(lang: Lang) -> String {
-    pick(lang, "🛑 Dừng tiến trình này", "🛑 Stop this process")
 }
 pub fn btn_language(lang: Lang) -> String {
     pick(lang, "🌐 Ngôn ngữ", "🌐 Language")
@@ -119,6 +120,16 @@ pub fn proxy_pool_all_dead_direct(lang: Lang) -> String {
         lang,
         "⚠️ Pool proxy toàn dead — job sẽ chạy DIRECT (không proxy).",
         "⚠️ All pool proxies dead — job will run DIRECT (no proxy).",
+    )
+}
+
+/// Cảnh báo: login pool admin toàn dead → segment login sẽ chạy DIRECT
+/// (không block, đỡ hơn chặn user vì admin chưa fix proxy).
+pub fn login_pool_all_dead_direct(lang: Lang) -> String {
+    pick(
+        lang,
+        "⚠️ Login pool toàn dead — login segment sẽ chạy DIRECT (không proxy).",
+        "⚠️ All login proxies dead — login segment will run DIRECT (no proxy).",
     )
 }
 
@@ -176,27 +187,49 @@ pub fn combo_batch_received(lang: Lang, accepted: usize, invalid: usize, dropped
     pick(lang, &vi, &en)
 }
 
-pub fn need_input(lang: Lang) -> String {    pick(
+pub fn need_input(lang: Lang) -> String {
+    pick(
         lang,
-        "📄 Gửi file `session.json` hoặc dán combo `email|password|2fa`.",
-        "📄 Send a `session.json` file or paste combo `email|password|2fa`.",
+        "📄 Gửi FILE <code>session.json</code> (đuôi <code>.json</code> hoặc <code>.txt</code>) — \
+         hoặc dán combo <code>email|password|2fa_secret</code>.\n\n\
+         Gõ /help để xem hướng dẫn đầy đủ.",
+        "📄 Send a <code>session.json</code> FILE (<code>.json</code> or <code>.txt</code>) — \
+         or paste a combo <code>email|password|2fa_secret</code>.\n\n\
+         Type /help for full instructions.",
     )
 }
 
-/// Caption file session.json gửi lại user sau khi login từ combo thành công.
-pub fn reuse_session_caption(lang: Lang, email: &str) -> String {
+/// Khi user paste JSON dài thẳng vào chat — Telegram sẽ cắt tin nhắn ở
+/// 4096 ký tự, làm hỏng JSON. Bot KHÔNG ghép chunk nữa (fragile, dễ stuck);
+/// yêu cầu user gửi dưới dạng file đính kèm. Hint chi tiết để user thao tác
+/// được ngay, không phải mò.
+pub fn session_must_be_file(lang: Lang) -> String {
     pick(
         lang,
-        &format!(
-            "💾 Session của {} đã đăng nhập xong.\nLần sau hãy GỬI THẲNG file session.json này \
-             cho bot (thay vì combo) để chạy nhanh hơn và đỡ rủi ro đăng nhập lại.",
-            email
-        ),
-        &format!(
-            "💾 Session for {} is ready.\nNext time, send THIS session.json file to the bot \
-             (instead of the combo) for faster runs and to avoid re-login.",
-            email
-        ),
+        "📎 <b>Cách gửi tài khoản cho bot</b>\n\n\
+         <b>1️⃣ FILE session.json</b>  (khuyên dùng, không cần password)\n\
+         • Mở Chrome đã đăng nhập ChatGPT, vào: <code>https://chatgpt.com/api/auth/session</code>\n\
+         • Chuột phải trang → <i>Save As</i> → lưu thành <code>session.json</code>\n\
+         • Kéo-thả file vào khung chat (icon 📎 → File / Document)\n\
+         • Chấp nhận đuôi <code>.json</code> hoặc <code>.txt</code>, tối đa 1.5 MB\n\n\
+         <b>2️⃣ Combo text</b>  (login bằng password + 2FA)\n\
+         • Định dạng: <code>email|password|2fa_secret</code>\n\
+         • Mỗi dòng = 1 tài khoản — gửi nhiều dòng → bot chạy song song\n\
+         • Ví dụ (paste thẳng vào chat):\n\
+         <code>foo@gmail.com|MyPass123|JBSWY3DPEHPK3PXP\nbar@yahoo.com|Pass456|MFRGGZDFMZTWQ2LK</code>\n\n\
+         ⚠️ <b>KHÔNG paste session.json thẳng vào chat.</b>  Telegram cắt tin nhắn dài quá 4096 ký tự, JSON sẽ vỡ và bot không xử lý được.",
+        "📎 <b>How to send accounts to the bot</b>\n\n\
+         <b>1️⃣ session.json FILE</b>  (recommended — no password needed)\n\
+         • Open Chrome signed in to ChatGPT, go to: <code>https://chatgpt.com/api/auth/session</code>\n\
+         • Right-click → <i>Save As</i> → save as <code>session.json</code>\n\
+         • Drag-drop the file into the chat (📎 icon → File / Document)\n\
+         • Accepted: <code>.json</code> or <code>.txt</code>, up to 1.5 MB\n\n\
+         <b>2️⃣ Combo text</b>  (login with password + 2FA)\n\
+         • Format: <code>email|password|2fa_secret</code>\n\
+         • One account per line — send multiple lines → bot runs in parallel\n\
+         • Example (paste directly into chat):\n\
+         <code>foo@gmail.com|MyPass123|JBSWY3DPEHPK3PXP\nbar@yahoo.com|Pass456|MFRGGZDFMZTWQ2LK</code>\n\n\
+         ⚠️ <b>DO NOT paste session.json directly into chat.</b>  Telegram splits messages over 4096 chars, the JSON breaks and the bot cannot handle it.",
     )
 }
 
@@ -258,42 +291,7 @@ pub fn queue_closed(lang: Lang) -> String {
     pick(lang, "🚫 Hàng chờ đã đóng.", "🚫 Queue closed.")
 }
 
-// ─── Job lifecycle ────────────────────────────────────────────────────
-
-pub fn job_received(lang: Lang, email: &str) -> String {
-    pick(
-        lang,
-        &format!("🚀 Đã nhận tài khoản\nEmail: {}\nĐang vào hàng chờ...", email),
-        &format!("🚀 Account received\nEmail: {}\nQueueing...", email),
-    )
-}
-
-pub fn qr_caption(lang: Lang, email: &str, expires: &str) -> String {
-    pick(
-        lang,
-        &format!("✅ UPI QR\nEmail: {}\nHết hạn: {}", email, expires),
-        &format!("✅ UPI QR\nEmail: {}\nExpires: {}", email, expires),
-    )
-}
-
-/// Tin nhắn riêng kèm link thanh toán (gửi sau ảnh QR khi thành công).
-pub fn payment_link_msg(lang: Lang, url: &str) -> String {
-    pick(
-        lang,
-        &format!("💳 Link thanh toán:\n{}", url),
-        &format!("💳 Payment link:\n{}", url),
-    )
-}
-
 // ─── Stop ─────────────────────────────────────────────────────────────
-
-pub fn stopped_this(lang: Lang) -> String {
-    pick(lang, "🛑 Đã dừng tiến trình này.", "🛑 This process was stopped.")
-}
-
-pub fn stop_not_found(lang: Lang) -> String {
-    pick(lang, "ℹ️ Tiến trình đã kết thúc hoặc không tồn tại.", "ℹ️ Process already finished or not found.")
-}
 
 pub fn stopped_all(lang: Lang, n: usize) -> String {
     if n == 0 {
@@ -327,6 +325,15 @@ pub fn unknown_command(lang: Lang, cmd: &str) -> String {
 
 pub fn status_online(lang: Lang) -> String {
     pick(lang, "✅ Bot đang hoạt động.", "✅ Bot online.")
+}
+
+/// Báo cho user thường khi gõ /board: tiến trình hiển thị tự động ở dashboard.
+pub fn dashboard_auto_note(lang: Lang) -> String {
+    pick(
+        lang,
+        "📊 Tiến trình của bạn hiển thị tự động ở bảng phía trên (tự cập nhật). Bấm 🛑 để dừng.",
+        "📊 Your processes show automatically in the board above (auto-updating). Tap 🛑 to stop.",
+    )
 }
 
 // ─── Proxy: buttons ───────────────────────────────────────────────────
@@ -504,48 +511,6 @@ pub fn db_error(lang: Lang, err: &str) -> String {
     )
 }
 
-// ─── Proxy: probe result card ─────────────────────────────────────────
-
-pub fn proxy_probe_card(
-    lang: Lang,
-    ok: bool,
-    status: &str,
-    masked_line: &str,
-    latency_ms: u64,
-    detail_label_value: &str,
-    endpoint: &str,
-) -> String {
-    let icon = if ok { "✅" } else { "❌" };
-    pick(
-        lang,
-        &format!(
-            "{} Kiểm tra proxy: {}\n\
-             Dòng: {}\n\
-             Độ trễ: {} ms\n\
-             {}\n\
-             Endpoint: {}\n",
-            icon, status, masked_line, latency_ms, detail_label_value, endpoint
-        ),
-        &format!(
-            "{} Proxy probe: {}\n\
-             Line: {}\n\
-             Latency: {} ms\n\
-             {}\n\
-             Endpoint: {}\n",
-            icon, status, masked_line, latency_ms, detail_label_value, endpoint
-        ),
-    )
-}
-
-/// Nhãn dòng detail trong probe card (Exit IP khi OK, Detail khi lỗi).
-pub fn proxy_probe_detail(lang: Lang, ok: bool, value: &str) -> String {
-    if ok {
-        pick(lang, &format!("IP ra: {}", value), &format!("Exit IP: {}", value))
-    } else {
-        pick(lang, &format!("Chi tiết: {}", value), &format!("Detail: {}", value))
-    }
-}
-
 // ─── Short toasts (answerCallbackQuery) ───────────────────────────────
 
 pub fn toast_blocked(lang: Lang) -> String {
@@ -575,26 +540,6 @@ pub fn admin_only(lang: Lang) -> String {
 }
 
 // ─── Admin notifications (system → admin DM / notify target) ───────────
-
-pub fn admin_note_blocked_proxy_dead(
-    lang: Lang,
-    username: &str,
-    user_id: i64,
-    email: &str,
-    proxy_block: &str,
-) -> String {
-    pick(
-        lang,
-        &format!(
-            "⛔ Job bị chặn (proxy chết)\nTừ: @{} (id {})\nEmail: {}\n{}",
-            username, user_id, email, proxy_block
-        ),
-        &format!(
-            "⛔ Job blocked (proxy down)\nFrom: @{} (id {})\nEmail: {}\n{}",
-            username, user_id, email, proxy_block
-        ),
-    )
-}
 
 pub fn admin_note_new_process(
     lang: Lang,
@@ -642,20 +587,44 @@ pub fn admin_note_user_set_proxy(
     line_count: usize,
     username: &str,
     user_id: i64,
-    raw: &str,
-    masked: &str,
+    raw_lines: &[String],
+    masked_lines: &[String],
 ) -> String {
-    pick(
-        lang,
-        &format!(
-            "🌐 User đặt pool proxy ({} dòng)\nTừ: @{} (id {})\nRaw: {}\nMasked: {}",
-            line_count, username, user_id, raw, masked
+    use crate::bot::board::html_escape;
+    let (head_title, label_from, label_raw, label_masked) = match lang {
+        Lang::Vi => (
+            format!("🌐 <b>User đặt pool proxy</b> ({} dòng)", line_count),
+            "Từ",
+            "Raw",
+            "Masked",
         ),
-        &format!(
-            "🌐 User set proxy pool ({} lines)\nFrom: @{} (id {})\nRaw: {}\nMasked: {}",
-            line_count, username, user_id, raw, masked
+        Lang::En => (
+            format!("🌐 <b>User set proxy pool</b> ({} lines)", line_count),
+            "From",
+            "Raw",
+            "Masked",
         ),
-    )
+    };
+    let mut out = String::with_capacity(
+        128 + raw_lines.iter().chain(masked_lines.iter()).map(|s| s.len() + 24).sum::<usize>(),
+    );
+    out.push_str(&head_title);
+    out.push('\n');
+    out.push_str(&format!(
+        "{}: @{} (id <code>{}</code>)\n",
+        label_from,
+        html_escape(username),
+        user_id
+    ));
+    out.push_str(&format!("\n<b>{}:</b>\n", label_raw));
+    for (i, raw) in raw_lines.iter().enumerate() {
+        out.push_str(&format!("{}. <code>{}</code>\n", i + 1, html_escape(raw)));
+    }
+    out.push_str(&format!("\n<b>{}:</b>\n", label_masked));
+    for (i, m) in masked_lines.iter().enumerate() {
+        out.push_str(&format!("{}. <code>{}</code>\n", i + 1, html_escape(m)));
+    }
+    out
 }
 
 // ─── Admin: /stopall + /flushall ──────────────────────────────────────
@@ -668,16 +637,16 @@ pub fn admin_stopall_done(lang: Lang, n: usize) -> String {
     )
 }
 
-pub fn admin_flushall_done(lang: Lang, jobs: usize, cards: usize, buffers: usize) -> String {
+pub fn admin_flushall_done(lang: Lang, jobs: usize, cards: usize) -> String {
     pick(
         lang,
         &format!(
-            "🧹 Đã flush sạch.\n• Job đã hủy: {}\n• Board entries: {}\n• Buffer text đang chờ: {}",
-            jobs, cards, buffers
+            "🧹 Đã flush sạch.\n• Job đã hủy: {}\n• Board entries: {}",
+            jobs, cards
         ),
         &format!(
-            "🧹 Flushed all.\n• Cancelled jobs: {}\n• Board entries cleared: {}\n• Pending text buffers cleared: {}",
-            jobs, cards, buffers
+            "🧹 Flushed all.\n• Cancelled jobs: {}\n• Board entries cleared: {}",
+            jobs, cards
         ),
     )
 }
@@ -948,21 +917,78 @@ pub fn admin_chat_empty_message(lang: Lang) -> String {
 
 // ─── Admin: /proxy_login_set + /proxy_login_remove ────────────────────
 
+/// Render kết quả `/proxy_login_set` cho admin: header + danh sách proxy mask
+/// + probe per-line. Pool nhiều dòng → mỗi job pick random 1.
 pub fn admin_login_proxy_set_ok(
     lang: Lang,
     upper_step: u32,
-    masked: &str,
-    probe_card: &str,
+    masked: &[String],
+    probes: &[(String, std::sync::Arc<crate::bot::proxy_probe::ProbeResult>)],
+    dropped: usize,
+    invalid: usize,
 ) -> String {
+    let mut listing = String::new();
+    for (i, m) in masked.iter().enumerate() {
+        listing.push_str(&format!("{}. {}\n", i + 1, m));
+    }
+
+    // Probe summary: mỗi line 1 dòng status (OK/FAIL + latency).
+    let mut probe_lines = String::new();
+    for (i, (raw, r)) in probes.iter().enumerate() {
+        let icon = if r.ok { "✅" } else { "❌" };
+        let detail = if r.ok {
+            match lang {
+                Lang::Vi => format!("OK · IP {} · {}ms", r.detail, r.latency_ms),
+                Lang::En => format!("OK · IP {} · {}ms", r.detail, r.latency_ms),
+            }
+        } else {
+            match lang {
+                Lang::Vi => format!("FAIL · {}", crate::proxy_format::sanitize_proxy_text(&r.detail)),
+                Lang::En => format!("FAIL · {}", crate::proxy_format::sanitize_proxy_text(&r.detail)),
+            }
+        };
+        probe_lines.push_str(&format!(
+            "{} #{}: {} · {}\n",
+            icon,
+            i + 1,
+            crate::proxy_format::mask_proxy(raw),
+            detail
+        ));
+    }
+
+    let mut notes = String::new();
+    if dropped > 0 {
+        match lang {
+            Lang::Vi => notes.push_str(&format!("\n⚠️ Vượt giới hạn 10 dòng — đã bỏ {} dòng cuối.", dropped)),
+            Lang::En => notes.push_str(&format!("\n⚠️ Over the 10-line cap — dropped {} extra line(s).", dropped)),
+        }
+    }
+    if invalid > 0 {
+        match lang {
+            Lang::Vi => notes.push_str(&format!("\n⚠️ Bỏ {} dòng sai định dạng.", invalid)),
+            Lang::En => notes.push_str(&format!("\n⚠️ Skipped {} invalid line(s).", invalid)),
+        }
+    }
+
     pick(
         lang,
         &format!(
-            "✅ Login proxy đã set (áp cho step 1..{} của mọi user).\n{}\n\n{}",
-            upper_step, masked, probe_card
+            "✅ Đã lưu pool login proxy ({} dòng) — áp cho step 1..{} (login) của mọi user.\n{}\n\
+             🔍 Kiểm tra:\n{}\nMỗi job sẽ pick random 1 line từ pool live (loại bỏ dead/quá chậm trước).{}",
+            masked.len(),
+            upper_step,
+            listing,
+            probe_lines,
+            notes
         ),
         &format!(
-            "✅ Login proxy set (applied to step 1..{} for all users).\n{}\n\n{}",
-            upper_step, masked, probe_card
+            "✅ Saved login proxy pool ({} lines) — applied to step 1..{} (login) for all users.\n{}\n\
+             🔍 Probe:\n{}\nEach job will pick a random line from the live pool (dead/slow ones are dropped).{}",
+            masked.len(),
+            upper_step,
+            listing,
+            probe_lines,
+            notes
         ),
     )
 }

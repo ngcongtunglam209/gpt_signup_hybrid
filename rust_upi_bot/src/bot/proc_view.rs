@@ -1,180 +1,24 @@
-//! Thẻ tiến trình thân thiện — dịch log kỹ thuật thô của runner thành 1 card
-//! gọn (checklist 5 bước + thanh % + bộ đếm sống + lý do đời thường), song ngữ.
+//! Lớp hiển thị thân thiện cho user Telegram:
+//!   - `render_dashboard_html`: bảng tiến trình per-user (1 message sống).
+//!   - `qr_caption_full`: caption ảnh QR khi thành công (gộp link + hạn).
+//!   - `render_done_fail` / `render_timeout`: tin terminal lý do đời thường.
+//!   - `render_preflight_ok` / `_batch`: card kiểm tra proxy trước khi chạy.
+//!   - `render_proxy_line`: 1 dòng trạng thái proxy cho card pre-flight.
 //!
-//! Log thô vẫn còn nguyên trong logread router để debug; đây chỉ là lớp hiển
-//! thị cho user Telegram.
+//! Log thô của runner vẫn được parse thành `StepKind` ở `board.rs` (dùng cho
+//! dashboard) — đây chỉ là các template text.
 
 use crate::bot::i18n::Lang;
 
-/// 5 bước hiển thị cho user (gộp từ các step kỹ thuật của runner).
-const PHASE_LOGIN: u8 = 0; // [1/6] login + [login] ...
-const PHASE_PREPARE: u8 = 1; // [2/6] checkout, [3/6] init, [4/6] elements, [5a] token
-const PHASE_CONFIRM: u8 = 2; // [5b] confirm, [5c] refresh
-const PHASE_ACTIVATE: u8 = 3; // [6/6] approve loop + try N/M
-const PHASE_QR: u8 = 4; // approve OK → xuất QR
-
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
-enum Note {
-    #[default]
-    None,
-    Blocked,
-    Exception,
-    Network,
-}
-
-/// Trạng thái rút gọn của 1 tiến trình, cập nhật theo từng dòng log.
-pub struct ProcView {
-    email: String,
-    phase: u8,
-    approve_cur: u32,
-    approve_max: u32,
-    note: Note,
-    /// Proxy đang dùng cho attempt gần nhất ("direct" = không proxy). Cập nhật
-    /// liên tục theo log "proxy=...". None khi chưa có log nào liên quan proxy.
-    proxy_label: Option<String>,
-}
-
-impl ProcView {
-    pub fn new(email: String) -> Self {
-        Self {
-            email,
-            phase: PHASE_LOGIN,
-            approve_cur: 0,
-            approve_max: 0,
-            note: Note::None,
-            proxy_label: None,
-        }
-    }
-
-    /// Cập nhật state từ 1 dòng log thô. Phase chỉ tiến, không lùi.
-    pub fn update(&mut self, line: &str) {
-        let detected = detect_phase(line);
-        if let Some(p) = detected {
-            if p > self.phase {
-                self.phase = p;
-            }
-        }
-
-        // Bộ đếm vòng kích hoạt: "      try 001/004  FAIL  http=200  blocked ..."
-        if let Some((cur, max)) = parse_try(line) {
-            self.phase = self.phase.max(PHASE_ACTIVATE);
-            self.approve_cur = cur;
-            self.approve_max = max;
-        }
-
-        // Lý do (chỉ áp dụng ở phase kích hoạt).
-        if line.contains("try ") || line.contains("approve") {
-            if line.contains("blocked") {
-                self.note = Note::Blocked;
-            } else if line.contains("exception") {
-                self.note = Note::Exception;
-            } else if line.contains("NetworkError") || line.contains("http=---") {
-                self.note = Note::Network;
-            }
-        }
-        // Outage detection của runner.
-        if line.contains("[net]") && (line.contains("outage") || line.contains("waiting")) {
-            self.note = Note::Network;
-        }
-
-        // Parse proxy hiện tại từ log line dạng "... proxy=<value>". Áp dụng
-        // cho approve attempt + cf-warmup → reflect proxy đang dùng cho user.
-        // Lưu rút gọn (cắt query/path) để hiển thị gọn trên card.
-        if let Some(idx) = line.find("proxy=") {
-            let after = &line[idx + "proxy=".len()..];
-            let token = after.split_whitespace().next().unwrap_or("");
-            if !token.is_empty() {
-                self.proxy_label = Some(short_proxy_display(token));
-            }
-        }
-    }
-
-    fn pct(&self) -> u8 {
-        match self.phase {
-            PHASE_LOGIN => 15,
-            PHASE_PREPARE => 50,
-            PHASE_CONFIRM => 70,
-            PHASE_ACTIVATE => {
-                if self.approve_max > 0 {
-                    let frac = self.approve_cur as f64 / self.approve_max as f64;
-                    (75.0 + frac * 20.0).min(95.0) as u8
-                } else {
-                    75
-                }
-            }
-            _ => 100,
-        }
-    }
-
-    /// Render card "đang chạy".
-    pub fn render_running(&self, lang: Lang, elapsed_s: f64) -> String {
-        let bar = progress_bar(self.pct());
-        let mut s = format!(
-            "⚡ UPI QR · {}\n{} {}% · ⏱ {}",
-            self.email,
-            bar,
-            self.pct(),
-            fmt_elapsed(elapsed_s)
-        );
-        // Dòng proxy (Mẫu A) — hiện ngay sau progress bar khi đã có thông tin.
-        if let Some(p) = &self.proxy_label {
-            let label = format_proxy_label(lang, p);
-            s.push_str(&format!("\n{}", label));
-        }
-        s.push_str("\n\n");
-        for p in 0..=PHASE_QR {
-            let label = phase_label(lang, p);
-            let icon = if p < self.phase {
-                "✅"
-            } else if p == self.phase {
-                "🔄"
-            } else {
-                "⬜"
-            };
-            if p == PHASE_ACTIVATE && p == self.phase && self.approve_max > 0 {
-                let lap = match lang {
-                    Lang::Vi => "lần",
-                    Lang::En => "try",
-                };
-                s.push_str(&format!(
-                    "{} {} · {} {}/{}\n",
-                    icon, label, lap, self.approve_cur, self.approve_max
-                ));
-            } else {
-                s.push_str(&format!("{} {}\n", icon, label));
-            }
-        }
-        if self.note != Note::None {
-            s.push_str(&format!("\n💬 {}", note_text(lang, self.note)));
-        }
-        s
-    }
-}
-
-// ─── Render các trạng thái terminal/queue ────────────────────────────────
-
-pub fn render_queued(lang: Lang, email: &str, position: usize) -> String {
-    match lang {
-        Lang::Vi => format!(
-            "⏳ ĐANG CHỜ · vị trí ~{}\n{}\nBot sẽ tự chạy khi tới lượt 🔔",
-            position, email
-        ),
-        Lang::En => format!(
-            "⏳ QUEUED · position ~{}\n{}\nThe bot will start automatically 🔔",
-            position, email
-        ),
-    }
-}
-
-pub fn render_your_turn(lang: Lang, email: &str) -> String {
-    match lang {
-        Lang::Vi => format!("🔔 Tới lượt bạn! · {}\nĐang khởi động…", email),
-        Lang::En => format!("🔔 Your turn! · {}\nStarting…", email),
-    }
-}
-
-/// 1 dòng trạng thái proxy cho pre-flight card. `label` = "Login"/"User".
-pub fn render_proxy_line(lang: Lang, label: &str, ok: bool, status: &str, detail: &str, latency_ms: u64) -> String {
+/// 1 dòng trạng thái proxy cho pre-flight card. `label` = "Login"/"User #i".
+pub fn render_proxy_line(
+    lang: Lang,
+    label: &str,
+    ok: bool,
+    status: &str,
+    detail: &str,
+    latency_ms: u64,
+) -> String {
     let icon = if ok { "✅" } else { "❌" };
     if ok {
         let ip = match lang {
@@ -187,22 +31,7 @@ pub fn render_proxy_line(lang: Lang, label: &str, ok: bool, status: &str, detail
     }
 }
 
-/// Card pre-flight khi 1 proxy chết → chặn chạy (fail-fast).
-pub fn render_preflight_blocked(lang: Lang, email: &str, lines: &[String]) -> String {
-    let body = lines.join("\n");
-    match lang {
-        Lang::Vi => format!(
-            "⛔ KHÔNG THỂ CHẠY · {}\nProxy không khả dụng — đã chặn trước khi chạy.\n\n{}\n\n↳ Báo admin kiểm tra proxy login, hoặc /proxy_remove rồi thử lại.",
-            email, body
-        ),
-        Lang::En => format!(
-            "⛔ CANNOT RUN · {}\nProxy unavailable — blocked before start.\n\n{}\n\n↳ Ask admin to check the login proxy, or /proxy_remove and retry.",
-            email, body
-        ),
-    }
-}
-
-/// Card pre-flight khi proxy OK → thông báo ngắn rồi vào hàng chờ.
+/// Card pre-flight (1 job) khi proxy OK → thông báo ngắn rồi vào hàng chờ.
 pub fn render_preflight_ok(lang: Lang, email: &str, lines: &[String]) -> String {
     let body = lines.join("\n");
     match lang {
@@ -211,8 +40,102 @@ pub fn render_preflight_ok(lang: Lang, email: &str, lines: &[String]) -> String 
     }
 }
 
-pub fn render_done_ok(lang: Lang, email: &str, elapsed_s: f64, expires: &str, attempts: usize) -> String {
-    let bar = progress_bar(100);
+/// Card pre-flight cho BATCH nhiều combo — gộp 1 lần probe + 1 card cho cả
+/// batch (thay vì N card trùng lặp khi user dán nhiều dòng).
+pub fn render_preflight_ok_batch(lang: Lang, count: usize, lines: &[String]) -> String {
+    let body = lines.join("\n");
+    match lang {
+        Lang::Vi => format!("🌐 Kiểm tra proxy · {} tài khoản\n{}", count, body),
+        Lang::En => format!("🌐 Proxy check · {} accounts\n{}", count, body),
+    }
+}
+
+/// Dashboard per-user (1 message sống) — gom MỌI tiến trình của user vào 1
+/// message HTML (parse_mode=HTML cổ điển, KHÔNG dùng `<table>` của rich để
+/// chạy được trên mọi Bot API server). Mỗi tiến trình 2 dòng: email + tuổi,
+/// rồi bước thân thiện. Cập nhật qua editMessageText có throttle → chỉ 1
+/// message/user thay vì N → chống flood 429.
+///
+/// `entries` lấy từ `JobBoard::snapshot_entries_for_user`. Mọi giá trị động
+/// đã đi qua `html_escape`.
+pub fn render_dashboard_html(
+    entries: &[(u64, crate::bot::board::JobStatus)],
+    lang: Lang,
+    clock: &str,
+) -> String {
+    use crate::bot::board::{fmt_age, html_escape, JobState};
+
+    if entries.is_empty() {
+        return match lang {
+            Lang::Vi => "✅ <b>Không còn tiến trình nào đang chạy.</b>\n<i>Gửi tài khoản (file session.json hoặc combo) để bắt đầu.</i>".to_string(),
+            Lang::En => "✅ <b>No active processes.</b>\n<i>Send an account (session.json file or combo) to start.</i>".to_string(),
+        };
+    }
+
+    let running = entries
+        .iter()
+        .filter(|(_, s)| s.state == JobState::Running)
+        .count();
+    let queued = entries.len() - running;
+
+    let (title, run_w, queue_w, foot) = match lang {
+        Lang::Vi => (
+            "📊 <b>Tiến trình của bạn</b>",
+            "chạy",
+            "chờ",
+            "<i>Bảng tự cập nhật. Bấm 🛑 để dừng tiến trình tương ứng.</i>",
+        ),
+        Lang::En => (
+            "📊 <b>Your processes</b>",
+            "run",
+            "queue",
+            "<i>Auto-updating. Tap 🛑 to stop a process.</i>",
+        ),
+    };
+
+    let mut out = String::with_capacity(128 + entries.len() * 96);
+    out.push_str(title);
+    out.push('\n');
+    out.push_str(&format!(
+        "<i>▶️ <b>{}</b> {} · ⏳ <b>{}</b> {} · 🕒 {}</i>\n",
+        running,
+        run_w,
+        queued,
+        queue_w,
+        html_escape(clock)
+    ));
+    out.push_str("───────────────\n");
+
+    for (i, (_, s)) in entries.iter().enumerate() {
+        let icon = match s.state {
+            JobState::Running => "▶️",
+            JobState::Queued => "⏳",
+        };
+        let age = fmt_age(s.since.elapsed().as_secs());
+        let step = html_escape(&s.step.label(lang));
+        out.push_str(&format!(
+            "{} <b>{}.</b> <code>{}</code> · 🕒 <b>{}</b>\n     <i>↳ {}</i>\n",
+            icon,
+            i + 1,
+            html_escape(&s.email_masked),
+            html_escape(&age),
+            step,
+        ));
+    }
+    out.push('\n');
+    out.push_str(foot);
+    out
+}
+
+/// Caption ảnh QR khi thành công — gộp email + hạn + (tùy chọn) link thanh
+/// toán + số lần kích hoạt vào 1 caption (không gửi tin riêng → bớt 1 message).
+pub fn qr_caption_full(
+    lang: Lang,
+    email: &str,
+    expires: &str,
+    payment_link: Option<&str>,
+    attempts: usize,
+) -> String {
     let activated = if attempts > 0 {
         match lang {
             Lang::Vi => format!(" · kích hoạt sau {} lần", attempts),
@@ -221,18 +144,20 @@ pub fn render_done_ok(lang: Lang, email: &str, elapsed_s: f64, expires: &str, at
     } else {
         String::new()
     };
-    match lang {
-        Lang::Vi => format!(
-            "✅ HOÀN TẤT · {}\n{} 100% · ⏱ {}\n\nMã QR UPI đã sẵn sàng 👇\nHết hạn: {}{}",
-            email, bar, fmt_elapsed(elapsed_s), expires, activated
-        ),
-        Lang::En => format!(
-            "✅ DONE · {}\n{} 100% · ⏱ {}\n\nYour UPI QR is ready 👇\nExpires: {}{}",
-            email, bar, fmt_elapsed(elapsed_s), expires, activated
-        ),
+    let mut s = match lang {
+        Lang::Vi => format!("✅ UPI QR · {}\nHết hạn: {}{}", email, expires, activated),
+        Lang::En => format!("✅ UPI QR · {}\nExpires: {}{}", email, expires, activated),
+    };
+    if let Some(url) = payment_link {
+        s.push_str(&match lang {
+            Lang::Vi => format!("\n💳 Link thanh toán: {}", url),
+            Lang::En => format!("\n💳 Payment link: {}", url),
+        });
     }
+    s
 }
 
+/// Tin terminal khi job FAIL — dịch lỗi thô sang câu đời thường.
 pub fn render_done_fail(
     lang: Lang,
     email: &str,
@@ -267,6 +192,7 @@ pub fn render_done_fail(
     }
 }
 
+/// Tin terminal khi job hết thời gian.
 pub fn render_timeout(lang: Lang, email: &str, elapsed_s: f64) -> String {
     match lang {
         Lang::Vi => format!(
@@ -282,82 +208,7 @@ pub fn render_timeout(lang: Lang, email: &str, elapsed_s: f64) -> String {
     }
 }
 
-pub fn render_stopped(lang: Lang, email: &str, elapsed_s: f64) -> String {
-    match lang {
-        Lang::Vi => format!("🛑 ĐÃ DỪNG · {}\n⏱ {}", email, fmt_elapsed(elapsed_s)),
-        Lang::En => format!("🛑 STOPPED · {}\n⏱ {}", email, fmt_elapsed(elapsed_s)),
-    }
-}
-
 // ─── Helpers ─────────────────────────────────────────────────────────────
-
-fn detect_phase(line: &str) -> Option<u8> {
-    // Ưu tiên QR/approve trước (xuất hiện muộn nhất).
-    if line.contains("[QR]") && line.contains("OK") {
-        return Some(PHASE_QR);
-    }
-    if line.contains("approve     OK") || line.contains("approved at") {
-        return Some(PHASE_QR);
-    }
-    if line.contains("[6/6]") || line.contains("try ") {
-        return Some(PHASE_ACTIVATE);
-    }
-    if line.contains("[5b") || line.contains("[5c") {
-        return Some(PHASE_CONFIRM);
-    }
-    if line.contains("[2/6")
-        || line.contains("[3/6")
-        || line.contains("[4/6")
-        || line.contains("[5a]")
-    {
-        return Some(PHASE_PREPARE);
-    }
-    if line.contains("[1/6] login")
-        || line.contains("[login]")
-        || line.starts_with("Account:")
-    {
-        return Some(PHASE_LOGIN);
-    }
-    None
-}
-
-/// Parse "try 001/004 ..." → (cur, max).
-fn parse_try(line: &str) -> Option<(u32, u32)> {
-    let t = line.trim_start();
-    let rest = t.strip_prefix("try ")?;
-    let mut sp = rest.split('/');
-    let cur: u32 = sp.next()?.trim().parse().ok()?;
-    let max_part = sp.next()?;
-    let max: u32 = max_part.split_whitespace().next()?.trim().parse().ok()?;
-    Some((cur, max))
-}
-
-fn phase_label(lang: Lang, p: u8) -> &'static str {
-    match (lang, p) {
-        (Lang::Vi, PHASE_LOGIN) => "Đăng nhập",
-        (Lang::Vi, PHASE_PREPARE) => "Chuẩn bị thanh toán",
-        (Lang::Vi, PHASE_CONFIRM) => "Xác nhận UPI",
-        (Lang::Vi, PHASE_ACTIVATE) => "Kích hoạt ưu đãi",
-        (Lang::Vi, _) => "Xuất mã QR",
-        (Lang::En, PHASE_LOGIN) => "Sign in",
-        (Lang::En, PHASE_PREPARE) => "Preparing payment",
-        (Lang::En, PHASE_CONFIRM) => "Confirming UPI",
-        (Lang::En, PHASE_ACTIVATE) => "Activating offer",
-        (Lang::En, _) => "Generating QR",
-    }
-}
-
-fn note_text(lang: Lang, note: Note) -> &'static str {
-    match (lang, note) {
-        (Lang::Vi, Note::Blocked) => "Máy chủ đang từ chối — bot tự thử lại",
-        (Lang::Vi, Note::Exception) => "Lỗi tạm thời — bot tự thử lại",
-        (Lang::Vi, Note::Network) => "Mạng chậm — bot tự thử lại",
-        (Lang::En, Note::Blocked) => "Server is rejecting — retrying",
-        (Lang::En, Note::Exception) => "Temporary error — retrying",
-        (Lang::En, Note::Network) => "Network slow — retrying",
-        _ => "",
-    }
-}
 
 /// Dịch lỗi thô của runner sang câu đời thường.
 fn friendly_reason(lang: Lang, raw: &str) -> String {
@@ -407,7 +258,6 @@ fn friendly_reason(lang: Lang, raw: &str) -> String {
             "Network/server unstable, please try again.",
         );
     }
-    // Fallback: cắt gọn raw error.
     let short: String = raw.chars().take(120).collect();
     if vi {
         format!("Không hoàn tất ({}).", short)
@@ -416,131 +266,11 @@ fn friendly_reason(lang: Lang, raw: &str) -> String {
     }
 }
 
-fn progress_bar(pct: u8) -> String {
-    let cells = 10usize;
-    let filled = ((pct as f64 / 100.0) * cells as f64).round() as usize;
-    let filled = filled.min(cells);
-    let mut s = String::with_capacity(cells * 3);
-    for _ in 0..filled {
-        s.push('▓');
-    }
-    for _ in filled..cells {
-        s.push('░');
-    }
-    s
-}
-
 fn fmt_elapsed(secs: f64) -> String {
     let s = secs.max(0.0) as u64;
     if s < 60 {
         format!("{}s", s)
     } else {
         format!("{}m{:02}s", s / 60, s % 60)
-    }
-}
-
-/// Cắt proxy token cho hiển thị gọn trên card. Strip scheme `http(s)://` +
-/// path/query, chỉ giữ host[:port]. Giữ "direct" nguyên.
-fn short_proxy_display(token: &str) -> String {
-    if token == "direct" {
-        return token.to_string();
-    }
-    // Nếu là URL: cắt scheme + path/query.
-    let stripped = token
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(token);
-    // Nếu có "@" (user:pass@host) — chỉ giữ phần sau @ (mask).
-    let host_part = stripped
-        .rsplit_once('@')
-        .map(|(_, h)| h)
-        .unwrap_or(stripped);
-    // Cắt path/query: lấy phần trước '/'.
-    let host = host_part.split(['/', '?']).next().unwrap_or(host_part);
-    host.to_string()
-}
-
-/// Format dòng proxy hiển thị trên card. "direct" → song ngữ "DIRECT (no proxy)".
-fn format_proxy_label(lang: Lang, raw: &str) -> String {
-    if raw == "direct" {
-        match lang {
-            Lang::Vi => "🌐 DIRECT (không proxy)".to_string(),
-            Lang::En => "🌐 DIRECT (no proxy)".to_string(),
-        }
-    } else {
-        format!("🌐 {}", raw)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_try_works() {
-        assert_eq!(parse_try("      try 001/004  FAIL  http=200  blocked"), Some((1, 4)));
-        assert_eq!(parse_try("try 36/100 ok"), Some((36, 100)));
-        assert_eq!(parse_try("no try here"), None);
-    }
-
-    #[test]
-    fn phase_progresses_and_renders() {
-        let mut v = ProcView::new("a***b@x.com".into());
-        v.update("Account: a***b@x.com");
-        assert_eq!(v.phase, PHASE_LOGIN);
-        v.update("[2/6 [p1]] checkout   OK   cs=cs_live_x");
-        assert_eq!(v.phase, PHASE_PREPARE);
-        v.update("[5b [p1]] confirm    OK      variant=qr_code http=200");
-        assert_eq!(v.phase, PHASE_CONFIRM);
-        v.update("[6/6] approve loop start  retries=100");
-        v.update("      try 006/100  FAIL  http=200  blocked    proxy=direct");
-        assert_eq!(v.phase, PHASE_ACTIVATE);
-        assert_eq!((v.approve_cur, v.approve_max), (6, 100));
-        let card = v.render_running(Lang::Vi, 42.0);
-        assert!(card.contains("Kích hoạt ưu đãi"));
-        assert!(card.contains("6/100"));
-        assert!(card.contains("Máy chủ đang từ chối"));
-    }
-
-    /// Preview thẻ tiến trình từ chuỗi log THẬT (chạy: cargo test preview -- --ignored --nocapture).
-    #[test]
-    #[ignore]
-    fn preview_cards() {
-        let email = "igl***02@hotmail.com";
-        let real_log = [
-            "Account: igl***02@hotmail.com",
-            "[1/6] login   →    HTTP login (email|pass|2fa) proxy=direct",
-            "[login] [9/9] GET /api/auth/session",
-            "[1/6] login   OK   session acquired (cookies=30)",
-            "[2/6 [p1]] checkout   OK   cs=cs_live_a1veg7… ui=custom",
-            "[3/6 [p1]] init       OK   amount=0 ppage=ppage_1TkUY7…",
-            "[4/6 [p1]] elements   OK   session=elements_sessi…",
-            "[5a]   token-cfg  OK   shift=11 rv=e96dd269…",
-            "[5b [p1]] confirm    OK      variant=qr_code http=200",
-            "[5c [p1]] refresh    OK      http=200",
-            "[6/6] approve loop start  retries=100 delay=3.0s batch=3",
-            "      try 036/100  FAIL  http=200  blocked    proxy=direct",
-        ];
-        for lang in [Lang::Vi, Lang::En] {
-            let mut v = ProcView::new(email.into());
-            // Mốc 1: sau login
-            for l in &real_log[..4] {
-                v.update(l);
-            }
-            println!("\n===== [{:?}] ĐANG CHẠY (sau login) =====\n{}", lang, v.render_running(lang, 6.0));
-            // Mốc 2: vòng kích hoạt
-            for l in &real_log[4..] {
-                v.update(l);
-            }
-            println!("\n===== [{:?}] ĐANG CHẠY (kích hoạt) =====\n{}", lang, v.render_running(lang, 162.0));
-            // Terminal states
-            println!("\n===== [{:?}] QUEUED =====\n{}", lang, render_queued(lang, email, 3));
-            println!("\n===== [{:?}] THÀNH CÔNG =====\n{}", lang, render_done_ok(lang, email, 52.0, "21/06 14:30 (UTC+7)", 18));
-            println!("\n===== [{:?}] FAIL: blocked =====\n{}", lang, render_done_fail(lang, email, 312.0, "approve failed after 100 attempts (retries=100)", 100));
-            println!("\n===== [{:?}] FAIL: billing country =====\n{}", lang, render_done_fail(lang, email, 8.0, "checkout HTTP 400: {\"detail\":\"Billing country must match request country.\"}", 0));
-            println!("\n===== [{:?}] FAIL: email-OTP =====\n{}", lang, render_done_fail(lang, email, 5.0, "login fail: account dùng passwordless OTP (cần mailbox)", 0));
-            println!("\n===== [{:?}] TIMEOUT =====\n{}", lang, render_timeout(lang, email, 1800.0));
-            println!("\n===== [{:?}] STOPPED =====\n{}", lang, render_stopped(lang, email, 30.0));
-        }
     }
 }

@@ -1750,9 +1750,11 @@ async def run_upi_qr_probe(
     for login_attempt in range(1, LOGIN_MAX_ATTEMPTS + 1):
         try:
             if login_fn is not None:
-                # SessionProvider: reuse cookie cũ (revalidate HTTP) → bỏ qua login.
-                # force_fresh=True (cycle re-login đổi IP) → provider bỏ reuse, login mới.
-                # proxy=login_proxy: tôn trọng proxy_from_step (login direct khi >1).
+                # Cache-aware login (UPI only): reuse cookie cache (revalidate
+                # /api/auth/session) → bỏ qua login. force_fresh=True (cycle
+                # re-login đổi IP) → manager wrapper bỏ reuse, login mới.
+                # proxy=login_proxy: tôn trọng proxy_from_step (login direct
+                # khi proxy_from_step > 1).
                 session_data = await login_fn(force_fresh=force_fresh, proxy=login_proxy)
             else:
                 session_data = await get_session_pure_request(

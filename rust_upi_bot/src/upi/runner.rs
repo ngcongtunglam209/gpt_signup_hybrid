@@ -77,20 +77,6 @@ pub struct UpiJobConfig {
 
 pub type LogFn = Arc<dyn Fn(&str) + Send + Sync>;
 
-/// Sink phát nội dung session.json (chuỗi) ngay khi login từ combo thành công,
-/// để bot gửi file lại cho user tái dùng lượt sau. `None` ở chế độ CLI run-once.
-pub type SessionSink = Arc<dyn Fn(String) + Send + Sync>;
-
-/// Dựng nội dung file session.json từ raw `/api/auth/session` + cookies jar.
-/// Đính `__cookies` để bot `build_cookie_header` đọc lại được ở lượt sau.
-fn build_session_file(session_json: &Value, cookies: &[Value]) -> String {
-    let mut obj = session_json.clone();
-    if let Some(map) = obj.as_object_mut() {
-        map.insert("__cookies".to_string(), Value::Array(cookies.to_vec()));
-    }
-    serde_json::to_string_pretty(&obj).unwrap_or_else(|_| obj.to_string())
-}
-
 /// Mask email cho log (giữ 3 ký tự đầu + 2 cuối local part).
 pub fn mask_email(email: &str) -> String {
     if let Some(at_idx) = email.find('@') {
@@ -322,7 +308,6 @@ pub async fn run_upi_qr(
     client: Arc<HttpClient>,
     cfg: UpiJobConfig,
     log: LogFn,
-    session_sink: Option<SessionSink>,
 ) -> UpiQrResult {
     let started = Instant::now();
     let masked_email = mask_email(&cfg.email);
@@ -427,16 +412,7 @@ pub async fn run_upi_qr(
                 }
             }
             match session_opt {
-                Some(sess) => {
-                    // Phát session.json lại cho user NGAY (trước khi chạy tiếp
-                    // các step có thể fail) → user giữ được session để dùng lượt
-                    // sau dù QR có lỗi về sau.
-                    if let Some(sink) = &session_sink {
-                        let content = build_session_file(&sess.session_json, &sess.cookies);
-                        sink(content);
-                    }
-                    (sess.access_token, sess.cookie_header)
-                }
+                Some(sess) => (sess.access_token, sess.cookie_header),
                 None => {
                     return finalize_error(
                         masked_email,
