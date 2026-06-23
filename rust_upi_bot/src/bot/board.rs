@@ -1,23 +1,26 @@
 //! Live job board — snapshot trung tâm của mọi job đang trong hệ thống, phục
-//! vụ bảng trạng thái realtime cho admin (`/board`).
+//! vụ bảng trạng thái realtime cho `/board`.
 //!
 //! Khác `JobRegistry` (chỉ giữ cancel token để `/stop`), board giữ thêm trạng
-//! thái hiển thị: user, email (đã mask), state, step (log cuối), mốc thời gian.
+//! thái hiển thị: user, email (đã mask), state, **bước thân thiện** (StepKind
+//! đã dịch từ log thô — KHÔNG lộ http/proxy/internal step code), mốc thời gian.
 //!
 //! Vòng đời 1 entry (key = `job_id` u64 từ `JobRegistry::register`):
-//!   1. submit thành công  → `insert_queued`
+//!   1. submit thành công  → `insert_queued`           (StepKind::Idle)
 //!   2. worker pickup       → `mark_running`
-//!   3. mỗi log line        → `set_step`
+//!   3. mỗi log line        → `set_step` (parse → StepKind, chỉ tiến không lùi)
 //!   4. Done/Timeout/Cancel → `remove`
 //!
-//! Map sync + ngắn, không giữ guard qua `.await` (tokio `Mutex` vẫn dùng để
-//! await an toàn nếu cần). Render là pure function trên snapshot đã clone.
+//! Map sync + ngắn, không giữ guard qua `.await`. Render là pure function trên
+//! snapshot đã clone.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::Mutex;
+
+use crate::bot::i18n::Lang;
 
 /// Trạng thái 1 job trong board.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,12 +30,120 @@ pub enum JobState {
 }
 
 impl JobState {
-    pub fn icon(self) -> &'static str {
-        match self {
-            JobState::Queued => "⏳",
-            JobState::Running => "▶️",
+    /// Nhãn ngắn cho cột "Trạng thái" trong /board (icon + chữ).
+    pub fn label(self, lang: Lang) -> &'static str {
+        match (self, lang) {
+            (JobState::Running, Lang::Vi) => "▶️ Chạy",
+            (JobState::Running, Lang::En) => "▶️ Run",
+            (JobState::Queued, Lang::Vi) => "⏳ Chờ",
+            (JobState::Queued, Lang::En) => "⏳ Wait",
         }
     }
+}
+
+/// Bước hiện tại — DỊCH từ log thô của runner thành label thân thiện.
+/// Tuyệt đối KHÔNG mang chi tiết kỹ thuật (http=200, [5b], proxy=...) lên
+/// /board, tránh lộ logic nội bộ và overload user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StepKind {
+    /// Vừa submit / chưa có log nào.
+    #[default]
+    Idle,
+    Login,
+    Prepare,
+    Confirm,
+    /// Vòng kích hoạt (`try N/M`). `max=0` khi mới vào phase chưa parse được counter.
+    Activate { cur: u32, max: u32 },
+    Qr,
+}
+
+impl StepKind {
+    /// Rank để so sánh "tiến/lùi". Phase chỉ tiến lên — riêng Activate cùng
+    /// rank với chính nó để cập nhật counter (cur/max) liên tục.
+    fn rank(self) -> u8 {
+        match self {
+            StepKind::Idle => 0,
+            StepKind::Login => 1,
+            StepKind::Prepare => 2,
+            StepKind::Confirm => 3,
+            StepKind::Activate { .. } => 4,
+            StepKind::Qr => 5,
+        }
+    }
+
+    /// Label song ngữ — chỉ chữ thân thiện, không http/proxy/code.
+    pub fn label(self, lang: Lang) -> String {
+        let vi = matches!(lang, Lang::Vi);
+        match self {
+            StepKind::Idle => {
+                if vi { "Đang chờ".into() } else { "Queued".into() }
+            }
+            StepKind::Login => {
+                if vi { "Đang đăng nhập".into() } else { "Signing in".into() }
+            }
+            StepKind::Prepare => {
+                if vi { "Đang chuẩn bị".into() } else { "Preparing".into() }
+            }
+            StepKind::Confirm => {
+                if vi { "Đang xác nhận".into() } else { "Confirming".into() }
+            }
+            StepKind::Activate { cur, max } => {
+                if max == 0 {
+                    if vi { "Đang kích hoạt".into() } else { "Activating".into() }
+                } else if vi {
+                    format!("Đang thử {}/{}", cur, max)
+                } else {
+                    format!("Trying {}/{}", cur, max)
+                }
+            }
+            StepKind::Qr => {
+                if vi { "Đang tạo mã QR".into() } else { "Generating QR".into() }
+            }
+        }
+    }
+}
+
+/// Map 1 dòng log thô → `StepKind`. Trả `None` khi log không thuộc nhóm bước.
+/// Pattern khớp với `proc_view::detect_phase` để 2 view (card user và board)
+/// đồng nhất bước, nhưng KHÔNG giữ chi tiết.
+pub fn parse_step(line: &str) -> Option<StepKind> {
+    // QR thành công (xuất hiện muộn nhất — ưu tiên trước).
+    if (line.contains("[QR]") && line.contains("OK"))
+        || line.contains("approve     OK")
+        || line.contains("approved at")
+    {
+        return Some(StepKind::Qr);
+    }
+    // "try N/M ..." — vòng kích hoạt với counter.
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("try ") {
+        let mut sp = rest.split('/');
+        let cur_part = sp.next()?;
+        let max_part = sp.next()?;
+        let cur: u32 = cur_part.trim().parse().ok()?;
+        let max: u32 = max_part.split_whitespace().next()?.trim().parse().ok()?;
+        return Some(StepKind::Activate { cur, max });
+    }
+    if line.contains("[6/6]") {
+        return Some(StepKind::Activate { cur: 0, max: 0 });
+    }
+    if line.contains("[5b") || line.contains("[5c") {
+        return Some(StepKind::Confirm);
+    }
+    if line.contains("[2/6")
+        || line.contains("[3/6")
+        || line.contains("[4/6")
+        || line.contains("[5a]")
+    {
+        return Some(StepKind::Prepare);
+    }
+    if line.contains("[1/6] login")
+        || line.contains("[login]")
+        || line.starts_with("Account:")
+    {
+        return Some(StepKind::Login);
+    }
+    None
 }
 
 #[derive(Debug, Clone)]
@@ -42,8 +153,8 @@ pub struct JobStatus {
     /// Email đã mask sẵn (không lưu plaintext).
     pub email_masked: String,
     pub state: JobState,
-    /// Log line gần nhất — hiển thị cột "step". Rỗng khi chưa có log.
-    pub step: String,
+    /// Bước hiện tại (đã dịch thân thiện — không có log thô).
+    pub step: StepKind,
     /// Mốc tính tuổi: thời điểm submit (Queued) hoặc thời điểm chạy (Running).
     pub since: Instant,
 }
@@ -60,7 +171,7 @@ impl JobBoard {
         }
     }
 
-    /// Thêm job vừa submit vào board (state = Queued).
+    /// Thêm job vừa submit vào board (state = Queued, step = Idle).
     pub async fn insert_queued(
         &self,
         job_id: u64,
@@ -76,7 +187,7 @@ impl JobBoard {
                 username,
                 email_masked,
                 state: JobState::Queued,
-                step: String::new(),
+                step: StepKind::Idle,
                 since: Instant::now(),
             },
         );
@@ -91,11 +202,16 @@ impl JobBoard {
         }
     }
 
-    /// Cập nhật log line gần nhất cho job.
-    pub async fn set_step(&self, job_id: u64, step: String) {
+    /// Cập nhật bước từ 1 dòng log thô. CHỈ tiến lên (rank cao hơn); riêng
+    /// phase Activate được cập nhật counter `(cur, max)` liên tục cùng rank.
+    pub async fn set_step(&self, job_id: u64, line: String) {
+        let Some(parsed) = parse_step(&line) else { return };
         let mut g = self.inner.lock().await;
-        if let Some(s) = g.get_mut(&job_id) {
-            s.step = step;
+        let Some(s) = g.get_mut(&job_id) else { return };
+        let same_activate = matches!(parsed, StepKind::Activate { .. })
+            && matches!(s.step, StepKind::Activate { .. });
+        if parsed.rank() > s.step.rank() || same_activate {
+            s.step = parsed;
         }
     }
 
@@ -150,9 +266,8 @@ fn sort_entries(out: &mut [(u64, JobStatus)]) {
     });
 }
 
-/// Escape ký tự đặc biệt HTML — Telegram parse_mode=HTML chặn `<`/`>`/`&`
-/// chưa escape. Mọi giá trị động (email, username, step) PHẢI qua hàm này
-/// trước khi nhúng vào template HTML của board.
+/// Escape ký tự đặc biệt HTML — Telegram parse rất chặt, mọi giá trị động
+/// (email, username, age...) PHẢI qua hàm này trước khi nhúng template HTML.
 pub fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -169,6 +284,7 @@ pub fn html_escape(s: &str) -> String {
 }
 
 /// Cắt chuỗi theo số ký tự (char-safe), thêm '…' nếu bị cắt.
+#[allow(dead_code)]
 pub fn truncate_chars(s: &str, max: usize) -> String {
     let trimmed = s.trim();
     if trimmed.chars().count() <= max {

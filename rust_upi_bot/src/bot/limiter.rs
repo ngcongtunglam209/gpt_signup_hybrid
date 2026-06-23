@@ -108,6 +108,29 @@ impl UserLimiter {
         }
     }
 
+    /// Reset CỨNG `in_flight=0` cho user (dùng cho `/stop`, `/stopall`, nút
+    /// Stop trên board). Lý do: cancel_token + registry clear ngay khi /stop,
+    /// nhưng worker `mark_done` chạy bất đồng bộ — nếu user gửi combo mới
+    /// trước khi worker kết thúc cancel handshake, limiter vẫn còn đếm cũ →
+    /// MaxConcurrent block oan. Force reset ở /stop diệt khe race này.
+    /// `mark_done` của worker sau đó giảm `saturating_sub(0)` → không underflow.
+    /// KHÔNG set `last_done_at` (user dừng chủ động, không phạt cooldown).
+    pub async fn force_reset_user(&self, user_id: i64) {
+        let mut g = self.inner.lock().await;
+        if let Some(st) = g.get_mut(&user_id) {
+            st.in_flight = 0;
+        }
+    }
+
+    /// Reset CỨNG TẤT CẢ user (admin `/stopall` / `/flushall`). Drain map →
+    /// memory không giữ lại entry rỗng. Tương đương `force_reset_user` cho mọi user.
+    pub async fn force_reset_everyone(&self) {
+        let mut g = self.inner.lock().await;
+        for (_, st) in g.iter_mut() {
+            st.in_flight = 0;
+        }
+    }
+
     pub async fn mark_done(&self, user_id: i64) {
         let mut g = self.inner.lock().await;
         let st = g.entry(user_id).or_default();

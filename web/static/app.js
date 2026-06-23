@@ -624,13 +624,37 @@
     return cfg.defaultMode;
   }
 
+  let _regModeSyncedOnLoad = false;
+
+  async function _syncRegConcurrencyToServer(mode) {
+    const target = _modeToConcurrency(mode);
+    try {
+      await api('/api/config', {
+        method: 'POST',
+        body: JSON.stringify({ max_concurrent: target }),
+      });
+      state.maxConcurrent = target;
+    } catch (err) {
+      console.error('[reg.mode sync]', err);
+    }
+  }
+
   function _applyTabMode(tabId) {
     _renderModeOptionsForTab(tabId);
     const cfg = MODE_TAB_CONFIG[tabId];
     if (!cfg) return;
     const mode = _loadModeForTab(tabId);
     dom.modeSelect.value = mode;
-    if (tabId === 'reg') state.mode = mode;
+    if (tabId === 'reg') {
+      state.mode = mode;
+      // Force sync server-side config 1 lần khi load tab Reg đầu tiên — tránh
+      // case DB key `reg.max_concurrent` còn giá trị stale từ build cũ
+      // (clamp 5) dù `reg.mode` đã là multi10/multi20/multi30.
+      if (!_regModeSyncedOnLoad) {
+        _regModeSyncedOnLoad = true;
+        _syncRegConcurrencyToServer(mode);
+      }
+    }
   }
 
   // Switch tab → re-render Mode dropdown theo cap + load value đã save cho tab.

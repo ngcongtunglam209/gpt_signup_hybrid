@@ -120,7 +120,9 @@ def _env(key: str, default: str) -> str:
 
 
 # Parsed constants
-_MAX_CONCURRENT = min(max(int(_env("HYBRID_MAX_CONCURRENT", "2")), 1), 10)
+# Reg max_concurrent giới hạn trên product = 30 (Multi (30) trong UI). Env var
+# cho phép override nhưng vẫn clamp [1, 30] để khớp UI cap.
+_MAX_CONCURRENT = min(max(int(_env("HYBRID_MAX_CONCURRENT", "2")), 1), 30)
 _DEFAULT_JOB_TIMEOUT = min(max(float(_env("HYBRID_JOB_TIMEOUT", "240")), 30), 600)
 _DEFAULT_PROXY = _env("HYBRID_OUTLOOK_PROXY", "") or None
 
@@ -590,8 +592,8 @@ class JobManager:
         return self._max
 
     def set_max_concurrent(self, n: int) -> None:
-        if n < 1 or n > 5:
-            raise ValueError("max_concurrent phải trong [1, 5]")
+        if n < 1 or n > 30:
+            raise ValueError("max_concurrent phải trong [1, 30]")
         self._max = n
         self._ensure_workers()
 
@@ -732,10 +734,10 @@ class JobManager:
             self._debug = bool(settings["reg.debug"])
         if "reg.max_concurrent" in settings:
             val = int(settings["reg.max_concurrent"])
-            # Cap về 5 — Reg cap [1, 5]. Giá trị cũ trong DB > 5 vẫn silent
-            # clamp xuống thay vì bỏ qua, giữ behavior nhất quán với set_config.
+            # Cap về 30 — Reg cap [1, 30]. Giá trị cũ trong DB ngoài range vẫn
+            # silent clamp để giữ behavior nhất quán với set_config.
             if val >= 1:
-                self._max = max(1, min(val, 5))
+                self._max = max(1, min(val, 30))
         if "reg.use_proxy" in settings:
             self._use_proxy = bool(settings["reg.use_proxy"])
         _hydrate_proxy_pool_from_settings(settings)
@@ -2397,7 +2399,7 @@ class SessionJobManager:
         _hydrate_proxy_pool_from_settings(settings)
         if "reg.max_concurrent" in settings:
             val = int(settings["reg.max_concurrent"])
-            if 1 <= val <= 10:
+            if 1 <= val <= 30:
                 self._max = val
         if "reg.auto_retry" in settings:
             self._auto_retry = bool(settings["reg.auto_retry"])
@@ -2499,8 +2501,8 @@ class SessionJobManager:
         return self._max
 
     def set_max_concurrent(self, n: int) -> None:
-        if n < 1 or n > 10:
-            raise ValueError("max_concurrent phải trong [1, 10]")
+        if n < 1 or n > 30:
+            raise ValueError("max_concurrent phải trong [1, 30]")
         self._max = n
         self._ensure_workers()
 

@@ -290,9 +290,9 @@ class AddJobsRequest(BaseModel):
 
 
 class SetConfigRequest(BaseModel):
-    # Bỏ le ở schema — frontend mode dropdown share giữa các tab có option
-    # tới Multi (200). Handler tự clamp về [1, 5] (giới hạn Reg) trước khi
-    # apply, tránh trả 422 khi user chọn mode > 5 ở tab Reg.
+    # Reg cap [1, 30] (yêu cầu sản phẩm). Schema không set le để FE gửi value
+    # > 30 vẫn được handler clamp (không trả 422), giữ tương thích các phiên
+    # cũ khi dropdown từng share giữa các tab.
     max_concurrent: int | None = Field(default=None, ge=1)
     headless: bool | None = Field(default=None)
     debug: bool | None = Field(default=None)
@@ -485,12 +485,10 @@ async def set_config(payload: SetConfigRequest) -> JSONResponse:
     sm = get_session_manager()
     lm = get_link_manager()
     # Clamp 1 lần — dùng cho cả manager apply và write-through Settings Store.
-    # Frontend dropdown share đến Multi (200) giữa các tab; tab Reg cap [1, 5]
-    # (yêu cầu sản phẩm: Reg multi tối đa 5 song song). Mọi giá trị > 5 (vd
-    # user chọn Multi 10/50/100/200) đều silent clamp xuống 5 — không trả
-    # 422 vì dropdown share giữa các tab.
+    # Reg cap [1, 30] (yêu cầu sản phẩm). FE đã render dropdown đúng cap, ở
+    # đây chỉ defensive clamp khi client cũ hoặc API bên ngoài gửi value lệch.
     max_concurrent_clamped: int | None = (
-        max(1, min(payload.max_concurrent, 5))
+        max(1, min(payload.max_concurrent, 30))
         if payload.max_concurrent is not None else None
     )
     if payload.max_concurrent is not None:
@@ -985,8 +983,8 @@ async def set_session_config(payload: SetSessionConfigRequest) -> JSONResponse:
     sm = get_session_manager()
     if payload.max_concurrent is not None:
         try:
-            # Silent clamp về [1, 10] (Session max).
-            clamped = max(1, min(payload.max_concurrent, 10))
+            # Silent clamp về [1, 30] (Session max).
+            clamped = max(1, min(payload.max_concurrent, 30))
             sm.set_max_concurrent(clamped)
         except ValueError as exc:
             raise HTTPException(400, str(exc))

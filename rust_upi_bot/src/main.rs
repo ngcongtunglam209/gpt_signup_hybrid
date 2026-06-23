@@ -198,6 +198,16 @@ fn lang_or_default(store: &settings::Settings, user_id: i64) -> Lang {
     user_lang(store, user_id).unwrap_or(Lang::Vi)
 }
 
+/// Ngôn ngữ admin — đọc từ store theo `admin_chat_id`. Mọi tin admin/system →
+/// admin (notify DM, banner cảnh báo) PHẢI dùng hàm này để khớp ngôn ngữ admin
+/// đã chọn (qua /language). Default Vi khi admin chưa chọn hoặc admin disabled.
+fn admin_lang(store: &settings::Settings, admin_chat_id: i64) -> Lang {
+    if admin_chat_id == 0 {
+        return Lang::Vi;
+    }
+    lang_or_default(store, admin_chat_id)
+}
+
 /// Keyboard chọn ngôn ngữ (song ngữ).
 fn language_keyboard() -> Value {
     serde_json::json!([[
@@ -506,6 +516,7 @@ async fn main() -> Result<()> {
                     } else if let Some(cb) = u.callback_query {
                         let tg = tg.clone();
                         let registry = registry.clone();
+                        let limiter = limiter.clone();
                         let session_buffer = session_buffer.clone();
                         let store = store.clone();
                         let allowed = allowed_users.clone();
@@ -515,6 +526,7 @@ async fn main() -> Result<()> {
                             if let Err(e) = handle_callback(
                                 tg,
                                 registry,
+                                limiter,
                                 session_buffer,
                                 store,
                                 cb,
@@ -695,6 +707,7 @@ async fn handle_message(
         }
         if trimmed.starts_with("/stop") {
             let stopped = registry.stop_user(user_id).await;
+            limiter.force_reset_user(user_id).await;
             session_buffer.lock().await.clear(msg.chat.id);
             let body = i18n::stopped_all(lang, stopped);
             tg.send_message(msg.chat.id, &body, Some(msg.message_id))
@@ -755,7 +768,7 @@ async fn handle_message(
                     "/notify" => handle_notify(&tg, &store, &msg, text).await,
                     "/chat" => handle_chat(&tg, &store, &msg, text).await,
                     "/ban" => {
-                        handle_ban(&tg, &store, &registry, &msg, text, cli.admin_chat_id).await
+                        handle_ban(&tg, &store, &registry, &limiter, &msg, text, cli.admin_chat_id).await
                     }
                     "/unban" => handle_unban(&tg, &store, &msg, text).await,
                     "/banlist" => handle_banlist(&tg, &store, &msg).await,
@@ -765,9 +778,18 @@ async fn handle_message(
                     "/proxy_login_remove" => {
                         handle_proxy_login_remove(&tg, &store, &msg).await
                     }
-                    "/stopall" => handle_stopall(&tg, &registry, msg.chat.id).await,
+                    "/stopall" => handle_stopall(&tg, &registry, &limiter, &store, msg.chat.id).await,
                     "/flushall" => {
-                        handle_flushall(&tg, &registry, &session_buffer, &board, msg.chat.id).await
+                        handle_flushall(
+                            &tg,
+                            &registry,
+                            &limiter,
+                            &session_buffer,
+                            &board,
+                            &store,
+                            msg.chat.id,
+                        )
+                        .await
                     }
                     "/set_notify" => handle_set_notify(&tg, &store, &msg, text).await,
                     "/notify_remove" => handle_notify_remove(&tg, &store, &msg).await,
@@ -1195,12 +1217,13 @@ async fn enqueue_and_track(
         .await
         .ok();
         if cli.admin_chat_id != 0 && user_id != cli.admin_chat_id {
-            let note = format!(
-                "⛔ Job bị chặn (proxy chết)\nTừ: @{} (id {})\nEmail: {}\n{}",
+            let alang = admin_lang(&store, cli.admin_chat_id);
+            let note = i18n::admin_note_blocked_proxy_dead(
+                alang,
                 username.as_deref().unwrap_or("-"),
                 user_id,
-                masked_email,
-                proxy_lines.join("\n"),
+                &masked_email,
+                &proxy_lines.join("\n"),
             );
             tg.send_message(cli.admin_chat_id, &note, None).await.ok();
         }
@@ -1283,11 +1306,12 @@ async fn enqueue_and_track(
             // Báo admin (DM) khi user KHÁC tạo tiến trình mới — KHÔNG đi qua
             // notify target (notify target dành riêng cho QR success ở topic).
             if cli.admin_chat_id != 0 && user_id != cli.admin_chat_id {
-                let note = format!(
-                    "🆕 Tiến trình mới\nTừ: @{} (id {})\nEmail: {}\nNguồn: {}\nHàng chờ: ~{}",
+                let alang = admin_lang(&store, cli.admin_chat_id);
+                let note = i18n::admin_note_new_process(
+                    alang,
                     username_for_log.as_deref().unwrap_or("-"),
                     user_id,
-                    masked_email,
+                    &masked_email,
                     auth_kind,
                     position,
                 );
@@ -1363,7 +1387,8 @@ async fn enqueue_and_track(
                             last_edit = std::time::Instant::now();
                         }
                         JobEvent::Log(line) => {
-                            // Board admin giữ log thô; user xem thẻ tiến trình gọn.
+                            // Board parse log → StepKind thân thiện (không lưu
+                            // raw để tránh lộ logic). User vẫn xem card riêng.
                             board_for_task.set_step(board_job_id, line.clone()).await;
                             view.update(&line);
                             running = true;
@@ -1469,11 +1494,12 @@ async fn enqueue_and_track(
                             // (set_notify topic). Tránh duplicate khi notify
                             // target trùng admin chat (cùng chat + không thread).
                             if result.ok && user_id != admin_chat_id {
-                                let summary = format!(
-                                    "🆕 QR success\nFrom: @{} (id {})\nEmail: {}\nElapsed: {:.1}s",
+                                let alang = admin_lang(&store_for_notify, admin_chat_id);
+                                let summary = i18n::admin_note_qr_success(
+                                    alang,
                                     username_for_log.as_deref().unwrap_or("-"),
                                     user_id,
-                                    result.email,
+                                    &result.email,
                                     result.elapsed_seconds,
                                 );
                                 let mut sent_admin = false;
@@ -1833,6 +1859,8 @@ async fn handle_set_notify(
     msg: &Message,
     text: &str,
 ) {
+    let admin_id = msg.from.as_ref().map(|u| u.id).unwrap_or(0);
+    let lang = lang_or_default(store, admin_id);
     let arg = text
         .strip_prefix("/set_notify")
         .map(|s| s.trim())
@@ -1840,24 +1868,9 @@ async fn handle_set_notify(
     if arg.is_empty() {
         let cur = store.get_notify_target();
         let body = match cur {
-            Some((cid, Some(tid))) => format!(
-                "🔔 Notify hiện tại: chat_id={} · topic={}\n\n\
-                 Đặt lại: /set_notify <chat_id> [thread_id] hoặc dán link topic\n\
-                 Xóa: /notify_remove · Test: /notify_test",
-                cid, tid
-            ),
-            Some((cid, None)) => format!(
-                "🔔 Notify hiện tại: chat_id={} (root)\n\n\
-                 Đặt lại: /set_notify <chat_id> [thread_id] hoặc dán link topic\n\
-                 Xóa: /notify_remove · Test: /notify_test",
-                cid
-            ),
-            None => String::from(
-                "🔔 Notify chưa cấu hình — đang fallback về ADMIN_CHAT_ID (nếu có).\n\n\
-                 Cách 1: /set_notify <chat_id> [thread_id]\n\
-                 Cách 2: /set_notify <link topic>  (vd https://t.me/c/2123456789/45)\n\n\
-                 Mẹo: forward 1 tin nhắn từ topic cho @userinfobot để lấy ID.",
-            ),
+            Some((cid, Some(tid))) => i18n::admin_notify_show_with_topic(lang, cid, tid),
+            Some((cid, None)) => i18n::admin_notify_show_root(lang, cid),
+            None => i18n::admin_notify_show_unset(lang),
         };
         tg.send_message(msg.chat.id, &body, Some(msg.message_id))
             .await
@@ -1868,7 +1881,7 @@ async fn handle_set_notify(
     let Some((chat_id, thread_id)) = parse_notify_arg(arg) else {
         tg.send_message(
             msg.chat.id,
-            "❌ Sai format. Dùng: /set_notify <chat_id> [thread_id] hoặc dán link topic.",
+            &i18n::admin_notify_set_bad_format(lang),
             Some(msg.message_id),
         )
         .await
@@ -1879,7 +1892,7 @@ async fn handle_set_notify(
     if let Err(e) = store.set_notify_target(chat_id, thread_id) {
         tg.send_message(
             msg.chat.id,
-            &format!("❌ DB error: {}", e),
+            &i18n::db_error(lang, &e.to_string()),
             Some(msg.message_id),
         )
         .await
@@ -1888,22 +1901,11 @@ async fn handle_set_notify(
     }
 
     // Test luôn — chứng minh bot có quyền gửi vào target đó.
-    let probe = format!(
-        "✅ Notify target đã set bởi admin. chat_id={} thread={:?}",
-        chat_id, thread_id
-    );
+    let probe = i18n::admin_notify_set_probe_text(lang, chat_id, thread_id);
     let test_result = tg.send_message_to_thread(chat_id, &probe, thread_id).await;
     let body = match test_result {
-        Ok(_) => format!(
-            "✅ Đã set notify target: chat_id={} · topic={}\nĐã gửi 1 tin test vào đó.",
-            chat_id,
-            thread_id.map(|t| t.to_string()).unwrap_or_else(|| "—".into())
-        ),
-        Err(e) => format!(
-            "⚠️ Đã lưu chat_id={} topic={:?} NHƯNG gửi test FAIL: {}\n\
-             Kiểm tra: bot đã được add vào group/topic + có quyền gửi tin chưa?",
-            chat_id, thread_id, e
-        ),
+        Ok(_) => i18n::admin_notify_set_ok(lang, chat_id, thread_id),
+        Err(e) => i18n::admin_notify_set_fail(lang, chat_id, thread_id, &e.to_string()),
     };
     tg.send_message(msg.chat.id, &body, Some(msg.message_id))
         .await
@@ -1916,12 +1918,14 @@ async fn handle_notify_remove(
     store: &Arc<settings::Settings>,
     msg: &Message,
 ) {
+    let admin_id = msg.from.as_ref().map(|u| u.id).unwrap_or(0);
+    let lang = lang_or_default(store, admin_id);
     let body = match store.remove_notify_target() {
-        Ok(true) => "🗑 Đã xóa notify target. Quay lại fallback ADMIN_CHAT_ID (nếu có).",
-        Ok(false) => "ℹ️ Chưa có notify target nào để xóa.",
-        Err(_) => "❌ DB error khi xóa notify target.",
+        Ok(true) => i18n::admin_notify_remove_ok(lang),
+        Ok(false) => i18n::admin_notify_remove_none(lang),
+        Err(_) => i18n::admin_notify_remove_db_err(lang),
     };
-    tg.send_message(msg.chat.id, body, Some(msg.message_id))
+    tg.send_message(msg.chat.id, &body, Some(msg.message_id))
         .await
         .ok();
 }
@@ -1933,31 +1937,24 @@ async fn handle_notify_test(
     msg: &Message,
     admin_chat_id: i64,
 ) {
+    let admin_id = msg.from.as_ref().map(|u| u.id).unwrap_or(0);
+    let lang = lang_or_default(store, admin_id);
     let target = resolve_notify_target(store, admin_chat_id);
     let Some((chat_id, thread_id)) = target else {
         tg.send_message(
             msg.chat.id,
-            "ℹ️ Chưa có notify target. Dùng /set_notify hoặc set ADMIN_CHAT_ID.",
+            &i18n::admin_notify_test_unset(lang),
             Some(msg.message_id),
         )
         .await
         .ok();
         return;
     };
-    let body = format!(
-        "🧪 Test notify\nchat_id={} thread={:?}\nThời gian: {}",
-        chat_id,
-        thread_id,
-        now_hms()
-    );
+    let body = i18n::admin_notify_test_body(lang, chat_id, thread_id, &now_hms());
     let res = tg.send_message_to_thread(chat_id, &body, thread_id).await;
     let report = match res {
-        Ok(_) => format!(
-            "✅ Gửi test OK vào chat_id={} topic={}",
-            chat_id,
-            thread_id.map(|t| t.to_string()).unwrap_or_else(|| "—".into())
-        ),
-        Err(e) => format!("❌ Gửi test FAIL: {}", e),
+        Ok(_) => i18n::admin_notify_test_ok(lang, chat_id, thread_id),
+        Err(e) => i18n::admin_notify_test_fail(lang, &e.to_string()),
     };
     tg.send_message(msg.chat.id, &report, Some(msg.message_id))
         .await
@@ -1966,36 +1963,40 @@ async fn handle_notify_test(
 
 /// `/stopall` (admin) — cancel MỌI job của MỌI user. Slot limiter tự trả qua
 /// `on_done` khi worker xử lý xong các job đã cancel.
-async fn handle_stopall(tg: &Arc<TelegramClient>, registry: &JobRegistry, chat_id: i64) {
+async fn handle_stopall(
+    tg: &Arc<TelegramClient>,
+    registry: &JobRegistry,
+    limiter: &UserLimiter,
+    store: &Arc<settings::Settings>,
+    chat_id: i64,
+) {
     let n = registry.stop_everyone().await;
-    tg.send_message(
-        chat_id,
-        &format!("🛑 Stopped {} process(es) across all users.", n),
-        None,
-    )
-    .await
-    .ok();
+    limiter.force_reset_everyone().await;
+    let lang = admin_lang(store, chat_id);
+    tg.send_message(chat_id, &i18n::admin_stopall_done(lang, n), None)
+        .await
+        .ok();
 }
 
 /// `/flushall` (admin) — reset toàn bộ trạng thái tạm: cancel mọi job, xóa
-/// board + buffer text đang chờ. KHÔNG zero cứng counter limiter (slot trả tự
-/// nhiên qua `on_done`) để tránh lệch số đếm.
+/// board + buffer text đang chờ. Force reset limiter để chống lệch counter.
 async fn handle_flushall(
     tg: &Arc<TelegramClient>,
     registry: &JobRegistry,
+    limiter: &UserLimiter,
     session_buffer: &Arc<tokio::sync::Mutex<SessionBuffer>>,
     board: &JobBoard,
+    store: &Arc<settings::Settings>,
     chat_id: i64,
 ) {
     let jobs = registry.stop_everyone().await;
+    limiter.force_reset_everyone().await;
     let cards = board.clear_all().await;
     let buffers = session_buffer.lock().await.clear_all();
+    let lang = admin_lang(store, chat_id);
     tg.send_message(
         chat_id,
-        &format!(
-            "🧹 Flushed all.\n• Cancelled jobs: {}\n• Board entries cleared: {}\n• Pending text buffers cleared: {}",
-            jobs, cards, buffers
-        ),
+        &i18n::admin_flushall_done(lang, jobs, cards, buffers),
         None,
     )
     .await
@@ -2006,11 +2007,14 @@ async fn handle_flushall(
 /// của Telegram). Danh sách text vẫn liệt kê đủ; nút chỉ cho N process đầu.
 const BOARD_STOP_BTN_CAP: usize = 25;
 
-/// Render board thành HTML đẹp (Telegram parse_mode=HTML). `scope_all` = true:
-/// admin xem toàn hệ thống; false: chỉ tiến trình của viewer. Tag hỗ trợ:
-/// `<b>` (đậm), `<i>` (nghiêng), `<code>` (mono), `<u>`, `<s>`. Mọi giá trị
-/// động đã đi qua `html_escape`.
-fn render_board_html(entries: &[(u64, JobStatus)], scope_all: bool, lang: Lang) -> String {
+/// Render board thành Rich HTML (Bot API 10.1+) — dùng `<h3>` heading,
+/// `<table bordered striped>` với cột thẳng hàng, `<details>` cho ghi chú phụ.
+/// Cột "Bước hiện tại" CHỈ hiển thị label thân thiện từ `StepKind` —
+/// KHÔNG render log thô (http=200, [5b], proxy=...) để tránh lộ logic nội bộ.
+///
+/// `scope_all` = true: admin xem toàn hệ thống (có thêm cột "Chủ"); false:
+/// chỉ tiến trình của viewer (giấu cột chủ).
+fn render_board_rich_html(entries: &[(u64, JobStatus)], scope_all: bool, lang: Lang) -> String {
     use crate::bot::board::{html_escape, JobState};
     let running = entries
         .iter()
@@ -2018,76 +2022,109 @@ fn render_board_html(entries: &[(u64, JobStatus)], scope_all: bool, lang: Lang) 
         .count();
     let queued = entries.len() - running;
 
-    // Header — title đậm, dòng thống kê xám-nhạt (italic), giờ VN.
-    let mut out = String::with_capacity(256 + entries.len() * 200);
-    let title = if scope_all {
-        match lang {
-            Lang::Vi => "📊 <b>Bảng tiến trình — toàn hệ thống</b>",
-            Lang::En => "📊 <b>Process board — system-wide</b>",
-        }
-    } else {
-        match lang {
-            Lang::Vi => "📊 <b>Tiến trình của bạn</b>",
-            Lang::En => "📊 <b>Your processes</b>",
-        }
-    };
-    out.push_str(title);
-    out.push('\n');
-    let stats = match lang {
-        Lang::Vi => format!(
-            "<i>▶️ {} chạy · ⏳ {} chờ · 🕒 {}</i>",
-            running, queued, html_escape(&now_hms())
+    let (heading, run_label, queue_label, empty_msg, footer_hint) = match (scope_all, lang) {
+        (true, Lang::Vi) => (
+            "📊 Bảng tiến trình — toàn hệ thống",
+            "đang chạy",
+            "đang chờ",
+            "Hiện chưa có tiến trình nào.",
+            "Bấm 🔄 để cập nhật bảng. Bấm nút 🛑 để dừng tiến trình tương ứng.",
         ),
-        Lang::En => format!(
-            "<i>▶️ {} run · ⏳ {} queue · 🕒 {}</i>",
-            running, queued, html_escape(&now_hms())
+        (true, Lang::En) => (
+            "📊 Process board — system-wide",
+            "running",
+            "queued",
+            "No processes right now.",
+            "Tap 🔄 to refresh. Tap 🛑 to stop a process.",
+        ),
+        (false, Lang::Vi) => (
+            "📊 Tiến trình của bạn",
+            "đang chạy",
+            "đang chờ",
+            "Bạn chưa có tiến trình nào.",
+            "Bấm 🔄 để cập nhật bảng. Bấm nút 🛑 để dừng tiến trình của bạn.",
+        ),
+        (false, Lang::En) => (
+            "📊 Your processes",
+            "running",
+            "queued",
+            "You have no processes.",
+            "Tap 🔄 to refresh. Tap 🛑 to stop a process.",
         ),
     };
-    out.push_str(&stats);
+
+    let mut out = String::with_capacity(512 + entries.len() * 220);
+    out.push_str("<h3>");
+    out.push_str(heading);
+    out.push_str("</h3>");
+    out.push_str(&format!(
+        "<p><i>▶️ <b>{}</b> {} · ⏳ <b>{}</b> {} · 🕒 {}</i></p>",
+        running,
+        run_label,
+        queued,
+        queue_label,
+        html_escape(&now_hms())
+    ));
 
     if entries.is_empty() {
-        let empty = match lang {
-            Lang::Vi => "\n\n<i>Không có tiến trình nào đang chạy.</i>",
-            Lang::En => "\n\n<i>No processes running.</i>",
-        };
-        out.push_str(empty);
+        out.push_str(&format!("<p><i>{}</i></p>", empty_msg));
         return out;
     }
 
-    out.push_str("\n────────────");
+    let (h_no, h_st, h_age, h_owner, h_email, h_step) = match lang {
+        Lang::Vi => ("#", "Trạng thái", "Tuổi", "Chủ", "Email", "Bước hiện tại"),
+        Lang::En => ("#", "State", "Age", "Owner", "Email", "Current step"),
+    };
+
+    out.push_str("<table bordered striped>");
+    if scope_all {
+        out.push_str(&format!(
+            "<tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th></tr>",
+            h_no, h_st, h_age, h_owner, h_email, h_step
+        ));
+    } else {
+        out.push_str(&format!(
+            "<tr><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th></tr>",
+            h_no, h_st, h_age, h_email, h_step
+        ));
+    }
 
     for (i, (_, s)) in entries.iter().enumerate() {
         let age = crate::bot::board::fmt_age(s.since.elapsed().as_secs());
-        let step = if s.step.is_empty() {
-            "—".to_string()
-        } else {
-            html_escape(&crate::bot::board::truncate_chars(&s.step, 48))
-        };
+        let st_label = s.state.label(lang);
         let email_html = html_escape(&s.email_masked);
-        let owner_html = if scope_all {
-            // Admin: hiện chủ sở hữu @username hoặc id. Dòng phụ in nghiêng.
-            let who = match s.username.as_deref() {
+        let step_html = html_escape(&s.step.label(lang));
+        let age_html = html_escape(&age);
+
+        if scope_all {
+            let owner_text = match s.username.as_deref() {
                 Some(u) if !u.is_empty() => format!("@{}", u),
                 _ => format!("id{}", s.user_id),
             };
-            format!("  <i>· {}</i>", html_escape(&who))
+            out.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td><td><code>{}</code></td>\
+                 <td>{}</td><td><code>{}</code></td><td>{}</td></tr>",
+                i + 1,
+                st_label,
+                age_html,
+                html_escape(&owner_text),
+                email_html,
+                step_html
+            ));
         } else {
-            String::new()
-        };
-
-        // Mỗi process 1 block 3 dòng:
-        //   <state> <#>. <code>email</code> · 🕒 mm:ss<owner>
-        //       └ step
-        out.push_str(&format!(
-            "\n\n{} <b>{}.</b> <code>{}</code>  🕒 <b>{}</b>{}\n   <i>↳ {}</i>",
-            s.state.icon(),
-            i + 1,
-            email_html,
-            html_escape(&age),
-            owner_html,
-            step,
-        ));
+            out.push_str(&format!(
+                "<tr><td>{}</td><td>{}</td><td><code>{}</code></td>\
+                 <td><code>{}</code></td><td>{}</td></tr>",
+                i + 1,
+                st_label,
+                age_html,
+                email_html,
+                step_html
+            ));
+        }
     }
+    out.push_str("</table>");
+    out.push_str(&format!("<p><i>{}</i></p>", footer_hint));
     out
 }
 
@@ -2107,7 +2144,7 @@ fn board_keyboard(entries: &[(u64, JobStatus)], lang: Lang) -> Value {
     Value::Array(rows)
 }
 
-/// Lấy snapshot (admin = tất cả, user = riêng) rồi build (html, keyboard).
+/// Lấy snapshot (admin = tất cả, user = riêng) rồi build (rich_html, keyboard).
 /// Filter theo `viewer` khi không phải admin → KHÔNG lộ tiến trình người khác.
 async fn build_board_view(
     board: &JobBoard,
@@ -2120,14 +2157,14 @@ async fn build_board_view(
     } else {
         board.snapshot_entries_for_user(viewer).await
     };
-    let html = render_board_html(&entries, is_admin, lang);
+    let html = render_board_rich_html(&entries, is_admin, lang);
     let kb = board_keyboard(&entries, lang);
     (html, kb)
 }
 
 /// `/board` — bảng tiến trình kèm nút Stop. Admin xem toàn hệ thống; user
 /// thường CHỈ thấy tiến trình của chính mình (bảo mật). Snapshot tĩnh + nút
-/// 🔄 Refresh để cập nhật. Render HTML (parse_mode=HTML) cho đẹp.
+/// 🔄 Refresh để cập nhật. Render Rich HTML (Bot API 10.1+) — `<table>` thật.
 async fn handle_board(
     tg: &Arc<TelegramClient>,
     board: &JobBoard,
@@ -2137,8 +2174,8 @@ async fn handle_board(
     lang: Lang,
 ) {
     let (html, kb) = build_board_view(board, viewer, is_admin, lang).await;
-    if let Err(e) = tg.send_message_kb_html(chat_id, &html, kb).await {
-        tracing::warn!("send board fail: {}", e);
+    if let Err(e) = tg.send_rich_message_kb(chat_id, &html, kb).await {
+        tracing::warn!("send board (rich) fail: {}", e);
     }
 }
 
@@ -2362,6 +2399,7 @@ async fn send_welcome(tg: &Arc<TelegramClient>, chat_id: i64, reply_to: i64, lan
 async fn handle_callback(
     tg: Arc<TelegramClient>,
     registry: JobRegistry,
+    limiter: UserLimiter,
     session_buffer: Arc<tokio::sync::Mutex<SessionBuffer>>,
     store: Arc<settings::Settings>,
     cb: CallbackQuery,
@@ -2411,6 +2449,10 @@ async fn handle_callback(
     if let Some(id_str) = data.strip_prefix("stopjob:") {
         if let Ok(job_id) = id_str.parse::<u64>() {
             let ok = registry.stop_job(user_id, job_id).await;
+            if ok {
+                // Force release 1 slot — diệt khe race với worker mark_done.
+                limiter.release(user_id).await;
+            }
             let toast = if ok { i18n::stopped_this(lang) } else { i18n::stop_not_found(lang) };
             tg.answer_callback_query(&cb.id, Some(&toast)).await.ok();
         } else {
@@ -2424,7 +2466,7 @@ async fn handle_callback(
         let message_id = cb.message.as_ref().map(|m| m.message_id).unwrap_or(0);
         if message_id != 0 {
             let (html, kb) = build_board_view(&board, user_id, is_admin, lang).await;
-            tg.edit_message_text_kb_html(chat_id, message_id, &html, kb).await.ok();
+            tg.edit_rich_message_kb(chat_id, message_id, &html, kb).await.ok();
         }
         tg.answer_callback_query(&cb.id, None).await.ok();
         return Ok(());
@@ -2435,18 +2477,28 @@ async fn handle_callback(
     // KHÔNG thể dừng job người khác kể cả khi forge job_id (bảo mật).
     if let Some(id_str) = data.strip_prefix("bstop:") {
         if let Ok(job_id) = id_str.parse::<u64>() {
+            // Lấy chủ sở hữu job để release slot đúng user (admin có thể stop
+            // job của user khác — slot phải trả về user đó, không phải admin).
+            let owner = board.owner_of(job_id).await;
             let ok = if is_admin {
                 registry.stop_job_any(job_id).await
             } else {
                 registry.stop_job(user_id, job_id).await
             };
+            if ok {
+                if let Some(uid) = owner {
+                    // Force release 1 slot cho user owner — diệt khe race
+                    // giữa cancel_token và worker mark_done.
+                    limiter.release(uid).await;
+                }
+            }
             tg.answer_callback_query(&cb.id, Some(&i18n::board_stopped_toast(lang, ok)))
                 .await
                 .ok();
             let message_id = cb.message.as_ref().map(|m| m.message_id).unwrap_or(0);
             if message_id != 0 {
                 let (html, kb) = build_board_view(&board, user_id, is_admin, lang).await;
-                tg.edit_message_text_kb_html(chat_id, message_id, &html, kb).await.ok();
+                tg.edit_rich_message_kb(chat_id, message_id, &html, kb).await.ok();
             }
         } else {
             tg.answer_callback_query(&cb.id, None).await.ok();
@@ -2461,6 +2513,7 @@ async fn handle_callback(
         }
         "cmd:stop" => {
             let n = registry.stop_user(user_id).await;
+            limiter.force_reset_user(user_id).await;
             session_buffer.lock().await.clear(chat_id);
             let body = i18n::stopped_all(lang, n);
             tg.answer_callback_query(&cb.id, Some(&body)).await.ok();
@@ -2594,7 +2647,7 @@ async fn handle_notify(
     let Some((body, body_start)) = command_body(text) else {
         tg.send_message(
             msg.chat.id,
-            "Usage: /notify <message>\n(Supports line breaks + text formatting.)",
+            &i18n::admin_notify_broadcast_usage(lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0))),
             Some(msg.message_id),
         )
         .await
@@ -2615,7 +2668,7 @@ async fn handle_notify(
         Err(e) => {
             tg.send_message(
                 msg.chat.id,
-                &format!("❌ Could not read user list: {}", e),
+                &i18n::admin_user_list_read_err(lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0)), &e.to_string()),
                 Some(msg.message_id),
             )
             .await
@@ -2628,7 +2681,7 @@ async fn handle_notify(
     let status_id = tg
         .send_message(
             msg.chat.id,
-            &format!("📢 Broadcasting to {} users...", total),
+            &i18n::admin_notify_broadcast_start(lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0)), total),
             Some(msg.message_id),
         )
         .await
@@ -2664,10 +2717,7 @@ async fn handle_notify(
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
 
-    let summary = format!(
-        "✅ Broadcast done\nSent OK: {}\nFailed: {}\nPruned users who blocked the bot: {}",
-        ok, fail, pruned
-    );
+    let summary = i18n::admin_notify_broadcast_done(lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0)), ok, fail, pruned);
     if status_id != 0 {
         tg.edit_message_text(msg.chat.id, status_id, &summary)
             .await
@@ -2689,7 +2739,7 @@ async fn handle_chat(
     let Some((arg, arg_start)) = command_body(text) else {
         tg.send_message(
             msg.chat.id,
-            "Usage: /chat <@username | id> <message>\nE.g.: /chat @vipproor hello there  ·  /chat 2314324 your QR is ready",
+            &i18n::admin_chat_usage_long(lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0))),
             Some(msg.message_id),
         )
         .await
@@ -2702,7 +2752,7 @@ async fn handle_chat(
     if token.is_empty() {
         tg.send_message(
             msg.chat.id,
-            "Usage: /chat <@username | id> <message>",
+            &i18n::admin_chat_usage_short(lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0))),
             Some(msg.message_id),
         )
         .await
@@ -2720,7 +2770,7 @@ async fn handle_chat(
     else {
         tg.send_message(
             msg.chat.id,
-            "❌ Empty message. Usage: /chat <@username | id> <message>",
+            &i18n::admin_chat_empty_message(lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0))),
             Some(msg.message_id),
         )
         .await
@@ -2730,7 +2780,7 @@ async fn handle_chat(
     if body.is_empty() {
         tg.send_message(
             msg.chat.id,
-            "❌ Empty message. Usage: /chat <@username | id> <message>",
+            &i18n::admin_chat_empty_message(lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0))),
             Some(msg.message_id),
         )
         .await
@@ -2748,10 +2798,9 @@ async fn handle_chat(
             Ok(None) => {
                 tg.send_message(
                     msg.chat.id,
-                    &format!(
-                        "❌ Haven't seen @{} connect to the bot — cannot resolve user_id.\n\
-                         Use the numeric id if you know it: /chat <id> <message>",
-                        stripped
+                    &i18n::admin_username_not_seen_chat(
+                        lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0)),
+                        stripped,
                     ),
                     Some(msg.message_id),
                 )
@@ -2762,7 +2811,10 @@ async fn handle_chat(
             Err(e) => {
                 tg.send_message(
                     msg.chat.id,
-                    &format!("❌ Username resolve error: {}", e),
+                    &i18n::admin_username_resolve_err(
+                        lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0)),
+                        &e.to_string(),
+                    ),
                     Some(msg.message_id),
                 )
                 .await
@@ -2796,7 +2848,7 @@ async fn handle_chat(
                 .unwrap_or_default();
             tg.send_message(
                 msg.chat.id,
-                &format!("✅ Message sent to user_id {}{}.", target_id, uname_disp),
+                &i18n::admin_msg_sent(lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0)), target_id, &uname_disp),
                 Some(msg.message_id),
             )
             .await
@@ -2804,18 +2856,28 @@ async fn handle_chat(
         }
         Err(e) => {
             let s = e.to_string().to_lowercase();
+            let lang = lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0));
             let hint = if s.contains("bot was blocked") {
-                " (user has blocked the bot)"
+                match lang {
+                    Lang::Vi => " (user đã chặn bot)",
+                    Lang::En => " (user has blocked the bot)",
+                }
             } else if s.contains("chat not found") {
-                " (user has never started the bot)"
+                match lang {
+                    Lang::Vi => " (user chưa từng start bot)",
+                    Lang::En => " (user has never started the bot)",
+                }
             } else if s.contains("user is deactivated") {
-                " (account deactivated)"
+                match lang {
+                    Lang::Vi => " (tài khoản đã bị vô hiệu hóa)",
+                    Lang::En => " (account deactivated)",
+                }
             } else {
                 ""
             };
             tg.send_message(
                 msg.chat.id,
-                &format!("❌ Send failed{}: {}", hint, e),
+                &i18n::admin_send_failed(lang, hint, &e.to_string()),
                 Some(msg.message_id),
             )
             .await
@@ -2830,6 +2892,7 @@ async fn handle_ban(
     tg: &Arc<TelegramClient>,
     store: &Arc<settings::Settings>,
     registry: &JobRegistry,
+    limiter: &UserLimiter,
     msg: &Message,
     text: &str,
     admin_id: i64,
@@ -2837,7 +2900,7 @@ async fn handle_ban(
     let Some((arg, _)) = command_body(text) else {
         tg.send_message(
             msg.chat.id,
-            "Usage: /ban <@username | id> [reason]\nE.g.: /ban @vipproor  ·  /ban 2314324",
+            &i18n::admin_ban_usage(lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0))),
             Some(msg.message_id),
         )
         .await
@@ -2857,10 +2920,9 @@ async fn handle_ban(
             Ok(None) => {
                 tg.send_message(
                     msg.chat.id,
-                    &format!(
-                        "❌ Haven't seen @{} connect to the bot — cannot resolve user_id.\n\
-                         Ban by numeric id if you know it: /ban <id> [reason]",
-                        stripped
+                    &i18n::admin_username_not_seen_ban(
+                        lang_or_default(store, admin_id),
+                        stripped,
                     ),
                     Some(msg.message_id),
                 )
@@ -2871,7 +2933,10 @@ async fn handle_ban(
             Err(e) => {
                 tg.send_message(
                     msg.chat.id,
-                    &format!("❌ Username resolve error: {}", e),
+                    &i18n::admin_username_resolve_err(
+                        lang_or_default(store, admin_id),
+                        &e.to_string(),
+                    ),
                     Some(msg.message_id),
                 )
                 .await
@@ -2882,28 +2947,35 @@ async fn handle_ban(
     };
 
     if target_id == admin_id {
-        tg.send_message(msg.chat.id, "⚠️ Cannot ban the admin.", Some(msg.message_id))
-            .await
-            .ok();
+        tg.send_message(
+            msg.chat.id,
+            &i18n::admin_ban_cant_ban_admin(lang_or_default(store, admin_id)),
+            Some(msg.message_id),
+        )
+        .await
+        .ok();
         return;
     }
 
     match store.ban(target_id, uname.as_deref(), reason_opt, admin_id) {
         Ok(_) => {
             let stopped = registry.stop_user(target_id).await;
+            limiter.force_reset_user(target_id).await;
+            let lang = lang_or_default(store, admin_id);
             let uname_disp = uname
                 .as_deref()
                 .map(|u| format!(" (@{})", u))
                 .unwrap_or_default();
-            let reason_disp = reason_opt
-                .map(|r| format!("\nReason: {}", r))
-                .unwrap_or_default();
+            let reason_disp = match reason_opt {
+                Some(r) => match lang {
+                    Lang::Vi => format!("\nLý do: {}", r),
+                    Lang::En => format!("\nReason: {}", r),
+                },
+                None => String::new(),
+            };
             tg.send_message(
                 msg.chat.id,
-                &format!(
-                    "🚫 Banned user_id {}{}{}\nStopped {} running job(s) of the user.",
-                    target_id, uname_disp, reason_disp, stopped
-                ),
+                &i18n::admin_ban_ok(lang, target_id, &uname_disp, &reason_disp, stopped),
                 Some(msg.message_id),
             )
             .await
@@ -2912,7 +2984,7 @@ async fn handle_ban(
         Err(e) => {
             tg.send_message(
                 msg.chat.id,
-                &format!("❌ Ban failed: {}", e),
+                &i18n::admin_ban_failed(lang_or_default(store, admin_id), &e.to_string()),
                 Some(msg.message_id),
             )
             .await
@@ -2932,7 +3004,7 @@ async fn handle_unban(
     let Some((arg, _)) = command_body(text) else {
         tg.send_message(
             msg.chat.id,
-            "Usage: /unban <@username | id>",
+            &i18n::admin_unban_usage(lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0))),
             Some(msg.message_id),
         )
         .await
@@ -2954,7 +3026,7 @@ async fn handle_unban(
     let Some(target_id) = target_id else {
         tg.send_message(
             msg.chat.id,
-            &format!("❌ Could not find user_id for '{}'.", token),
+            &i18n::admin_user_id_not_found(lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0)), token),
             Some(msg.message_id),
         )
         .await
@@ -2966,7 +3038,7 @@ async fn handle_unban(
         Ok(true) => {
             tg.send_message(
                 msg.chat.id,
-                &format!("✅ Unbanned user_id {}.", target_id),
+                &i18n::admin_unban_ok(lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0)), target_id),
                 Some(msg.message_id),
             )
             .await
@@ -2984,7 +3056,7 @@ async fn handle_unban(
         Err(e) => {
             tg.send_message(
                 msg.chat.id,
-                &format!("❌ Unban failed: {}", e),
+                &i18n::admin_unban_failed(lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0)), &e.to_string()),
                 Some(msg.message_id),
             )
             .await
@@ -3004,7 +3076,7 @@ async fn handle_banlist(
         Err(e) => {
             tg.send_message(
                 msg.chat.id,
-                &format!("❌ Could not read ban list: {}", e),
+                &i18n::admin_banlist_read_err(lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0)), &e.to_string()),
                 Some(msg.message_id),
             )
             .await
@@ -3013,12 +3085,16 @@ async fn handle_banlist(
         }
     };
     if bans.is_empty() {
-        tg.send_message(msg.chat.id, "✅ No users are banned.", Some(msg.message_id))
-            .await
-            .ok();
+        tg.send_message(
+            msg.chat.id,
+            &i18n::admin_banlist_empty(lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0))),
+            Some(msg.message_id),
+        )
+        .await
+        .ok();
         return;
     }
-    let mut body = format!("🚫 Banned users ({}):\n", bans.len());
+    let mut body = i18n::admin_banlist_header(lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0)), bans.len());
     for b in &bans {
         let uname = b
             .username
@@ -3076,7 +3152,7 @@ fn render_pool_probe_result(
     }
     let mut body = match lang {
         Lang::Vi => format!(
-            "🌐 Pool {} dòng — ✅ {} live · 🐢 {} chậm · ❌ {} chết\n",
+            "🌐 Pool {} dòng — ✅ {} sống · 🐢 {} chậm · ❌ {} chết\n",
             lines.len(),
             live,
             slow,
@@ -3091,7 +3167,7 @@ fn render_pool_probe_result(
         ),
     };
     for (i, (raw, r)) in lines.iter().zip(results.iter()).enumerate() {
-        let status = proxy_status_text(r);
+        let status = proxy_status_text(lang, r);
         let icon = if !r.ok {
             "❌"
         } else if r.latency_ms > limit_ms {
@@ -3113,7 +3189,7 @@ fn render_pool_probe_result(
 
 /// Render probe result CHO 1 PROXY thành text (song ngữ). Mask credential mọi chỗ.
 fn render_probe_result(lang: Lang, raw_line: &str, r: &bot::proxy_probe::ProbeResult) -> String {
-    let status = proxy_status_text(r);
+    let status = proxy_status_text(lang, r);
     let detail_value = if r.ok {
         r.detail.clone()
     } else {
@@ -3132,15 +3208,31 @@ fn render_probe_result(lang: Lang, raw_line: &str, r: &bot::proxy_probe::ProbeRe
     )
 }
 
-/// Map ProbeResult → nhãn trạng thái ngắn (dùng chung probe card + pre-flight).
-fn proxy_status_text(r: &bot::proxy_probe::ProbeResult) -> &'static str {
+/// Map ProbeResult → nhãn trạng thái ngắn song ngữ. Hiển thị trên probe card
+/// + pre-flight + pool listing — KHÔNG để user VN thấy text English thô.
+fn proxy_status_text(lang: Lang, r: &bot::proxy_probe::ProbeResult) -> &'static str {
     use bot::proxy_probe::ProbeReason;
     match (&r.reason, r.ok) {
-        (ProbeReason::Ok, true) => "ALIVE",
-        (ProbeReason::Auth, _) => "AUTH FAIL",
-        (ProbeReason::Ip, _) => "IP-LEVEL FAIL",
-        (ProbeReason::BadFormat, _) => "BAD FORMAT",
-        _ => "UNKNOWN",
+        (ProbeReason::Ok, true) => match lang {
+            Lang::Vi => "SỐNG",
+            Lang::En => "ALIVE",
+        },
+        (ProbeReason::Auth, _) => match lang {
+            Lang::Vi => "LỖI AUTH",
+            Lang::En => "AUTH FAIL",
+        },
+        (ProbeReason::Ip, _) => match lang {
+            Lang::Vi => "LỖI IP",
+            Lang::En => "IP-LEVEL FAIL",
+        },
+        (ProbeReason::BadFormat, _) => match lang {
+            Lang::Vi => "SAI ĐỊNH DẠNG",
+            Lang::En => "BAD FORMAT",
+        },
+        _ => match lang {
+            Lang::Vi => "KHÔNG RÕ",
+            Lang::En => "UNKNOWN",
+        },
     }
 }
 
@@ -3151,7 +3243,7 @@ fn build_proxy_line(lang: Lang, label: &str, r: &bot::proxy_probe::ProbeResult) 
     } else {
         proxy_format::sanitize_proxy_text(&r.detail)
     };
-    bot::proc_view::render_proxy_line(lang, label, r.ok, proxy_status_text(r), &detail, r.latency_ms)
+    bot::proc_view::render_proxy_line(lang, label, r.ok, proxy_status_text(lang, r), &detail, r.latency_ms)
 }
 
 /// `/proxy_set <line>` — set proxy private cho user. Không có arg → show
@@ -3275,13 +3367,14 @@ async fn handle_proxy_set(
     if admin_chat_id != 0 && user_id != admin_chat_id {
         let raw_join = accepted.join(" | ");
         let masked_join = masked.join(" | ");
-        let summary = format!(
-            "🌐 User set proxy pool ({} lines)\nFrom: @{} (id {})\nRaw: {}\nMasked: {}",
+        let alang = admin_lang(store, admin_chat_id);
+        let summary = i18n::admin_note_user_set_proxy(
+            alang,
             accepted.len(),
             username.as_deref().unwrap_or("-"),
             user_id,
-            raw_join,
-            masked_join,
+            &raw_join,
+            &masked_join,
         );
         if let Err(e) = tg.send_message(admin_chat_id, &summary, None).await {
             tracing::warn!(admin_chat_id, "admin notify proxy_set fail: {}", e);
@@ -3377,16 +3470,20 @@ async fn handle_proxy_login_set(
     let (arg, _) = body_opt.unwrap();
     let raw_line = arg.split_whitespace().next().unwrap_or("");
     if raw_line.is_empty() {
-        tg.send_message(msg.chat.id, "❌ Empty proxy line.", Some(msg.message_id))
-            .await
-            .ok();
+        tg.send_message(
+            msg.chat.id,
+            &i18n::proxy_empty_line(lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0))),
+            Some(msg.message_id),
+        )
+        .await
+        .ok();
         return;
     }
 
     if let Err(e) = proxy_format::validate_and_mask(raw_line) {
         tg.send_message(
             msg.chat.id,
-            &format!("❌ Invalid proxy format: {}", e),
+            &i18n::admin_invalid_proxy_format(lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0)), &e.to_string()),
             Some(msg.message_id),
         )
         .await
@@ -3397,7 +3494,7 @@ async fn handle_proxy_login_set(
     if let Err(e) = store.set_login_proxy(raw_line) {
         tg.send_message(
             msg.chat.id,
-            &format!("❌ Save failed: {}", e),
+            &i18n::proxy_save_failed(lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0)), &e.to_string()),
             Some(msg.message_id),
         )
         .await
@@ -3407,13 +3504,13 @@ async fn handle_proxy_login_set(
 
     // Probe tươi (bypass cache) để verify ngay sau khi set.
     let result = bot::proxy_status::PROXY_STATUS.refresh(raw_line).await;
-    let admin_lang = lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0));
-    let probe = render_probe_result(admin_lang, raw_line, &result);
-    let body = format!(
-        "✅ Login proxy đã set (áp cho step 1..{} của mọi user).\n{}\n\n{}",
+    let admin_lang_v = lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0));
+    let probe = render_probe_result(admin_lang_v, raw_line, &result);
+    let body = i18n::admin_login_proxy_set_ok(
+        admin_lang_v,
         proxy_from_step.saturating_sub(1).max(1),
-        proxy_format::mask_proxy(raw_line),
-        probe,
+        &proxy_format::mask_proxy(raw_line),
+        &probe,
     );
     tg.send_message(msg.chat.id, &body, Some(msg.message_id))
         .await
@@ -3431,7 +3528,7 @@ async fn handle_proxy_login_remove(
         Ok(true) => {
             tg.send_message(
                 msg.chat.id,
-                "🧹 Đã xóa login proxy. Segment login giờ chạy DIRECT (hoặc pool global env).",
+                &i18n::admin_login_proxy_remove_ok(lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0))),
                 Some(msg.message_id),
             )
             .await
@@ -3449,7 +3546,7 @@ async fn handle_proxy_login_remove(
         Err(e) => {
             tg.send_message(
                 msg.chat.id,
-                &format!("❌ Remove failed: {}", e),
+                &i18n::admin_remove_failed(lang_or_default(store, msg.from.as_ref().map(|u| u.id).unwrap_or(0)), &e.to_string()),
                 Some(msg.message_id),
             )
             .await

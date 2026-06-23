@@ -29,6 +29,9 @@ pub struct ProcView {
     approve_cur: u32,
     approve_max: u32,
     note: Note,
+    /// Proxy đang dùng cho attempt gần nhất ("direct" = không proxy). Cập nhật
+    /// liên tục theo log "proxy=...". None khi chưa có log nào liên quan proxy.
+    proxy_label: Option<String>,
 }
 
 impl ProcView {
@@ -39,6 +42,7 @@ impl ProcView {
             approve_cur: 0,
             approve_max: 0,
             note: Note::None,
+            proxy_label: None,
         }
     }
 
@@ -72,6 +76,17 @@ impl ProcView {
         if line.contains("[net]") && (line.contains("outage") || line.contains("waiting")) {
             self.note = Note::Network;
         }
+
+        // Parse proxy hiện tại từ log line dạng "... proxy=<value>". Áp dụng
+        // cho approve attempt + cf-warmup → reflect proxy đang dùng cho user.
+        // Lưu rút gọn (cắt query/path) để hiển thị gọn trên card.
+        if let Some(idx) = line.find("proxy=") {
+            let after = &line[idx + "proxy=".len()..];
+            let token = after.split_whitespace().next().unwrap_or("");
+            if !token.is_empty() {
+                self.proxy_label = Some(short_proxy_display(token));
+            }
+        }
     }
 
     fn pct(&self) -> u8 {
@@ -95,12 +110,18 @@ impl ProcView {
     pub fn render_running(&self, lang: Lang, elapsed_s: f64) -> String {
         let bar = progress_bar(self.pct());
         let mut s = format!(
-            "⚡ UPI QR · {}\n{} {}% · ⏱ {}\n\n",
+            "⚡ UPI QR · {}\n{} {}% · ⏱ {}",
             self.email,
             bar,
             self.pct(),
             fmt_elapsed(elapsed_s)
         );
+        // Dòng proxy (Mẫu A) — hiện ngay sau progress bar khi đã có thông tin.
+        if let Some(p) = &self.proxy_label {
+            let label = format_proxy_label(lang, p);
+            s.push_str(&format!("\n{}", label));
+        }
+        s.push_str("\n\n");
         for p in 0..=PHASE_QR {
             let label = phase_label(lang, p);
             let icon = if p < self.phase {
@@ -415,6 +436,39 @@ fn fmt_elapsed(secs: f64) -> String {
         format!("{}s", s)
     } else {
         format!("{}m{:02}s", s / 60, s % 60)
+    }
+}
+
+/// Cắt proxy token cho hiển thị gọn trên card. Strip scheme `http(s)://` +
+/// path/query, chỉ giữ host[:port]. Giữ "direct" nguyên.
+fn short_proxy_display(token: &str) -> String {
+    if token == "direct" {
+        return token.to_string();
+    }
+    // Nếu là URL: cắt scheme + path/query.
+    let stripped = token
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(token);
+    // Nếu có "@" (user:pass@host) — chỉ giữ phần sau @ (mask).
+    let host_part = stripped
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(stripped);
+    // Cắt path/query: lấy phần trước '/'.
+    let host = host_part.split(['/', '?']).next().unwrap_or(host_part);
+    host.to_string()
+}
+
+/// Format dòng proxy hiển thị trên card. "direct" → song ngữ "DIRECT (no proxy)".
+fn format_proxy_label(lang: Lang, raw: &str) -> String {
+    if raw == "direct" {
+        match lang {
+            Lang::Vi => "🌐 DIRECT (không proxy)".to_string(),
+            Lang::En => "🌐 DIRECT (no proxy)".to_string(),
+        }
+    } else {
+        format!("🌐 {}", raw)
     }
 }
 

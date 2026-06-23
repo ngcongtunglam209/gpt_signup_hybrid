@@ -350,23 +350,51 @@ impl TelegramClient {
             .await
     }
 
-    /// Edit message HTML (parse_mode=HTML) + giữ inline keyboard. Dùng cho
-    /// `/board` refresh để cập nhật bảng tiến trình mà không vỡ định dạng.
+    /// Gửi `sendRichMessage` (Bot API 10.1+) — message giàu định dạng với
+    /// `<table>`, `<h1>..<h6>`, `<details>`, `<hr>`, list... Caller PHẢI
+    /// escape mọi giá trị động trước khi nhúng vào `rich_html`.
+    ///
+    /// Telegram render trên client mới (Desktop 6.9+ / mobile mới); client cũ
+    /// hiển thị rút gọn nhưng API vẫn nhận. Khi API trả lỗi (vd Bot API server
+    /// chưa update lên 10.1), trả `Err` để caller log/handle — KHÔNG fallback
+    /// ngầm để tránh che lỗi.
+    pub async fn send_rich_message_kb(
+        &self,
+        chat_id: i64,
+        rich_html: &str,
+        keyboard: Value,
+    ) -> Result<i64> {
+        let url = format!("{}/sendRichMessage", self.base_url);
+        let body = json!({
+            "chat_id": chat_id,
+            "rich_message": { "html": rich_html },
+            "reply_markup": { "inline_keyboard": keyboard },
+        });
+        let resp = self.http.post(&url).json(&body).send().await?;
+        let v: Value = resp.json().await?;
+        if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
+            return Err(anyhow!(
+                "sendRichMessage fail: {}",
+                v.get("description").and_then(|s| s.as_str()).unwrap_or("?")
+            ));
+        }
+        Ok(v["result"]["message_id"].as_i64().unwrap_or(0))
+    }
+
+    /// Edit `rich_message` (Bot API 10.1+) + giữ inline keyboard.
     /// `message is not modified` được coi là OK (no-op).
-    pub async fn edit_message_text_kb_html(
+    pub async fn edit_rich_message_kb(
         &self,
         chat_id: i64,
         message_id: i64,
-        html: &str,
+        rich_html: &str,
         keyboard: Value,
     ) -> Result<()> {
         let url = format!("{}/editMessageText", self.base_url);
         let body = json!({
             "chat_id": chat_id,
             "message_id": message_id,
-            "text": html,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": true,
+            "rich_message": { "html": rich_html },
             "reply_markup": { "inline_keyboard": keyboard },
         });
         let resp = self.http.post(&url).json(&body).send().await?;
@@ -376,7 +404,7 @@ impl TelegramClient {
             if desc.contains("message is not modified") {
                 return Ok(());
             }
-            tracing::debug!("editMessageText(html) warn: {}", desc);
+            tracing::debug!("editMessageText(rich) warn: {}", desc);
         }
         Ok(())
     }

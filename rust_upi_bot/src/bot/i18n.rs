@@ -573,3 +573,554 @@ pub fn toast_unknown_action(lang: Lang) -> String {
 pub fn admin_only(lang: Lang) -> String {
     pick(lang, "⛔ Lệnh chỉ dành cho admin.", "⛔ Admin-only command.")
 }
+
+// ─── Admin notifications (system → admin DM / notify target) ───────────
+
+pub fn admin_note_blocked_proxy_dead(
+    lang: Lang,
+    username: &str,
+    user_id: i64,
+    email: &str,
+    proxy_block: &str,
+) -> String {
+    pick(
+        lang,
+        &format!(
+            "⛔ Job bị chặn (proxy chết)\nTừ: @{} (id {})\nEmail: {}\n{}",
+            username, user_id, email, proxy_block
+        ),
+        &format!(
+            "⛔ Job blocked (proxy down)\nFrom: @{} (id {})\nEmail: {}\n{}",
+            username, user_id, email, proxy_block
+        ),
+    )
+}
+
+pub fn admin_note_new_process(
+    lang: Lang,
+    username: &str,
+    user_id: i64,
+    email: &str,
+    auth_kind: &str,
+    queue_pos: usize,
+) -> String {
+    pick(
+        lang,
+        &format!(
+            "🆕 Tiến trình mới\nTừ: @{} (id {})\nEmail: {}\nNguồn: {}\nHàng chờ: ~{}",
+            username, user_id, email, auth_kind, queue_pos
+        ),
+        &format!(
+            "🆕 New process\nFrom: @{} (id {})\nEmail: {}\nSource: {}\nQueue: ~{}",
+            username, user_id, email, auth_kind, queue_pos
+        ),
+    )
+}
+
+pub fn admin_note_qr_success(
+    lang: Lang,
+    username: &str,
+    user_id: i64,
+    email: &str,
+    elapsed_s: f64,
+) -> String {
+    pick(
+        lang,
+        &format!(
+            "🆕 QR thành công\nTừ: @{} (id {})\nEmail: {}\nThời gian: {:.1}s",
+            username, user_id, email, elapsed_s
+        ),
+        &format!(
+            "🆕 QR success\nFrom: @{} (id {})\nEmail: {}\nElapsed: {:.1}s",
+            username, user_id, email, elapsed_s
+        ),
+    )
+}
+
+pub fn admin_note_user_set_proxy(
+    lang: Lang,
+    line_count: usize,
+    username: &str,
+    user_id: i64,
+    raw: &str,
+    masked: &str,
+) -> String {
+    pick(
+        lang,
+        &format!(
+            "🌐 User đặt pool proxy ({} dòng)\nTừ: @{} (id {})\nRaw: {}\nMasked: {}",
+            line_count, username, user_id, raw, masked
+        ),
+        &format!(
+            "🌐 User set proxy pool ({} lines)\nFrom: @{} (id {})\nRaw: {}\nMasked: {}",
+            line_count, username, user_id, raw, masked
+        ),
+    )
+}
+
+// ─── Admin: /stopall + /flushall ──────────────────────────────────────
+
+pub fn admin_stopall_done(lang: Lang, n: usize) -> String {
+    pick(
+        lang,
+        &format!("🛑 Đã dừng {} tiến trình của tất cả user.", n),
+        &format!("🛑 Stopped {} process(es) across all users.", n),
+    )
+}
+
+pub fn admin_flushall_done(lang: Lang, jobs: usize, cards: usize, buffers: usize) -> String {
+    pick(
+        lang,
+        &format!(
+            "🧹 Đã flush sạch.\n• Job đã hủy: {}\n• Board entries: {}\n• Buffer text đang chờ: {}",
+            jobs, cards, buffers
+        ),
+        &format!(
+            "🧹 Flushed all.\n• Cancelled jobs: {}\n• Board entries cleared: {}\n• Pending text buffers cleared: {}",
+            jobs, cards, buffers
+        ),
+    )
+}
+
+// ─── Admin: /set_notify, /notify_remove, /notify_test ──────────────────
+
+pub fn admin_notify_show_with_topic(lang: Lang, chat_id: i64, thread_id: i64) -> String {
+    pick(
+        lang,
+        &format!(
+            "🔔 Notify hiện tại: chat_id={} · topic={}\n\n\
+             Đặt lại: /set_notify <chat_id> [thread_id] hoặc dán link topic\n\
+             Xóa: /notify_remove · Test: /notify_test",
+            chat_id, thread_id
+        ),
+        &format!(
+            "🔔 Notify target: chat_id={} · topic={}\n\n\
+             Change: /set_notify <chat_id> [thread_id] or paste a topic link\n\
+             Remove: /notify_remove · Test: /notify_test",
+            chat_id, thread_id
+        ),
+    )
+}
+
+pub fn admin_notify_show_root(lang: Lang, chat_id: i64) -> String {
+    pick(
+        lang,
+        &format!(
+            "🔔 Notify hiện tại: chat_id={} (root)\n\n\
+             Đặt lại: /set_notify <chat_id> [thread_id] hoặc dán link topic\n\
+             Xóa: /notify_remove · Test: /notify_test",
+            chat_id
+        ),
+        &format!(
+            "🔔 Notify target: chat_id={} (root)\n\n\
+             Change: /set_notify <chat_id> [thread_id] or paste a topic link\n\
+             Remove: /notify_remove · Test: /notify_test",
+            chat_id
+        ),
+    )
+}
+
+pub fn admin_notify_show_unset(lang: Lang) -> String {
+    pick(
+        lang,
+        "🔔 Notify chưa cấu hình — đang fallback về ADMIN_CHAT_ID (nếu có).\n\n\
+         Cách 1: /set_notify <chat_id> [thread_id]\n\
+         Cách 2: /set_notify <link topic>  (vd https://t.me/c/2123456789/45)\n\n\
+         Mẹo: forward 1 tin nhắn từ topic cho @userinfobot để lấy ID.",
+        "🔔 Notify not configured — falling back to ADMIN_CHAT_ID (if set).\n\n\
+         Way 1: /set_notify <chat_id> [thread_id]\n\
+         Way 2: /set_notify <topic link>  (e.g. https://t.me/c/2123456789/45)\n\n\
+         Tip: forward a message from the topic to @userinfobot to get IDs.",
+    )
+}
+
+pub fn admin_notify_set_bad_format(lang: Lang) -> String {
+    pick(
+        lang,
+        "❌ Sai format. Dùng: /set_notify <chat_id> [thread_id] hoặc dán link topic.",
+        "❌ Wrong format. Use: /set_notify <chat_id> [thread_id] or paste a topic link.",
+    )
+}
+
+pub fn admin_notify_set_probe_text(lang: Lang, chat_id: i64, thread_id: Option<i64>) -> String {
+    pick(
+        lang,
+        &format!(
+            "✅ Notify target đã set bởi admin. chat_id={} thread={:?}",
+            chat_id, thread_id
+        ),
+        &format!(
+            "✅ Notify target set by admin. chat_id={} thread={:?}",
+            chat_id, thread_id
+        ),
+    )
+}
+
+pub fn admin_notify_set_ok(lang: Lang, chat_id: i64, thread_id: Option<i64>) -> String {
+    let topic = thread_id
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| "—".into());
+    pick(
+        lang,
+        &format!(
+            "✅ Đã set notify target: chat_id={} · topic={}\nĐã gửi 1 tin test vào đó.",
+            chat_id, topic
+        ),
+        &format!(
+            "✅ Notify target set: chat_id={} · topic={}\nA test message was sent there.",
+            chat_id, topic
+        ),
+    )
+}
+
+pub fn admin_notify_set_fail(
+    lang: Lang,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    err: &str,
+) -> String {
+    pick(
+        lang,
+        &format!(
+            "⚠️ Đã lưu chat_id={} topic={:?} NHƯNG gửi test FAIL: {}\n\
+             Kiểm tra: bot đã được add vào group/topic + có quyền gửi tin chưa?",
+            chat_id, thread_id, err
+        ),
+        &format!(
+            "⚠️ Saved chat_id={} topic={:?} BUT test send FAILED: {}\n\
+             Check: is the bot added to the group/topic and allowed to post?",
+            chat_id, thread_id, err
+        ),
+    )
+}
+
+pub fn admin_notify_remove_ok(lang: Lang) -> String {
+    pick(
+        lang,
+        "🗑 Đã xóa notify target. Quay lại fallback ADMIN_CHAT_ID (nếu có).",
+        "🗑 Notify target removed. Falling back to ADMIN_CHAT_ID (if set).",
+    )
+}
+
+pub fn admin_notify_remove_none(lang: Lang) -> String {
+    pick(
+        lang,
+        "ℹ️ Chưa có notify target nào để xóa.",
+        "ℹ️ No notify target to remove.",
+    )
+}
+
+pub fn admin_notify_remove_db_err(lang: Lang) -> String {
+    pick(
+        lang,
+        "❌ Lỗi DB khi xóa notify target.",
+        "❌ DB error while removing notify target.",
+    )
+}
+
+pub fn admin_notify_test_unset(lang: Lang) -> String {
+    pick(
+        lang,
+        "ℹ️ Chưa có notify target. Dùng /set_notify hoặc set ADMIN_CHAT_ID.",
+        "ℹ️ No notify target. Use /set_notify or set ADMIN_CHAT_ID.",
+    )
+}
+
+pub fn admin_notify_test_body(
+    lang: Lang,
+    chat_id: i64,
+    thread_id: Option<i64>,
+    clock: &str,
+) -> String {
+    pick(
+        lang,
+        &format!(
+            "🧪 Test notify\nchat_id={} thread={:?}\nThời gian: {}",
+            chat_id, thread_id, clock
+        ),
+        &format!(
+            "🧪 Test notify\nchat_id={} thread={:?}\nTime: {}",
+            chat_id, thread_id, clock
+        ),
+    )
+}
+
+pub fn admin_notify_test_ok(lang: Lang, chat_id: i64, thread_id: Option<i64>) -> String {
+    let topic = thread_id
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| "—".into());
+    pick(
+        lang,
+        &format!("✅ Gửi test OK vào chat_id={} topic={}", chat_id, topic),
+        &format!("✅ Test sent OK to chat_id={} topic={}", chat_id, topic),
+    )
+}
+
+pub fn admin_notify_test_fail(lang: Lang, err: &str) -> String {
+    pick(
+        lang,
+        &format!("❌ Gửi test FAIL: {}", err),
+        &format!("❌ Test send FAILED: {}", err),
+    )
+}
+
+// ─── Admin: /ban + /unban + /banlist ───────────────────────────────────
+
+pub fn admin_ban_usage(lang: Lang) -> String {
+    pick(
+        lang,
+        "Cách dùng: /ban <@username | id> [lý do]\nVD: /ban @vippro  ·  /ban 2314324",
+        "Usage: /ban <@username | id> [reason]\nE.g.: /ban @vippro  ·  /ban 2314324",
+    )
+}
+
+pub fn admin_ban_cant_ban_admin(lang: Lang) -> String {
+    pick(lang, "⚠️ Không thể ban admin.", "⚠️ Cannot ban the admin.")
+}
+
+pub fn admin_unban_usage(lang: Lang) -> String {
+    pick(
+        lang,
+        "Cách dùng: /unban <@username | id>",
+        "Usage: /unban <@username | id>",
+    )
+}
+
+pub fn admin_banlist_empty(lang: Lang) -> String {
+    pick(lang, "✅ Không có user nào bị ban.", "✅ No users are banned.")
+}
+
+// ─── Admin: /chat + /notify ────────────────────────────────────────────
+
+pub fn admin_notify_broadcast_usage(lang: Lang) -> String {
+    pick(
+        lang,
+        "Cách dùng: /notify <nội dung>\n(Hỗ trợ xuống dòng + format chữ.)",
+        "Usage: /notify <message>\n(Supports line breaks + text formatting.)",
+    )
+}
+
+pub fn admin_notify_broadcast_start(lang: Lang, total: usize) -> String {
+    pick(
+        lang,
+        &format!("📢 Đang broadcast tới {} user...", total),
+        &format!("📢 Broadcasting to {} users...", total),
+    )
+}
+
+pub fn admin_notify_broadcast_done(lang: Lang, ok: usize, fail: usize, pruned: usize) -> String {
+    pick(
+        lang,
+        &format!(
+            "✅ Broadcast xong\nGửi OK: {}\nThất bại: {}\nPrune user đã chặn bot: {}",
+            ok, fail, pruned
+        ),
+        &format!(
+            "✅ Broadcast done\nSent OK: {}\nFailed: {}\nPruned users who blocked the bot: {}",
+            ok, fail, pruned
+        ),
+    )
+}
+
+pub fn admin_chat_usage_short(lang: Lang) -> String {
+    pick(
+        lang,
+        "Cách dùng: /chat <@username | id> <nội dung>",
+        "Usage: /chat <@username | id> <message>",
+    )
+}
+
+pub fn admin_chat_usage_long(lang: Lang) -> String {
+    pick(
+        lang,
+        "Cách dùng: /chat <@username | id> <nội dung>\nVD: /chat @vippro hello  ·  /chat 2314324 QR đã sẵn sàng",
+        "Usage: /chat <@username | id> <message>\nE.g.: /chat @vippro hello  ·  /chat 2314324 your QR is ready",
+    )
+}
+
+pub fn admin_chat_empty_message(lang: Lang) -> String {
+    pick(
+        lang,
+        "❌ Tin nhắn rỗng. Cách dùng: /chat <@username | id> <nội dung>",
+        "❌ Empty message. Usage: /chat <@username | id> <message>",
+    )
+}
+
+// ─── Admin: /proxy_login_set + /proxy_login_remove ────────────────────
+
+pub fn admin_login_proxy_set_ok(
+    lang: Lang,
+    upper_step: u32,
+    masked: &str,
+    probe_card: &str,
+) -> String {
+    pick(
+        lang,
+        &format!(
+            "✅ Login proxy đã set (áp cho step 1..{} của mọi user).\n{}\n\n{}",
+            upper_step, masked, probe_card
+        ),
+        &format!(
+            "✅ Login proxy set (applied to step 1..{} for all users).\n{}\n\n{}",
+            upper_step, masked, probe_card
+        ),
+    )
+}
+
+pub fn admin_login_proxy_remove_ok(lang: Lang) -> String {
+    pick(
+        lang,
+        "🧹 Đã xóa login proxy. Segment login giờ chạy DIRECT (hoặc pool global env).",
+        "🧹 Login proxy removed. Login segment now runs DIRECT (or env global pool).",
+    )
+}
+
+// ─── Admin: generic action results ────────────────────────────────────
+
+pub fn admin_user_list_read_err(lang: Lang, err: &str) -> String {
+    pick(
+        lang,
+        &format!("❌ Không đọc được danh sách user: {}", err),
+        &format!("❌ Could not read user list: {}", err),
+    )
+}
+
+pub fn admin_username_resolve_err(lang: Lang, err: &str) -> String {
+    pick(
+        lang,
+        &format!("❌ Lỗi resolve username: {}", err),
+        &format!("❌ Username resolve error: {}", err),
+    )
+}
+
+pub fn admin_username_not_seen_chat(lang: Lang, username: &str) -> String {
+    pick(
+        lang,
+        &format!(
+            "❌ Chưa thấy @{} kết nối bot — không resolve được user_id.\n\
+             Dùng id số nếu biết: /chat <id> <nội dung>",
+            username
+        ),
+        &format!(
+            "❌ Haven't seen @{} connect to the bot — cannot resolve user_id.\n\
+             Use the numeric id if you know it: /chat <id> <message>",
+            username
+        ),
+    )
+}
+
+pub fn admin_username_not_seen_ban(lang: Lang, username: &str) -> String {
+    pick(
+        lang,
+        &format!(
+            "❌ Chưa thấy @{} kết nối bot — không resolve được user_id.\n\
+             Ban theo id số nếu biết: /ban <id> [lý do]",
+            username
+        ),
+        &format!(
+            "❌ Haven't seen @{} connect to the bot — cannot resolve user_id.\n\
+             Ban by numeric id if you know it: /ban <id> [reason]",
+            username
+        ),
+    )
+}
+
+pub fn admin_msg_sent(lang: Lang, target_id: i64, uname_disp: &str) -> String {
+    pick(
+        lang,
+        &format!("✅ Đã gửi tin tới user_id {}{}.", target_id, uname_disp),
+        &format!("✅ Message sent to user_id {}{}.", target_id, uname_disp),
+    )
+}
+
+pub fn admin_send_failed(lang: Lang, hint: &str, err: &str) -> String {
+    pick(
+        lang,
+        &format!("❌ Gửi thất bại{}: {}", hint, err),
+        &format!("❌ Send failed{}: {}", hint, err),
+    )
+}
+
+pub fn admin_ban_failed(lang: Lang, err: &str) -> String {
+    pick(
+        lang,
+        &format!("❌ Ban thất bại: {}", err),
+        &format!("❌ Ban failed: {}", err),
+    )
+}
+
+pub fn admin_user_id_not_found(lang: Lang, token: &str) -> String {
+    pick(
+        lang,
+        &format!("❌ Không tìm thấy user_id cho '{}'.", token),
+        &format!("❌ Could not find user_id for '{}'.", token),
+    )
+}
+
+pub fn admin_unban_ok(lang: Lang, target_id: i64) -> String {
+    pick(
+        lang,
+        &format!("✅ Đã gỡ ban user_id {}.", target_id),
+        &format!("✅ Unbanned user_id {}.", target_id),
+    )
+}
+
+pub fn admin_unban_failed(lang: Lang, err: &str) -> String {
+    pick(
+        lang,
+        &format!("❌ Gỡ ban thất bại: {}", err),
+        &format!("❌ Unban failed: {}", err),
+    )
+}
+
+pub fn admin_banlist_read_err(lang: Lang, err: &str) -> String {
+    pick(
+        lang,
+        &format!("❌ Không đọc được danh sách ban: {}", err),
+        &format!("❌ Could not read ban list: {}", err),
+    )
+}
+
+pub fn admin_banlist_header(lang: Lang, count: usize) -> String {
+    pick(
+        lang,
+        &format!("🚫 User bị ban ({}):\n", count),
+        &format!("🚫 Banned users ({}):\n", count),
+    )
+}
+
+pub fn admin_ban_ok(
+    lang: Lang,
+    target_id: i64,
+    uname_disp: &str,
+    reason_disp: &str,
+    stopped: usize,
+) -> String {
+    pick(
+        lang,
+        &format!(
+            "🚫 Đã ban user_id {}{}{}\nĐã dừng {} job đang chạy của user.",
+            target_id, uname_disp, reason_disp, stopped
+        ),
+        &format!(
+            "🚫 Banned user_id {}{}{}\nStopped {} running job(s) of the user.",
+            target_id, uname_disp, reason_disp, stopped
+        ),
+    )
+}
+
+pub fn admin_invalid_proxy_format(lang: Lang, err: &str) -> String {
+    pick(
+        lang,
+        &format!("❌ Format proxy không hợp lệ: {}", err),
+        &format!("❌ Invalid proxy format: {}", err),
+    )
+}
+
+pub fn admin_remove_failed(lang: Lang, err: &str) -> String {
+    pick(
+        lang,
+        &format!("❌ Xóa thất bại: {}", err),
+        &format!("❌ Remove failed: {}", err),
+    )
+}
