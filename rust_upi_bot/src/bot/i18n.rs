@@ -327,6 +327,90 @@ pub fn status_online(lang: Lang) -> String {
     pick(lang, "✅ Bot đang hoạt động.", "✅ Bot online.")
 }
 
+// ─── /2fa — lấy mã TOTP ───────────────────────────────────────────────
+
+pub fn twofa_usage(lang: Lang) -> String {
+    pick(
+        lang,
+        "🔐 Lấy mã 2FA (TOTP).\n\n\
+         Cách dùng:\n\
+         • <code>/2fa SECRET</code> — dán secret base32\n\
+         • <code>/2fa email|password|secret</code> — bot tự tách secret\n\n\
+         Bot sẽ hiện mã 6 số + thời gian còn hạn, kèm nút 🔄 để lấy mã mới.",
+        "🔐 Get a 2FA (TOTP) code.\n\n\
+         Usage:\n\
+         • <code>/2fa SECRET</code> — paste a base32 secret\n\
+         • <code>/2fa email|password|secret</code> — bot extracts the secret\n\n\
+         The bot shows the 6-digit code + time left, with a 🔄 button for a fresh code.",
+    )
+}
+
+pub fn twofa_invalid(lang: Lang, err: &str) -> String {
+    pick(
+        lang,
+        &format!("❌ Secret 2FA không hợp lệ: {}\n\nGõ /2fa để xem hướng dẫn.", err),
+        &format!("❌ Invalid 2FA secret: {}\n\nType /2fa for usage.", err),
+    )
+}
+
+/// Card hiển thị mã 2FA — mã mono (tap-copy) + đếm ngược cửa sổ 30s. `secs_left`
+/// là số giây còn lại tại thời điểm sinh mã. `updated` = giờ VN HH:MM:SS.
+pub fn twofa_card(lang: Lang, code: &str, secs_left: u64, updated: &str) -> String {
+    // Thanh đếm ngược trực quan theo 30s (mỗi ô ~3s).
+    let total = 30u64;
+    let cells = 10usize;
+    let filled = ((secs_left.min(total) as f64 / total as f64) * cells as f64).round() as usize;
+    let filled = filled.min(cells);
+    let mut bar = String::with_capacity(cells * 3);
+    for _ in 0..filled {
+        bar.push('🟩');
+    }
+    for _ in filled..cells {
+        bar.push('⬛');
+    }
+    // Mã hiển thị dạng "123 456" cho dễ đọc nhưng <code> vẫn copy nguyên 6 số.
+    let pretty = if code.len() == 6 {
+        format!("{} {}", &code[..3], &code[3..])
+    } else {
+        code.to_string()
+    };
+    pick(
+        lang,
+        &format!(
+            "🔐 <b>Mã 2FA</b>\n\n<code>{}</code>   (<code>{}</code>)\n{}\n⏳ Còn <b>{}s</b> · 🕒 {}",
+            crate::bot::board::html_escape(&pretty),
+            crate::bot::board::html_escape(code),
+            bar,
+            secs_left,
+            crate::bot::board::html_escape(updated)
+        ),
+        &format!(
+            "🔐 <b>2FA code</b>\n\n<code>{}</code>   (<code>{}</code>)\n{}\n⏳ <b>{}s</b> left · 🕒 {}",
+            crate::bot::board::html_escape(&pretty),
+            crate::bot::board::html_escape(code),
+            bar,
+            secs_left,
+            crate::bot::board::html_escape(updated)
+        ),
+    )
+}
+
+pub fn btn_2fa_reload(lang: Lang) -> String {
+    pick(lang, "🔄 Lấy mã mới", "🔄 New code")
+}
+
+pub fn toast_2fa_reloaded(lang: Lang) -> String {
+    pick(lang, "Đã cập nhật mã", "Code refreshed")
+}
+
+pub fn toast_2fa_expired(lang: Lang) -> String {
+    pick(
+        lang,
+        "Phiên đã cũ — gõ lại /2fa",
+        "Session too old — send /2fa again",
+    )
+}
+
 /// Báo cho user thường khi gõ /board: tiến trình hiển thị tự động ở dashboard.
 pub fn dashboard_auto_note(lang: Lang) -> String {
     pick(
@@ -572,11 +656,11 @@ pub fn admin_note_qr_success(
     pick(
         lang,
         &format!(
-            "🆕 QR thành công\nTừ: @{} (id {})\nEmail: {}\nThời gian: {:.1}s",
+            "✅ QR thành công\nTừ: @{} (id {})\nEmail: {}\nThời gian: {:.1}s",
             username, user_id, email, elapsed_s
         ),
         &format!(
-            "🆕 QR success\nFrom: @{} (id {})\nEmail: {}\nElapsed: {:.1}s",
+            "✅ QR success\nFrom: @{} (id {})\nEmail: {}\nElapsed: {:.1}s",
             username, user_id, email, elapsed_s
         ),
     )

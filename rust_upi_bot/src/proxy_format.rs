@@ -5,10 +5,12 @@
 //! raw line/template để hỗ trợ rotate sticky session.
 //!
 //! Format hỗ trợ:
-//!   - `host:port`                       → `http://host:port` (no-auth)
-//!   - `host:port:user:pass`             → `http://user:pass@host:port`
-//!   - `host:port:user`                  → `http://user@host:port` (pass rỗng)
-//!   - `scheme://user:pass@host:port`    → giữ nguyên (URL form, backward-compat)
+//!   - `host:port`                            → `http://host:port` (no-auth)
+//!   - `host:port:user:pass`                  → `http://user:pass@host:port`
+//!   - `host:port:user`                       → `http://user@host:port` (pass rỗng)
+//!   - `scheme://user:pass@host:port`         → giữ nguyên (URL form chuẩn)
+//!   - `scheme://host:port:user:pass`         → `scheme://user:pass@host:port`
+//!     (scheme + colon-form, phổ biến với mobile proxy: socks5://host:port:user:pass)
 //!
 //! Placeholder `{SID}` / `{sid}` (case-insensitive) ở user và/hoặc pass được
 //! thay bằng **cùng 1 SID** ngẫu nhiên mỗi lần materialize → 1 base line =
@@ -86,9 +88,42 @@ pub fn materialize_proxy(line: &str, sid_len: usize) -> Result<String> {
         line.to_string()
     };
 
-    // URL form: caller tự chuẩn → giữ nguyên (không re-encode để khỏi double-quote).
-    if line.contains("://") {
-        return Ok(line);
+    // URL form: `scheme://...`
+    //
+    // 3 nhánh phân biệt qua heuristic "phần sau `@` cuối là host:port":
+    //   1) URL form chuẩn `scheme://[user[:pass]@]host:port` (port toàn digit)
+    //      → passthrough (caller tự chuẩn, không re-encode).
+    //   2) Body ≤1 dấu `:` và không có `@` → URL form no-auth `scheme://host[:port]`
+    //      → passthrough.
+    //   3) Còn lại → scheme + colon-form `scheme://host:port:user[:pass]`
+    //      (mobile proxy provider format, kể cả khi pass chứa `@`)
+    //      → parse body theo colon-form bằng đệ quy, re-prepend scheme.
+    if let Some((scheme, body)) = line.split_once("://") {
+        // Branch 1: URL form chuẩn — phần sau '@' cuối phải là host:port.
+        if let Some(at_pos) = body.rfind('@') {
+            let after_at = &body[at_pos + 1..];
+            if let Some(colon) = after_at.rfind(':') {
+                let host = &after_at[..colon];
+                let port = &after_at[colon + 1..];
+                if !host.is_empty()
+                    && !port.is_empty()
+                    && port.chars().all(|c| c.is_ascii_digit())
+                {
+                    return Ok(line);
+                }
+            }
+        }
+        // Branch 2: URL form no-auth.
+        if !body.contains('@') && body.matches(':').count() <= 1 {
+            return Ok(line);
+        }
+        // Branch 3: scheme + colon-form. Body không còn `://` nên đệ quy
+        // sẽ rơi vào colon-split path bên dưới và trả `http://user:pass@host:port`.
+        let parsed = materialize_proxy(body, sid_len)?;
+        let stripped = parsed.strip_prefix("http://").ok_or_else(|| {
+            anyhow!("internal: colon-form materialize did not yield http:// prefix")
+        })?;
+        return Ok(format!("{}://{}", scheme, stripped));
     }
 
     // ── Credential-at form: `[user[:pass]@]host:port` ──────────────────────
@@ -318,5 +353,85 @@ mod tests {
         let url = materialize_proxy("h:80:u:p@ss", 8).unwrap();
         assert!(url.contains("p%40ss"));
         assert!(url.starts_with("http://u:"));
+    }
+
+    // ── Scheme + colon-form tests (mobile proxy provider format) ─────────
+    #[test]
+    fn scheme_colon_form_socks5() {
+        // socks5://host:port:user:pass — format phổ biến với mobile proxies
+        // (LightningProxies, ProxyMesh, ...)
+        let url = materialize_proxy(
+            "socks5://mobile.lightningproxies.net:1080:user123:pass456",
+            8,
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "socks5://user123:pass456@mobile.lightningproxies.net:1080"
+        );
+    }
+
+    #[test]
+    fn scheme_colon_form_http() {
+        let url = materialize_proxy("http://h:80:u:p", 8).unwrap();
+        assert_eq!(url, "http://u:p@h:80");
+    }
+
+    #[test]
+    fn scheme_colon_form_no_auth_passthrough() {
+        // socks5://host:port (no creds) → passthrough, không nhầm là colon-form
+        let url = materialize_proxy("socks5://1.2.3.4:1080", 8).unwrap();
+        assert_eq!(url, "socks5://1.2.3.4:1080");
+    }
+
+    #[test]
+    fn scheme_colon_form_with_sid() {
+        let url = materialize_proxy("socks5://h:1080:user-{sid}:pass-{sid}", 8).unwrap();
+        assert!(url.starts_with("socks5://user-"));
+        assert!(url.ends_with("@h:1080"));
+        // SID phải đồng nhất giữa user và pass
+        let creds = url
+            .strip_prefix("socks5://")
+            .unwrap()
+            .split_once('@')
+            .unwrap()
+            .0;
+        let (user, pass) = creds.split_once(':').unwrap();
+        let sid_user = user.strip_prefix("user-").unwrap();
+        let sid_pass = pass.strip_prefix("pass-").unwrap();
+        assert_eq!(sid_user, sid_pass);
+        assert_eq!(sid_user.len(), 8);
+    }
+
+    #[test]
+    fn scheme_colon_form_lightning_proxy_real_input() {
+        // Input thật từ user: socks5://host:port:user:pass với user/pass dài
+        let line = "socks5://mobile.lightningproxies.net:1080:skN2agsUhCeu35_lightning_proxy-country-in-type-mobile-sid-z4hd5oe384h-ttl-30m:msh0isi4yr";
+        let url = materialize_proxy(line, 8).unwrap();
+        assert_eq!(
+            url,
+            "socks5://skN2agsUhCeu35_lightning_proxy-country-in-type-mobile-sid-z4hd5oe384h-ttl-30m:msh0isi4yr@mobile.lightningproxies.net:1080"
+        );
+    }
+
+    #[test]
+    fn scheme_url_form_still_passthrough() {
+        // URL form chuẩn vẫn phải passthrough (regression check)
+        let s = "socks5://u:p@h:1080";
+        assert_eq!(materialize_proxy(s, 8).unwrap(), s);
+    }
+
+    #[test]
+    fn materialize_for_client_normalizes_socks5_to_socks5h() {
+        // End-to-end: scheme + colon form + normalize_socks
+        let url = materialize_for_client(
+            "socks5://mobile.lightningproxies.net:1080:user:pass",
+            8,
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "socks5h://user:pass@mobile.lightningproxies.net:1080"
+        );
     }
 }

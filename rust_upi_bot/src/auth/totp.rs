@@ -73,6 +73,18 @@ pub fn now_code(secret: &str) -> Result<String> {
     generate_code_at(secret, t)
 }
 
+/// Generate code hiện tại + số giây còn lại trong cửa sổ 30s (cho hiển thị
+/// đếm ngược). Trả `(code, secs_left)` với `secs_left` ∈ [1, 30].
+pub fn now_code_with_ttl(secret: &str) -> Result<(String, u64)> {
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| anyhow!("system clock before epoch: {}", e))?
+        .as_secs();
+    let code = generate_code_at(secret, t)?;
+    let secs_left = STEP_SECONDS - (t % STEP_SECONDS);
+    Ok((code, secs_left))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

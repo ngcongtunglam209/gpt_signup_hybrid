@@ -230,6 +230,7 @@ fn localized_commands(lang: Lang, is_admin: bool) -> Vec<(&'static str, &'static
             ("cancel", "Xóa bộ đệm văn bản đang chờ"),
             ("proxy_set", "Đặt proxy riêng của bạn"),
             ("proxy_remove", "Xóa proxy của bạn"),
+            ("2fa", "Lấy mã 2FA (TOTP)"),
             ("settings", "Cài đặt"),
             ("language", "Đổi ngôn ngữ"),
             ("help", "Trợ giúp"),
@@ -242,6 +243,7 @@ fn localized_commands(lang: Lang, is_admin: bool) -> Vec<(&'static str, &'static
             ("cancel", "Clear pending text buffer"),
             ("proxy_set", "Set your own proxy"),
             ("proxy_remove", "Remove your proxy"),
+            ("2fa", "Get a 2FA (TOTP) code"),
             ("settings", "Settings"),
             ("language", "Change language"),
             ("help", "Help"),
@@ -440,6 +442,7 @@ async fn main() -> Result<()> {
         ("language", "Language / Ngôn ngữ"),
         ("proxy_set", "Set your own proxy"),
         ("proxy_remove", "Remove your proxy"),
+        ("2fa", "Get a 2FA (TOTP) code"),
         ("help", "Show help"),
     ];
     if let Err(e) = tg.set_my_commands(bot_commands).await {
@@ -455,6 +458,7 @@ async fn main() -> Result<()> {
             ("cancel", "Clear pending text buffer"),
             ("proxy_set", "Set your own proxy"),
             ("proxy_remove", "Remove your proxy"),
+            ("2fa", "Get a 2FA (TOTP) code"),
             ("help", "Show help"),
             ("notify", "Broadcast to all users (admin)"),
             ("chat", "Direct message a user (admin)"),
@@ -748,6 +752,10 @@ async fn handle_message(
             }
             "/proxy_remove" => {
                 handle_proxy_remove(&tg, &store, &msg, user_id, lang).await;
+                return Ok(());
+            }
+            "/2fa" => {
+                handle_2fa(&tg, &msg, text, lang).await;
                 return Ok(());
             }
             _ => {}
@@ -1750,6 +1758,63 @@ fn now_hms() -> String {
         .to_string()
 }
 
+/// Tách secret TOTP từ input của `/2fa`: nếu là combo `email|pass|secret` →
+/// lấy field thứ 3; ngược lại coi cả chuỗi là secret. Normalize + validate
+/// base32 (qua `totp::normalize_secret`). Trả secret đã chuẩn hoá hoặc Err.
+fn extract_totp_secret(input: &str) -> Result<String> {
+    let raw = if input.contains('|') {
+        input.split('|').nth(2).map(|s| s.trim()).unwrap_or("")
+    } else {
+        input.trim()
+    };
+    crate::auth::totp::normalize_secret(raw)
+}
+
+/// Build (html, keyboard) cho card 2FA từ secret đã normalize. Nút 🔄 mang
+/// theo secret trong `callback_data` (giới hạn 64 byte Telegram) để regenerate
+/// khi bấm — secret quá dài thì bỏ nút (user gõ lại /2fa).
+fn build_2fa_view(secret: &str, lang: Lang) -> (String, Value) {
+    let (code, secs_left) = crate::auth::totp::now_code_with_ttl(secret)
+        .unwrap_or_else(|_| ("------".to_string(), 0));
+    let html = i18n::twofa_card(lang, &code, secs_left, &now_hms());
+    let cb = format!("2fa:{}", secret);
+    let kb = if cb.len() <= 64 {
+        serde_json::json!([[{
+            "text": i18n::btn_2fa_reload(lang),
+            "callback_data": cb,
+        }]])
+    } else {
+        Value::Array(vec![])
+    };
+    (html, kb)
+}
+
+/// `/2fa <secret | email|pass|secret>` — sinh mã TOTP hiện tại + đếm ngược +
+/// nút 🔄 lấy mã mới. Mọi user dùng được (không cần whitelist riêng).
+async fn handle_2fa(tg: &Arc<TelegramClient>, msg: &Message, text: &str, lang: Lang) {
+    let Some((arg, _)) = command_body(text) else {
+        tg.send_message_kb_html(msg.chat.id, &i18n::twofa_usage(lang), Value::Array(vec![]))
+            .await
+            .ok();
+        return;
+    };
+    match extract_totp_secret(arg) {
+        Ok(secret) => {
+            let (html, kb) = build_2fa_view(&secret, lang);
+            tg.send_message_kb_html(msg.chat.id, &html, kb).await.ok();
+        }
+        Err(e) => {
+            tg.send_message_kb_html(
+                msg.chat.id,
+                &i18n::twofa_invalid(lang, &e.to_string()),
+                Value::Array(vec![]),
+            )
+            .await
+            .ok();
+        }
+    }
+}
+
 /// Đích nhận thông báo "QR success" / "tiến trình mới" / "user set proxy".
 /// Ưu tiên `notify.chat_id` admin tự cấu hình (có thể là supergroup/topic),
 /// fallback về `--admin-chat-id` (DM admin) khi chưa set. None = tắt thông báo.
@@ -2406,6 +2471,29 @@ async fn handle_callback(
             send_welcome(&tg, chat_id, 0, l).await;
         } else {
             tg.answer_callback_query(&cb.id, None).await.ok();
+        }
+        return Ok(());
+    }
+
+    // Reload mã 2FA — callback `2fa:<secret>`. Regenerate mã + đếm ngược, edit
+    // tại chỗ. Secret nằm trong callback_data (≤64 byte) nên không cần state.
+    if let Some(secret) = data.strip_prefix("2fa:") {
+        let message_id = cb.message.as_ref().map(|m| m.message_id).unwrap_or(0);
+        match crate::auth::totp::normalize_secret(secret) {
+            Ok(norm) => {
+                let (html, kb) = build_2fa_view(&norm, lang);
+                if message_id != 0 {
+                    tg.edit_message_kb_html(chat_id, message_id, &html, kb).await.ok();
+                }
+                tg.answer_callback_query(&cb.id, Some(&i18n::toast_2fa_reloaded(lang)))
+                    .await
+                    .ok();
+            }
+            Err(_) => {
+                tg.answer_callback_query(&cb.id, Some(&i18n::toast_2fa_expired(lang)))
+                    .await
+                    .ok();
+            }
         }
         return Ok(());
     }
@@ -3571,6 +3659,7 @@ async fn send_help(
              /board — bảng tiến trình của bạn + nút Dừng\n\
              /proxy_set &lt;line&gt; — đặt proxy riêng của bạn\n\
              /proxy_remove — xóa proxy của bạn\n\
+             /2fa &lt;secret | email|pass|secret&gt; — lấy mã 2FA (TOTP) + nút làm mới\n\
              /settings — cài đặt\n\
              /language — đổi ngôn ngữ\n\
              /help — bảng này\n",
@@ -3585,6 +3674,7 @@ async fn send_help(
              /board — your process board + Stop buttons\n\
              /proxy_set &lt;line&gt; — set your own proxy\n\
              /proxy_remove — remove your proxy\n\
+             /2fa &lt;secret | email|pass|secret&gt; — get a 2FA (TOTP) code + reload button\n\
              /settings — settings\n\
              /language — change language\n\
              /help — this message\n",
