@@ -1234,3 +1234,260 @@ pub fn admin_remove_failed(lang: Lang, err: &str) -> String {
         &format!("❌ Remove failed: {}", err),
     )
 }
+// ─── Proxy: /proxy_check, /login_proxy_check, /proxy_check_user ─────────
+
+/// Header trên cùng cho `/proxy_check` (user xem pool của mình). Đặt trước
+/// pool listing render bởi `render_pool_probe_result`.
+pub fn proxy_check_header_self(lang: Lang) -> String {
+    pick(
+        lang,
+        "🔍 <b>Kiểm tra live pool proxy của bạn</b>\n",
+        "🔍 <b>Live check of your proxy pool</b>\n",
+    )
+}
+
+/// Header cho `/login_proxy_check` (ai cũng xem được pool admin set).
+pub fn login_proxy_check_header(lang: Lang, upper_step: u32) -> String {
+    pick(
+        lang,
+        &format!(
+            "🔐 <b>Kiểm tra live login proxy (admin set)</b>\nÁp cho step 1..{} (login segment).\n",
+            upper_step
+        ),
+        &format!(
+            "🔐 <b>Live check of login proxy pool (admin set)</b>\nApplies to steps 1..{} (login segment).\n",
+            upper_step
+        ),
+    )
+}
+
+/// `/login_proxy_check` khi pool admin chưa được set.
+pub fn login_proxy_check_empty(lang: Lang) -> String {
+    pick(
+        lang,
+        "ℹ️ Admin chưa cấu hình login proxy. Login segment đang chạy DIRECT (hoặc dùng pool global env).",
+        "ℹ️ Admin has not configured a login proxy. Login segment runs DIRECT (or uses the global env pool).",
+    )
+}
+
+/// Usage cho admin `/proxy_check_user` (thiếu target).
+pub fn admin_check_proxy_usage(lang: Lang) -> String {
+    pick(
+        lang,
+        "ℹ️ Cách dùng: <code>/proxy_check_user @username</code> hoặc <code>/proxy_check_user 123456789</code>\n\nXem pool proxy của user (raw — copy được) + check live ngay.",
+        "ℹ️ Usage: <code>/proxy_check_user @username</code> or <code>/proxy_check_user 123456789</code>\n\nShow the user's proxy pool (raw — copy-friendly) + live check.",
+    )
+}
+
+/// Header card kết quả `/proxy_check_user` — gắn trước pool listing.
+/// `uname_disp` là chuỗi như " (@foo)" hoặc rỗng.
+pub fn admin_check_proxy_target_header(lang: Lang, target_id: i64, uname_disp: &str) -> String {
+    pick(
+        lang,
+        &format!(
+            "👤 <b>Pool proxy của user</b>\nuser_id: <code>{}</code>{}\n⚠️ Hiển thị RAW (kèm credential) — chỉ chia sẻ khi cần.\n",
+            target_id, uname_disp
+        ),
+        &format!(
+            "👤 <b>User proxy pool</b>\nuser_id: <code>{}</code>{}\n⚠️ Showing RAW (with credentials) — share carefully.\n",
+            target_id, uname_disp
+        ),
+    )
+}
+
+/// `/proxy_check_user` — user tồn tại nhưng chưa đặt proxy nào.
+pub fn admin_check_proxy_no_proxy(lang: Lang, target_id: i64, uname_disp: &str) -> String {
+    pick(
+        lang,
+        &format!(
+            "ℹ️ User <code>{}</code>{} chưa đặt proxy nào.",
+            target_id, uname_disp
+        ),
+        &format!(
+            "ℹ️ User <code>{}</code>{} has not set any proxy.",
+            target_id, uname_disp
+        ),
+    )
+}
+// ─── max_per_user (global default + per-user override) ────────────────
+
+/// Hiển thị giá trị default global khi admin gõ `/set_max_per_user` không arg.
+/// `overrides` = số user đang có override (để admin biết bao nhiêu người được
+/// nâng quota — chi tiết xem qua /set_user_limit @user).
+pub fn limit_show_global(lang: Lang, current: u32, overrides: usize) -> String {
+    pick(
+        lang,
+        &format!(
+            "🎚 <b>Giới hạn tiến trình đồng thời (default toàn cục)</b>\n\
+             • Hiện tại: <b>{}</b> tiến trình/user\n\
+             • User có override riêng: {}\n\n\
+             Đổi: <code>/set_max_per_user &lt;1-10&gt;</code>\n\
+             Override 1 user: <code>/set_user_limit @user &lt;1-10&gt;</code>",
+            current, overrides
+        ),
+        &format!(
+            "🎚 <b>Concurrent process limit (global default)</b>\n\
+             • Current: <b>{}</b> processes/user\n\
+             • Users with custom override: {}\n\n\
+             Change: <code>/set_max_per_user &lt;1-10&gt;</code>\n\
+             Per-user override: <code>/set_user_limit @user &lt;1-10&gt;</code>",
+            current, overrides
+        ),
+    )
+}
+
+pub fn limit_set_global_ok(lang: Lang, old: u32, new: u32) -> String {
+    pick(
+        lang,
+        &format!(
+            "✅ Đã đổi default toàn cục: <b>{} → {}</b>\nÁp ngay cho user không có override.",
+            old, new
+        ),
+        &format!(
+            "✅ Global default updated: <b>{} → {}</b>\nApplies immediately to users without an override.",
+            old, new
+        ),
+    )
+}
+
+pub fn limit_invalid_range(lang: Lang, given: &str, min: u32, max: u32) -> String {
+    pick(
+        lang,
+        &format!(
+            "❌ Giá trị không hợp lệ: <code>{}</code>\nNhận số nguyên trong khoảng <b>{}..={}</b>.",
+            given, min, max
+        ),
+        &format!(
+            "❌ Invalid value: <code>{}</code>\nExpect integer in range <b>{}..={}</b>.",
+            given, min, max
+        ),
+    )
+}
+
+pub fn limit_user_show(
+    lang: Lang,
+    target_id: i64,
+    uname_disp: &str,
+    override_some: Option<u32>,
+    default_global: u32,
+) -> String {
+    let effective = override_some.unwrap_or(default_global);
+    let override_line = match (lang, override_some) {
+        (Lang::Vi, Some(n)) => format!("• Override riêng: <b>{}</b>", n),
+        (Lang::Vi, None) => "• Override riêng: <i>không (đang dùng default)</i>".to_string(),
+        (Lang::En, Some(n)) => format!("• Custom override: <b>{}</b>", n),
+        (Lang::En, None) => "• Custom override: <i>none (using default)</i>".to_string(),
+    };
+    pick(
+        lang,
+        &format!(
+            "🎚 <b>Giới hạn của user</b>\n\
+             user_id: <code>{}</code>{}\n\
+             {}\n\
+             • Default toàn cục: <b>{}</b>\n\
+             • Hiệu lực: <b>{}</b> tiến trình/user\n\n\
+             Đổi: <code>/set_user_limit {}{} &lt;1-10&gt;</code>\n\
+             Xóa override: <code>/set_user_limit {}{} default</code>",
+            target_id, uname_disp, override_line, default_global, effective,
+            target_id, uname_disp, target_id, uname_disp
+        ),
+        &format!(
+            "🎚 <b>User limit</b>\n\
+             user_id: <code>{}</code>{}\n\
+             {}\n\
+             • Global default: <b>{}</b>\n\
+             • Effective: <b>{}</b> processes/user\n\n\
+             Set: <code>/set_user_limit {}{} &lt;1-10&gt;</code>\n\
+             Clear override: <code>/set_user_limit {}{} default</code>",
+            target_id, uname_disp, override_line, default_global, effective,
+            target_id, uname_disp, target_id, uname_disp
+        ),
+    )
+}
+
+pub fn limit_user_set_ok(lang: Lang, target_id: i64, uname_disp: &str, n: u32) -> String {
+    pick(
+        lang,
+        &format!(
+            "✅ Đã set override cho user <code>{}</code>{}: <b>{}</b> tiến trình.\nÁp ngay cho admit kế tiếp.",
+            target_id, uname_disp, n
+        ),
+        &format!(
+            "✅ Override set for user <code>{}</code>{}: <b>{}</b> processes.\nApplies on next admit.",
+            target_id, uname_disp, n
+        ),
+    )
+}
+
+pub fn limit_user_clear_ok(lang: Lang, target_id: i64, uname_disp: &str, default_global: u32) -> String {
+    pick(
+        lang,
+        &format!(
+            "🗑 Đã xóa override của user <code>{}</code>{}.\nUser này giờ dùng default toàn cục: <b>{}</b>.",
+            target_id, uname_disp, default_global
+        ),
+        &format!(
+            "🗑 Override cleared for user <code>{}</code>{}.\nUser now uses global default: <b>{}</b>.",
+            target_id, uname_disp, default_global
+        ),
+    )
+}
+
+pub fn limit_user_clear_none(lang: Lang, target_id: i64, uname_disp: &str) -> String {
+    pick(
+        lang,
+        &format!(
+            "ℹ️ User <code>{}</code>{} không có override để xóa.",
+            target_id, uname_disp
+        ),
+        &format!(
+            "ℹ️ User <code>{}</code>{} has no override to clear.",
+            target_id, uname_disp
+        ),
+    )
+}
+
+pub fn limit_user_set_usage(lang: Lang) -> String {
+    pick(
+        lang,
+        "ℹ️ Cách dùng:\n\
+         • <code>/set_user_limit @user</code> — xem giới hạn hiện tại\n\
+         • <code>/set_user_limit @user 5</code> — set override (1-10)\n\
+         • <code>/set_user_limit @user default</code> — xóa override (về default toàn cục)",
+        "ℹ️ Usage:\n\
+         • <code>/set_user_limit @user</code> — show current limit\n\
+         • <code>/set_user_limit @user 5</code> — set override (1-10)\n\
+         • <code>/set_user_limit @user default</code> — clear override (back to global default)",
+    )
+}
+
+pub fn my_limit_card(
+    lang: Lang,
+    effective: u32,
+    has_override: bool,
+    default_global: u32,
+) -> String {
+    let source = match (lang, has_override) {
+        (Lang::Vi, true) => "(override admin cấp riêng)",
+        (Lang::Vi, false) => "(default toàn cục)",
+        (Lang::En, true) => "(custom override granted by admin)",
+        (Lang::En, false) => "(global default)",
+    };
+    pick(
+        lang,
+        &format!(
+            "🎚 <b>Giới hạn của bạn</b>\n\
+             • Tối đa: <b>{}</b> tiến trình đồng thời\n\
+             • Default toàn cục: <b>{}</b> {}\n\n\
+             Cần nhiều hơn? Liên hệ admin.",
+            effective, default_global, source
+        ),
+        &format!(
+            "🎚 <b>Your limit</b>\n\
+             • Max: <b>{}</b> concurrent processes\n\
+             • Global default: <b>{}</b> {}\n\n\
+             Need more? Contact admin.",
+            effective, default_global, source
+        ),
+    )
+}

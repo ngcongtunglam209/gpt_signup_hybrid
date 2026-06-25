@@ -174,7 +174,7 @@ class Settings:
     browser_headless: bool = False
     browser_viewport_width: int = 1440
     browser_viewport_height: int = 800
-    browser_use_profile_template: bool = True
+    browser_use_profile_template: bool = False  # anti-ban: fresh profile mỗi reg (journal 260625-1224)
     browser_profile_template_dir: Path = Path("runtime/profiles/template")
     browser_camoufox_profile_dir: Path = Path("runtime/profiles/camoufox_template")
     browser_random_screen: bool = False
@@ -323,7 +323,7 @@ def load_settings(root_dir: Path | None = None, env_file: str | Path = ".env") -
         browser_viewport_width=_parse_int(_lookup(env, "BROWSER_VIEWPORT_WIDTH", "1440"), default=1440),
         browser_viewport_height=_parse_int(_lookup(env, "BROWSER_VIEWPORT_HEIGHT", "800"), default=800),
         browser_use_profile_template=_parse_bool(
-            _lookup(env, "BROWSER_USE_PROFILE_TEMPLATE", "true"), default=True,
+            _lookup(env, "BROWSER_USE_PROFILE_TEMPLATE", "false"), default=False,
         ),
         browser_profile_template_dir=profile_template_dir,
         browser_camoufox_profile_dir=camoufox_profile_dir,

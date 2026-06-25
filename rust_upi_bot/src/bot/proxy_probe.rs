@@ -12,6 +12,8 @@
 
 use crate::proxy_format::materialize_for_client;
 use anyhow::Result;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use reqwest::{Client, Proxy};
 use std::time::{Duration, Instant};
 
@@ -52,19 +54,39 @@ impl ProbeResult {
 }
 
 /// Phân loại reqwest error → reason. Conservative:
-///   - DNS fail / proxy auth → `Auth` (giết line)
-///   - Timeout/reset/refused → `Ip`  (rotate SID)
+///   - DNS fail → `Auth` (giết line)
+///   - Status 401/403/407 hoặc keyword `proxy authentication` / `auth fail` /
+///     `unauthorized` / `forbidden` → `Auth` (provider chối credential).
+///     `auth fail` cụ thể bắt provider non-standard như bestproxy.com trả
+///     `HTTP 612 OK` body `auth fail bp-... ...`.
+///   - Còn lại (timeout/reset/refused/tunnel với mã không phổ biến) → `Ip`
+///     (rotate SID có thể giúp).
+///
+/// Match `\b(401|403|407)\b` qua regex để tránh false-positive với số trùng
+/// trong domain/UUID (vd `port=4011`).
+static AUTH_STATUS_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\b(401|403|407)\b").unwrap());
+
 fn classify(err: &reqwest::Error) -> ProbeReason {
-    let s = err.to_string().to_lowercase();
-    if s.contains("could not resolve")
-        || s.contains("name or service not known")
-        || s.contains("dns error")
+    let s = err.to_string();
+    let lower = s.to_lowercase();
+    if lower.contains("could not resolve")
+        || lower.contains("name or service not known")
+        || lower.contains("dns error")
     {
         return ProbeReason::Auth;
     }
-    if s.contains("407") || s.contains("proxy authentication") {
+    if AUTH_STATUS_RE.is_match(&s)
+        || lower.contains("proxy authentication")
+        || lower.contains("auth fail")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+    {
         return ProbeReason::Auth;
     }
+    // Log full error string → cho phép decode pattern lạ về sau (provider mới
+    // dùng status hoặc keyword chưa cover ở đây).
+    tracing::debug!(error = %s, "proxy probe error classified as IP");
     ProbeReason::Ip
 }
 
@@ -109,7 +131,8 @@ pub async fn probe_proxy_line(raw_line: &str) -> ProbeResult {
                     latency_ms,
                     probed_url: Some(url),
                 }
-            } else if status.as_u16() == 407 {
+            } else if matches!(status.as_u16(), 401 | 403 | 407) {
+                // Auth fail chuẩn HTTP — provider trả 401/403/407 trực tiếp.
                 ProbeResult {
                     ok: false,
                     reason: ProbeReason::Auth,

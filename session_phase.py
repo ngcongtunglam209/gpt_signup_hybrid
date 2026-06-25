@@ -128,6 +128,30 @@ async def _get_session_browser(
         from browser_phase import _ensure_geoip_cache
         _ensure_geoip_cache(settings.runtime_dir, log=log)
 
+    # ── Locale auto-detect theo proxy country (anti-ban Phase 6 Task 6.2) ──
+    # Sync với browser_phase Task 1.4: proxy → ipinfo.io country → locale/tz/geo.
+    # Login flow ít bị ban hơn signup nhưng vẫn cần consistency để tránh CF flag.
+    resolved_locale = "en-US"
+    resolved_timezone = None
+    resolved_geo: tuple[float, float] | None = None
+    if proxy:
+        try:
+            from _geo_locale import resolve_proxy_locale as _resolve_geo
+            auto_locale, auto_tz, auto_geo, auto_cc = _resolve_geo(
+                proxy, timeout=10.0, log=log,
+            )
+            resolved_locale = auto_locale
+            resolved_timezone = auto_tz
+            resolved_geo = auto_geo
+            log(
+                f"[session] proxy locale: country={auto_cc or '?'} "
+                f"locale={resolved_locale} tz={resolved_timezone}"
+            )
+        except Exception as exc:
+            log(f"[session] proxy locale auto-detect failed: {exc}")
+    else:
+        log(f"[session] locale=default {resolved_locale} (no proxy)")
+
     progress = {"password_submitted": False}
 
     def _profile_bundle(engine: str) -> tuple[Any, Any]:
@@ -143,11 +167,24 @@ async def _get_session_browser(
 
     async def _drive_session_flow(ctx: Any, page: Any) -> dict[str, Any]:
         device_id = str(uuid.uuid4())
-        logging_id = str(uuid.uuid4())
+        # auth_session_logging_id: defer gen → đọc cookie `oai-asli` sau khi
+        # load chatgpt.com (sentinel SDK set cookie này). Đảm bảo query param
+        # khớp cookie — anti-ban consistency. Xem journal
+        # `260625-1224-reg-anti-ban-master-plan.md` (Task 1.1, bug C2).
 
         # Step 1: bootstrap
         log("[session] loading chatgpt.com...")
         await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
+
+        from _nextauth_bootstrap import read_oai_asli_from_ctx as _read_asli
+        cookie_logging_id = await _read_asli(ctx)
+        if cookie_logging_id:
+            logging_id = cookie_logging_id
+            log(f"[session] auth_session_logging_id={logging_id} (from oai-asli cookie)")
+        else:
+            logging_id = str(uuid.uuid4())
+            log(f"[session] auth_session_logging_id={logging_id} (gen — cookie missing)")
+
         log("[session] bootstrapping NextAuth...")
         authorize_url = await bootstrap_authorize_url(
             page,
@@ -433,9 +470,12 @@ async def _get_session_browser(
             user_data_dir=str(profile_dir),
             os=list(_CAMOUFOX_OS),
             viewport=viewport,
-            locale="en-US",
+            locale=resolved_locale,
             ignore_https_errors=tls_insecure,
             geoip=bool(proxy),
+            # Anti-detect hardening (Phase 9 audit) — sync với browser_phase
+            block_webrtc=True,
+            humanize=True,
             config=extra_config,
             **screen_kwargs,
             **proxy_kwargs,
@@ -459,13 +499,22 @@ async def _get_session_browser(
         playwright = await async_playwright().start()
         try:
             channel = settings.browser_channel or None
+            chrome_ctx_kwargs: dict[str, Any] = {
+                "user_data_dir": str(profile_dir),
+                "headless": headless,
+                "channel": channel,
+                "viewport": viewport,
+                "locale": resolved_locale,
+                "ignore_https_errors": tls_insecure,
+            }
+            if resolved_timezone:
+                chrome_ctx_kwargs["timezone_id"] = resolved_timezone
+            if resolved_geo:
+                lat, lon = resolved_geo
+                chrome_ctx_kwargs["geolocation"] = {"latitude": lat, "longitude": lon}
+                chrome_ctx_kwargs["permissions"] = ["geolocation"]
             ctx = await playwright.chromium.launch_persistent_context(
-                user_data_dir=str(profile_dir),
-                headless=headless,
-                channel=channel,
-                viewport=viewport,
-                locale="en-US",
-                ignore_https_errors=tls_insecure,
+                **chrome_ctx_kwargs,
                 **proxy_kwargs,
             )
             try:
@@ -1007,6 +1056,16 @@ async def get_session_pure_request(
                             sess.cookies.set("oai-did", did, domain="chatgpt.com")
                         except Exception:
                             pass
+
+                        # Inject `_dd_s` Datadog cookie (anti-ban Phase 6 Task 6.3 + bug M3).
+                        # Browser thật luôn có khi load chatgpt.com — pure_request không
+                        # có Datadog SDK chạy nên phải inject manual.
+                        try:
+                            from _datadog_session import inject_dd_s as _inject_dd_s
+                            _inject_dd_s(sess, domain=".chatgpt.com", rum=0, log=log)
+                        except Exception as _dd_exc:
+                            log(f"[session-req] _dd_s inject failed (continue): {_dd_exc}")
+
                         _warm_ua_headers = {
                             "User-Agent": USER_AGENT,
                             "sec-ch-ua": _SEC_CH_UA,
@@ -1053,11 +1112,17 @@ async def get_session_pure_request(
                         # device_id chuẩn (cookie ↔ ext-oai-did query phải MATCH).
                         did = sess.cookies.get("oai-did", "") or did
                         csrf = _step_csrf(sess, log)
+                        # auth_session_logging_id: đọc cookie `oai-asli` đã set
+                        # sau warming. Browser thật luôn dùng cookie này làm
+                        # query param. Code cũ gen UUID khác cookie → server
+                        # cross-check fail. Xem journal `260625-1224` Task 1.1.
+                        from _nextauth_bootstrap import read_oai_asli_from_session as _read_asli_sync
+                        _asli = _read_asli_sync(sess) or str(__import__('uuid').uuid4())
                         _au_params = {
                             "prompt": "login",
                             "ext-passkey-client-capabilities": "11111",
                             "ext-oai-did": did,
-                            "auth_session_logging_id": str(__import__('uuid').uuid4()),
+                            "auth_session_logging_id": _asli,
                             "screen_hint": "login_or_signup",
                         }
                         if use_login_hint:

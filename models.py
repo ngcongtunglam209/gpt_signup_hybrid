@@ -39,7 +39,15 @@ class SignupRequest(BaseModel):
         description="Giữ browser mở sau khi xong (debug). Chỉ có tác dụng khi headed.",
     )
     off_font: bool = Field(default=False, description="Tắt camoufox font randomization.")
-    profile_template: bool = Field(default=True, description="Clone profile template (cookies, addons).")
+    profile_template: bool = Field(
+        default=False,
+        description=(
+            "Clone profile template (cookies, addons). Mặc định FALSE từ "
+            "anti-ban hardening 2026-06-25 (journal 260625-1224 bug B3). "
+            "Cookies cũ tái dùng giữa account → CF/Sentinel cluster ban. "
+            "Opt-in chỉ cho debug/research."
+        ),
+    )
     tls_insecure: bool = Field(
         default=False,
         description=(
@@ -125,6 +133,34 @@ class SignupRequest(BaseModel):
         description="curl_cffi browser impersonation key (đồng bộ với UA Chrome major).",
     )
     proxy: str | None = Field(default=None, description="HTTP/HTTPS proxy cho cả 2 phase.")
+
+    # Locale + persona (anti-ban — journal 260625-1224 Task 1.4 + 1.6)
+    # ──────────────────────────────────────────────────────────────────
+    # Locale BCP-47 dùng cho:
+    #   - Browser context locale (en-IN/Asia/Kolkata khi proxy India)
+    #   - Random profile name pool (en-IN → tên Ấn, en-US → tên Anglo)
+    # None = auto-detect theo proxy country (Task 1.4 implementation).
+    locale: str | None = Field(
+        default=None,
+        description=(
+            "Locale BCP-47 (vd 'en-IN', 'en-US'). None = auto-detect theo "
+            "proxy country (cần `reg.locale_auto_geo=true`)."
+        ),
+    )
+    timezone: str | None = Field(
+        default=None,
+        description="Timezone IANA (vd 'Asia/Kolkata'). None = auto theo proxy.",
+    )
+
+    # Browser persona (anti-ban Phase 7 Task 7.3)
+    persona: str = Field(
+        default="firefox_mac",
+        description=(
+            "Browser persona name. 'firefox_mac' (default — Camoufox/Firefox 135 Mac) "
+            "hoặc 'chrome_win' (Chrome 145 Windows — chỉ dùng khi engine=chromium). "
+            "Phải khớp với BrowserPersona registry trong user_agent_profile."
+        ),
+    )
 
     # MFA inline — enroll 2FA NGAY trong context vừa tạo account (browser page
     # hoặc curl session còn sống), tái dùng CF clearance + đúng IP. Tránh spawn

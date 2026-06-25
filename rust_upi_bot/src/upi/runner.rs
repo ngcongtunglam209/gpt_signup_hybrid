@@ -23,7 +23,7 @@ use crate::upi::qr::{download_qr_image, render_qr_png};
 use crate::upi::types::{
     ApproveAttemptSummary, ConfirmAttemptSummary, RefreshAttemptSummary, UpiAuth, UpiQrResult,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -115,18 +115,33 @@ fn proxy_for_step<'a>(
     }
 }
 
-fn proxy_for_retry<'a>(
+/// Pick proxy cho approve retry, SKIP các index trong `dead_proxies`.
+/// Trả `(url, idx)` để caller track per-proxy stats. Khi tất cả pool dead
+/// (hoặc step dùng login segment / pool rỗng) → trả `(None, None)` ⇒ caller
+/// chạy DIRECT thay vì block flow.
+fn proxy_for_retry_alive<'a>(
     proxy_pool: &'a [String],
+    dead_proxies: &std::collections::HashSet<usize>,
     from_step: u32,
     step: u32,
     attempt: u32,
     per_proxy: u32,
-) -> Option<&'a str> {
+) -> (Option<&'a str>, Option<usize>) {
     if step < from_step || proxy_pool.is_empty() {
-        return None;
+        return (None, None);
     }
-    let idx = ((attempt.saturating_sub(1)) / per_proxy) as usize % proxy_pool.len();
-    Some(proxy_pool[idx].as_str())
+    let len = proxy_pool.len();
+    if dead_proxies.len() >= len {
+        return (None, None); // ALL dead → DIRECT (không block)
+    }
+    let start = ((attempt.saturating_sub(1)) / per_proxy) as usize % len;
+    for offset in 0..len {
+        let idx = (start + offset) % len;
+        if !dead_proxies.contains(&idx) {
+            return (Some(proxy_pool[idx].as_str()), Some(idx));
+        }
+    }
+    (None, None)
 }
 
 fn is_backend_exception(att: &ApproveAttempt) -> bool {
@@ -249,17 +264,30 @@ async fn payment_page_refresh_with_pool(
     proxy_pool: &[String],
     login_proxy: Option<&str>,
     proxy_from_step: u32,
+    // Index proxy đã được approve loop đánh dấu chết — skip ở đây để không
+    // tốn thời gian retry proxy đã chắc chắn dead. Empty set ⇒ giữ hành vi
+    // cũ (thử full pool).
+    dead_proxies: &HashSet<usize>,
 ) -> crate::upi::endpoints::RefreshAttempt {
     use crate::upi::endpoints::{stripe_payment_page_refresh, RefreshAttempt};
 
     // Khi step 5 < proxy_from_step → segment login (login_proxy / direct).
-    // Khi step 5 >= proxy_from_step → segment work (pool). Pool rỗng = thử 1 lần.
+    // Khi step 5 >= proxy_from_step → segment work (pool). Pool rỗng hoặc
+    // tất cả dead = thử DIRECT 1 lần (không block — đỡ hơn skip refresh hoàn toàn).
     let candidates: Vec<Option<&str>> = if 5 < proxy_from_step {
         vec![login_proxy]
-    } else if proxy_pool.is_empty() {
-        vec![None]
     } else {
-        proxy_pool.iter().map(|s| Some(s.as_str())).collect()
+        let alive: Vec<&str> = proxy_pool
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !dead_proxies.contains(i))
+            .map(|(_, s)| s.as_str())
+            .collect();
+        if alive.is_empty() {
+            vec![None]
+        } else {
+            alive.into_iter().map(Some).collect()
+        }
     };
 
     let mut last: Option<RefreshAttempt> = None;
@@ -408,6 +436,41 @@ pub async fn run_upi_qr(
                             LOGIN_RETRY_DELAY_MS / 1000
                         ));
                         tokio::time::sleep(Duration::from_millis(LOGIN_RETRY_DELAY_MS)).await;
+                    }
+                }
+            }
+            // Tất cả attempts qua login proxy đều fail (non-fatal) → thử 1
+            // attempt cuối cùng DIRECT trước khi declare failure. Áp dụng khi:
+            //   - Đã có dùng proxy (login_proxy.is_some())
+            //   - Không phải lỗi fatal (sai password/MFA/passwordless/...)
+            //   - Vẫn chưa có session
+            // ⇒ Đảm bảo "all proxy die không block process" mở rộng đến login
+            // segment, không chỉ approve loop.
+            if session_opt.is_none() && login_proxy.is_some() {
+                let last_msg = last_err.clone().unwrap_or_default();
+                if !is_fatal_login_error(&last_msg) {
+                    log("[1/6] login   WARN proxy attempts exhausted (non-fatal) → fallback DIRECT 1 attempt");
+                    match crate::auth::login_pure_request(
+                        &cfg.email, password, totp_secret, None, &log,
+                    )
+                    .await
+                    {
+                        Ok(sess) => {
+                            log(&format!(
+                                "[1/6] login   OK   via DIRECT fallback (cookies={})",
+                                sess.cookie_count
+                            ));
+                            session_opt = Some(sess);
+                        }
+                        Err(e) => {
+                            let combined = format!(
+                                "{} | direct fallback also failed: {}",
+                                short_msg(&last_msg, 200),
+                                short_msg(&format!("{}", e), 200)
+                            );
+                            log(&format!("[1/6] login   FAIL {}", combined));
+                            last_err = Some(combined);
+                        }
                     }
                 }
             }
@@ -743,7 +806,9 @@ pub async fn run_upi_qr(
 
         // Step 5c — page refresh trước approve. Dùng pool retry: thử lần lượt
         // từng proxy live → giảm khả năng fail bước 5c (best-effort cho aggregate
-        // matches QR).
+        // matches QR). Pre-approve nên chưa có dead_proxies → pass empty set
+        // (thử full pool).
+        let empty_dead: HashSet<usize> = HashSet::new();
         let r = payment_page_refresh_with_pool(
             &client,
             &session_id,
@@ -753,6 +818,7 @@ pub async fn run_upi_qr(
             &cfg.proxy_pool,
             login_proxy_ref,
             cfg.proxy_from_step,
+            &empty_dead,
         )
         .await;
         if let Some(ref d) = r.data {
@@ -792,18 +858,42 @@ pub async fn run_upi_qr(
         // Track batch đã warm CF cookie — port từ Python `_warm_cf_cookie` khi
         // sang batch proxy mới. Mỗi batch chỉ warm 1 lần (cookie đủ cho cả batch).
         let mut warmed_batches: HashSet<u32> = HashSet::new();
+        // Runtime proxy health: proxy_pool[idx] gặp ≥ DEAD_THRESHOLD network
+        // error LIÊN TIẾP → đánh dấu dead, skip ở mọi lần pick sau. Khi tất
+        // cả pool dead → next pick trả None ⇒ chạy DIRECT (không block job).
+        // Per-job (không update PROXY_STATUS toàn cục) vì lỗi có thể cục bộ
+        // theo IP/account, các job khác vẫn dùng được proxy đó.
+        const DEAD_THRESHOLD: u32 = 2;
+        let mut dead_proxies: HashSet<usize> = HashSet::new();
+        let mut proxy_consec_errors: HashMap<usize, u32> = HashMap::new();
+        let mut all_dead_logged = false;
 
         let approve_started = Instant::now();
         while approve_index_total < cfg.approve_retries {
             approve_index_total += 1;
             proxy_virtual_attempt += 1;
-            let proxy_url = proxy_for_retry(
+            let (proxy_url, current_proxy_idx) = proxy_for_retry_alive(
                 &cfg.proxy_pool,
+                &dead_proxies,
                 cfg.proxy_from_step,
                 6,
                 proxy_virtual_attempt,
                 APPROVE_PROXY_BATCH,
             );
+            // Pool có proxy nhưng tất cả đã dead → từ bây giờ chạy DIRECT.
+            // Log thông báo 1 lần để dễ đọc log (không spam mỗi attempt).
+            if proxy_url.is_none()
+                && !cfg.proxy_pool.is_empty()
+                && cfg.proxy_from_step <= 6
+                && !all_dead_logged
+            {
+                log(&format!(
+                    "[6/6{}] proxy       WARN all {} proxy dead → fallback DIRECT (job tiếp tục)",
+                    phase_tag,
+                    cfg.proxy_pool.len()
+                ));
+                all_dead_logged = true;
+            }
             // Sang batch mới → warm CF cookie cho proxy (giảm 403 hit đầu).
             // Best-effort, không block flow nếu fail.
             if proxy_advance_enabled && proxy_url.is_some() {
@@ -827,6 +917,30 @@ pub async fn run_upi_qr(
                 },
             };
             let proxy_mask = proxy_url.map(mask_proxy).unwrap_or_else(|| "direct".into());
+            // Update per-proxy health từ kết quả attempt:
+            //   - network error (HTTP None) → tăng consec, đạt threshold → mark dead
+            //   - server có reply (2xx/4xx/5xx) → proxy còn forward được → reset
+            if let Some(idx) = current_proxy_idx {
+                if is_network_error(&attempt) {
+                    let entry = proxy_consec_errors.entry(idx).or_insert(0);
+                    *entry += 1;
+                    if *entry >= DEAD_THRESHOLD && !dead_proxies.contains(&idx) {
+                        dead_proxies.insert(idx);
+                        let alive_left = cfg.proxy_pool.len().saturating_sub(dead_proxies.len());
+                        log(&format!(
+                            "[6/6{}] proxy       DEAD {} ({} consec network err) → out of pool (alive {}/{})",
+                            phase_tag,
+                            mask_proxy(&cfg.proxy_pool[idx]),
+                            *entry,
+                            alive_left,
+                            cfg.proxy_pool.len()
+                        ));
+                        proxy_consec_errors.remove(&idx);
+                    }
+                } else {
+                    proxy_consec_errors.remove(&idx);
+                }
+            }
             approve_attempts.push(approve_to_summary(
                 &attempt,
                 confirm_variant_used.as_deref(),
@@ -962,7 +1076,8 @@ pub async fn run_upi_qr(
         }
 
         // Refresh post-approve (best-effort) — pool retry để tăng cơ hội lấy
-        // hosted_instructions_url cho QR.
+        // hosted_instructions_url cho QR. Skip các proxy approve loop đã đánh
+        // dấu chết — đỡ tốn thời gian + đỡ pollute log.
         if !triggered_restart && fatal_approve_error.is_none() && (approved || !approve_attempts.is_empty()) {
             let r = payment_page_refresh_with_pool(
                 &client,
@@ -973,6 +1088,7 @@ pub async fn run_upi_qr(
                 &cfg.proxy_pool,
                 login_proxy_ref,
                 cfg.proxy_from_step,
+                &dead_proxies,
             )
             .await;
             if let Some(ref d) = r.data {

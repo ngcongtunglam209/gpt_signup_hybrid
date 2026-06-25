@@ -2747,6 +2747,25 @@ class SessionJobManager:
         job = self.jobs.get(job_id)
         return list(job.log_lines) if job else []
 
+    def get_secrets_map(self) -> dict[str, dict[str, str | None]]:
+        """Trả map ``job_id → {email, password, secret}`` cho mọi session job.
+
+        Frontend render Output panes (Free/Plus) ở format
+        ``email|password|secret`` mà KHÔNG đưa secret vào ``job.to_dict()`` /
+        SSE broadcast (tránh leak qua snapshot). Pattern y hệt
+        ``UpiJobManager.get_secrets_map()`` — single source of truth cho
+        secrets là Settings Store / DB jobs.
+        """
+        return {
+            jid: {
+                "email": self.jobs[jid].email,
+                "password": self.jobs[jid].password,
+                "secret": self.jobs[jid].secret,
+            }
+            for jid in self.order
+            if jid in self.jobs
+        }
+
     async def _begin_job_proxy(self, job: SessionJob, log) -> str | None:
         """Resolve proxy live qua health-check; set _active_proxy (URL) +
         _active_proxy_line (raw, mark_dead key F-J); cache _proxy_knobs (F-H)."""

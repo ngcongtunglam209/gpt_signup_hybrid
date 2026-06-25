@@ -22,6 +22,8 @@ import uuid
 from datetime import datetime, timezone
 
 from user_agent_profile import (
+    BrowserPersona as _BrowserPersona,
+    CHROME_145_WIN as _DEFAULT_PERSONA,
     SEC_CH_UA as _SEC_CH_UA,
     WINDOWS_USER_AGENT as _WINDOWS_USER_AGENT,
 )
@@ -155,23 +157,35 @@ def _generate_requirements_token(device_id: str, user_agent: str) -> str:
     return "gAAAAAC" + _b64_encode(config)
 
 
-def _fetch_challenge(session, device_id: str, flow: str, request_p: str) -> dict | None:
-    """POST /sentinel/req → challenge JSON."""
+def _fetch_challenge(
+    session,
+    device_id: str,
+    flow: str,
+    request_p: str,
+    *,
+    persona: _BrowserPersona | None = None,
+) -> dict | None:
+    """POST /sentinel/req → challenge JSON. Headers theo persona (Task 3.2)."""
+    p = persona or _DEFAULT_PERSONA
     body = {"p": request_p, "id": device_id, "flow": flow}
-    headers = {
+    headers: dict[str, str] = {
         "Content-Type": "text/plain;charset=UTF-8",
         "Accept": "*/*",
-        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Encoding": p.accept_encoding,
+        "Accept-Language": p.accept_language,
         "Referer": SENTINEL_REFERER,
         "Origin": "https://sentinel.openai.com",
-        "User-Agent": DEFAULT_UA,
-        "sec-ch-ua": DEFAULT_SEC_CH_UA,
-        "sec-ch-ua-mobile": "?0",
-        'sec-ch-ua-platform': '"Windows"',
+        "User-Agent": p.user_agent,
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "same-origin",
     }
+    if p.sec_ch_ua:
+        headers["sec-ch-ua"] = p.sec_ch_ua
+        if p.sec_ch_ua_mobile:
+            headers["sec-ch-ua-mobile"] = p.sec_ch_ua_mobile
+        if p.sec_ch_ua_platform:
+            headers["sec-ch-ua-platform"] = p.sec_ch_ua_platform
     try:
         resp = session.post(
             SENTINEL_REQ_URL,
@@ -237,12 +251,25 @@ def get_sentinel_token(
     device_id: str,
     flow: str = "authorize_continue",
     user_agent: str = DEFAULT_UA,
+    *,
+    persona: _BrowserPersona | None = None,
 ) -> str:
-    """Build sentinel token via pure-Python PoW. Always returns a string (never raises)."""
-    did = device_id or str(uuid.uuid4())
-    req_p = _generate_requirements_token(did, user_agent)
+    """Build sentinel token via pure-Python PoW. Always returns a string (never raises).
 
-    challenge = _fetch_challenge(session, did, flow, req_p)
+    Args:
+        persona: BrowserPersona để build /sentinel/req headers (Task 3.2).
+            None = backward compat = CHROME_145_WIN. Caller mới nên pass explicit.
+        user_agent: Legacy param (giờ dùng persona.user_agent nếu có persona).
+            Kept for backward compat khi caller cũ pass user_agent string.
+    """
+    # Persona ưu tiên hơn user_agent legacy param. Nếu cả 2 default → Chrome.
+    p = persona or _DEFAULT_PERSONA
+    effective_ua = persona.user_agent if persona else user_agent
+
+    did = device_id or str(uuid.uuid4())
+    req_p = _generate_requirements_token(did, effective_ua)
+
+    challenge = _fetch_challenge(session, did, flow, req_p, persona=p)
     if not challenge:
         logger.warning("Sentinel challenge fetch failed, returning fallback token")
         return json.dumps(
@@ -258,7 +285,7 @@ def get_sentinel_token(
             seed=pow_data["seed"],
             difficulty=pow_data.get("difficulty", "0"),
             device_id=did,
-            user_agent=user_agent,
+            user_agent=effective_ua,
         )
     else:
         p_value = req_p

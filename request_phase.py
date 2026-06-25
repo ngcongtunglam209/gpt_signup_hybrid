@@ -36,6 +36,8 @@ from curl_cffi import requests as curl_requests
 from mail_providers import MailProvider
 from models import SignupRequest, SignupResult
 from user_agent_profile import (
+    BrowserPersona as _BrowserPersona,
+    CHROME_145_WIN as _DEFAULT_PERSONA,
     CURL_IMPERSONATE_CANDIDATES as _UA_IMPERSONATE_CANDIDATES,
     CURL_IMPERSONATE_PRIMARY as _UA_IMPERSONATE_PRIMARY,
     SEC_CH_UA,
@@ -149,11 +151,22 @@ def _is_rotatable_error(exc: BaseException) -> bool:
 # ─── Sentinel ─────────────────────────────────────────────────────────
 
 
-def _get_sentinel_token(session, device_id: str, flow: str, log: Callable, worker=None) -> str:
+def _get_sentinel_token(
+    session,
+    device_id: str,
+    flow: str,
+    log: Callable,
+    worker=None,
+    *,
+    persona: _BrowserPersona | None = None,
+) -> str:
     """Get sentinel token: QuickJS primary → Python PoW fallback.
 
-    ``worker`` (SentinelNodeWorker | None): nếu có → dùng persistent Node process
-    (warm) thay vì spawn one-shot mỗi action.
+    Args:
+        persona: BrowserPersona để inject vào sdk.js navigator + HTTP headers
+            (Task 7.2 + Phase 3.2). None = default CHROME_145_WIN — phù hợp
+            cho pure_request flow (curl_cffi impersonate Chrome).
+        worker: SentinelNodeWorker (persistent Node), None = one-shot Node spawn.
     """
     disable_quickjs = os.getenv("OPENAI_SENTINEL_DISABLE_QUICKJS", "0").lower() in (
         "1", "true", "yes",
@@ -168,6 +181,7 @@ def _get_sentinel_token(session, device_id: str, flow: str, log: Callable, worke
                 flow=flow,
                 log=log,
                 worker=worker,
+                persona=persona,
             )
             if token:
                 return token
@@ -176,13 +190,29 @@ def _get_sentinel_token(session, device_id: str, flow: str, log: Callable, worke
             log(f"[sentinel] QuickJS import/call error, fallback: {e}")
 
     from sentinel_pow import get_sentinel_token as _pow_token
-    return _pow_token(session, device_id, flow=flow)
+    return _pow_token(session, device_id, flow=flow, persona=persona)
 
 
 # ─── Common headers ──────────────────────────────────────────────────
 
 
-def _common_headers(referer: str = "https://chatgpt.com/") -> dict[str, str]:
+def _common_headers(
+    referer: str = "https://chatgpt.com/",
+    *,
+    persona: _BrowserPersona | None = None,
+) -> dict[str, str]:
+    """Common HTTP headers cho persona này. Default = CHROME_145_WIN.
+
+    Anti-ban (journal 260625-1224 Task 4.4 + bug H4 + M1):
+        Chrome gửi sec-ch-ua* (3 headers Client Hints), Firefox KHÔNG gửi.
+        Hardcode 3 headers Chrome = mismatch nếu caller sau dùng Firefox persona.
+        Now persona-aware: ``persona.common_headers()`` builds đúng theo browser
+        family, KHÔNG gửi sec-ch-ua khi Firefox.
+
+    Datadog headers (traceparent + x-datadog-*) luôn add — server expect cho
+    sentinel cross-check.
+    """
+    p = persona or _DEFAULT_PERSONA
     origin = "https://chatgpt.com"
     try:
         parsed = urlparse(referer)
@@ -191,18 +221,12 @@ def _common_headers(referer: str = "https://chatgpt.com/") -> dict[str, str]:
     except Exception:
         pass
 
-    headers = {
-        "Accept": "application/json",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": referer,
-        "Origin": origin,
-        "User-Agent": USER_AGENT,
-        # Client Hints — Chrome desktop luôn gửi 3 header này (low-entropy hints,
-        # không cần Accept-CH). Bắt buộc đồng bộ với USER_AGENT để tránh mismatch.
-        "sec-ch-ua": SEC_CH_UA,
-        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
-        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
-    }
+    # Persona-aware base headers (Chrome có sec-ch-ua, Firefox không)
+    headers = p.common_headers(referer=referer)
+    # Override / add specific headers for API request
+    headers["Accept"] = "application/json"
+    headers["Origin"] = origin
+    # Datadog RUM trace — luôn có trên request browser thật
     headers.update(_datadog_trace_headers())
     return headers
 
@@ -243,22 +267,20 @@ def _prime_chatgpt_session(session, log: Callable) -> None:
         pass
 
     log("[request] [0/9] Priming chatgpt.com session (GET /auth/login)...")
-    headers = {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br, zstd",
-        "Referer": "https://chatgpt.com/",
-        "User-Agent": USER_AGENT,
-        "sec-ch-ua": SEC_CH_UA,
-        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
-        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-User": "?1",
-        "Upgrade-Insecure-Requests": "1",
-        "Connection": "keep-alive",
-    }
+
+    # Inject `_dd_s` Datadog RUM cookie TRƯỚC khi prime (Task 3.5 + bug M3).
+    # Browser thật luôn có cookie này khi load chatgpt.com — Datadog RUM SDK set.
+    # Pure_request không có SDK → cookie vắng → server thấy "session bắt đầu
+    # giữa luồng" = bất thường. Inject với rum=0 (anonymous) trước login.
+    try:
+        from _datadog_session import inject_dd_s as _inject_dd_s
+        _inject_dd_s(session, domain=".chatgpt.com", rum=0, log=log)
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        log(f"[request] _dd_s inject failed (continue): {exc}")
+
+    # Headers persona-aware (Task 7.5) — page navigate kèm Connection.
+    headers = _navigate_headers("https://chatgpt.com/")
+    headers["Connection"] = "keep-alive"
     # Retry up to 3x on Cloudflare 403 (transient bot-management challenge),
     # backoff 5s/10s — đồng bộ pattern `_step_csrf`. Cùng host (chatgpt.com)
     # → cùng kiểu lỗi: CF middleware đôi khi trả 403 trước khi cấp __cf_bm,
@@ -283,6 +305,31 @@ def _prime_chatgpt_session(session, log: Callable) -> None:
         )
 
 
+def _step_providers(session, log: Callable) -> None:
+    """Step 0.5: GET /api/auth/providers (NextAuth providers list).
+
+    Anti-ban (Phase 8 audit gap): trace tay xác nhận browser thật GET
+    ``/api/auth/providers`` TRƯỚC ``/api/auth/csrf`` (~337ms gap). NextAuth
+    client SDK luôn fetch providers list khi load auth page rồi mới fetch
+    csrf trước khi signin click. Pure_request gọi thẳng csrf → server
+    thấy "missing providers fetch" = pattern bot.
+
+    Best-effort: response body không cần parse — chỉ cần server thấy GET.
+    """
+    log("[request] [1a/9] Fetching providers list...")
+    headers = _common_headers("https://chatgpt.com/auth/login")
+    try:
+        resp = session.get(
+            "https://chatgpt.com/api/auth/providers",
+            headers=headers,
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            log(f"[request] providers HTTP {resp.status_code} (continue, non-fatal)")
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        log(f"[request] providers fetch failed (continue): {exc}")
+
+
 def _step_csrf(session, log: Callable) -> str:
     """Step 1: GET chatgpt.com/api/auth/csrf → csrfToken.
 
@@ -290,9 +337,13 @@ def _step_csrf(session, log: Callable) -> str:
     NextAuth set cookie ``__Host-next-auth.csrf-token`` cho lần POST
     ``/api/auth/signin/openai`` kế tiếp (xem docstring _prime_chatgpt_session).
 
+    Bao gồm step ``_step_providers`` (Phase 8 audit gap) — browser thật luôn
+    fetch providers TRƯỚC csrf.
+
     Retry up to 3x on Cloudflare 403 (transient rate-limit), backoff 5s/10s.
     """
     _prime_chatgpt_session(session, log)
+    _step_providers(session, log)
     log("[request] [1/9] Fetching CSRF token...")
     headers = _common_headers("https://chatgpt.com/auth/login")
     resp = None
@@ -375,6 +426,10 @@ def _step_auth_url(session, csrf_token: str, log: Callable, device_id: str = "",
     Must include query params matching browser:
     prompt=login, ext-oai-did, ext-passkey-client-capabilities, screen_hint=login_or_signup
     login_hint={email} for login flow (lets server route to password/verify directly).
+
+    Anti-ban (Task 4.6 + bug C2): ``auth_session_logging_id`` đọc từ cookie
+    ``oai-asli`` (sentinel SDK chatgpt.com đã set khi prime). Khớp với cookie
+    → server cross-check pass. Code cũ KHÔNG có param này → server thấy lạ.
     """
     log("[request] [2/8] Getting authorize URL...")
     headers = _common_headers("https://chatgpt.com/auth/login")
@@ -390,6 +445,16 @@ def _step_auth_url(session, csrf_token: str, log: Callable, device_id: str = "",
         params["ext-oai-did"] = device_id
     if login_hint:
         params["login_hint"] = login_hint
+
+    # Đọc cookie oai-asli → query param auth_session_logging_id (Task 4.6).
+    try:
+        from _nextauth_bootstrap import read_oai_asli_from_session as _read_asli_sync
+        asli = _read_asli_sync(session)
+        if asli:
+            params["auth_session_logging_id"] = asli
+            log(f"[request] auth_session_logging_id={asli} (from oai-asli cookie)")
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        log(f"[request] read oai-asli failed (continue): {exc}")
 
     from urllib.parse import urlencode as _urlencode
     url = "https://chatgpt.com/api/auth/signin/openai?" + _urlencode(params)
@@ -450,15 +515,8 @@ def _step_auth_url(session, csrf_token: str, log: Callable, device_id: str = "",
 def _step_oauth_init(session, auth_url: str, log: Callable) -> str:
     """Step 3: Follow authorize URL → extract device_id from oai-did cookie."""
     log("[request] [3/9] OAuth init...")
-    headers = {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://chatgpt.com/auth/login",
-        "User-Agent": USER_AGENT,
-        "sec-ch-ua": SEC_CH_UA,
-        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
-        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
-    }
+    # Page navigate (Task 7.5) — persona-aware
+    headers = _navigate_headers("https://chatgpt.com/auth/login")
     session.get(auth_url, headers=headers, timeout=30, allow_redirects=True)
 
     # Extract device_id from cookies
@@ -513,77 +571,69 @@ def _step_authorize_continue(
         return {}
 
 
-def _step_signup(session, email: str, sentinel_token: str, device_id: str, log: Callable) -> bool:
-    """Step 4: Submit email → detect new vs existing account.
+# REMOVED 2026-06-25 (anti-ban Phase 7 Task 7.1):
+#   - ``_step_signup`` — gọi ``/authorize/continue`` mà browser thật KHÔNG gọi
+#     trong signup flow. ``_run_request_phase_sync`` không dùng (detect new vs
+#     existing qua HTTP status của ``/register``).
+#   - ``_step_register_password`` — visit ``/create-account/password`` XHR mà
+#     browser thật KHÔNG visit. Sync flow đã inline POST register với header
+#     persona-aware (Phase 4 Task 4.2 wire ``/email-verification`` HTML thay).
+#
+# Caller cũ nếu còn import sẽ raise AttributeError → bug rõ ràng dễ fix. Hàm
+# ``_step_authorize_continue`` GIỮ vì ``session_phase.py`` (login flow) còn dùng.
 
-    Returns True for new account, False for existing.
+
+def _navigate_headers(
+    referer: str,
+    *,
+    persona: _BrowserPersona | None = None,
+) -> dict[str, str]:
+    """Page navigate request headers (vd ``GET /email-verification`` HTML).
+
+    Anti-ban (journal 260625-1224 Task 4.3 + bug H2):
+        Trace tay xác nhận browser gửi GET ``/email-otp/send`` (HTTP 302) như
+        page navigate, KHÔNG phải XHR/fetch:
+            Sec-Fetch-Dest: document
+            Sec-Fetch-Mode: navigate
+            Sec-Fetch-Site: same-origin
+            Sec-Fetch-User: ?1
+            Upgrade-Insecure-Requests: 1
+            Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
+
+        Code cũ dùng ``_common_headers`` = XHR mode (Sec-Fetch-Mode: cors,
+        Accept: application/json). Server thấy unusual XHR → flag.
+
+    KHÔNG có Datadog headers (page navigate KHÔNG có Datadog RUM trace).
     """
-    log("[request] [4/9] Submitting email...")
-    data = _step_authorize_continue(
-        session, email, sentinel_token,
-        screen_hint="signup",
-        referer="https://auth.openai.com/create-account",
-        device_id=device_id,
-        log=log,
-    )
-
-    page = data.get("page", {}) if isinstance(data, dict) else {}
-    page_type = (page.get("type") or "").strip()
-    continue_url = (data.get("continue_url") or "").strip()
-
-    if page_type == "create_account_password" or "/create-account/password" in continue_url:
-        log("[request] New account detected")
-        return True
-
-    if page_type in ("email_otp_verification", "login_password"):
-        log(f"[request] Existing account detected (page_type={page_type})")
-        return False
-
-    log(f"[request] Unknown page_type={page_type!r}, treating as existing")
-    return False
-
-
-def _step_register_password(session, email: str, password: str, device_id: str, log: Callable) -> bool:
-    """Step 5: Register password for new account."""
-    log("[request] [5/9] Registering password...")
-
-    # Visit password page first (establish server state)
-    try:
-        session.get(
-            "https://auth.openai.com/create-account/password",
-            headers=_common_headers("https://auth.openai.com/create-account"),
-            timeout=15,
-        )
-    except Exception:
-        pass
-
-    # Refresh sentinel for username_password_create flow
-    sentinel = _get_sentinel_token(session, device_id, "username_password_create", log)
-
-    headers = _common_headers("https://auth.openai.com/create-account/password")
-    headers["Content-Type"] = "application/json"
-    if sentinel:
-        headers["openai-sentinel-token"] = sentinel
-    if device_id:
-        headers["oai-device-id"] = device_id
-
-    resp = session.post(
-        "https://auth.openai.com/api/accounts/user/register",
-        headers=headers,
-        json={"password": password, "username": email},
-        timeout=30,
-    )
-    if resp.status_code != 200:
-        log(f"[request] Register password failed: {resp.status_code} - {(resp.text or '')[:200]}")
-        return False
-    log("[request] Password registered")
-    return True
+    p = persona or _DEFAULT_PERSONA
+    headers = p.common_headers(referer=referer)
+    headers.update({
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "Connection": "keep-alive",
+    })
+    return headers
 
 
 def _step_send_otp(session, device_id: str, log: Callable) -> None:
-    """Step 6a: Trigger OTP email delivery."""
-    log("[request] [6/9] Sending OTP...")
-    headers = _common_headers("https://auth.openai.com/create-account/password")
+    """Step 6a: Trigger OTP email delivery.
+
+    Trace tay (HAR `web_record_20260625-120705_manual`): GET ``/email-otp/send``
+    là page navigate → 302 redirect tới ``/email-verification`` HTML. Browser
+    follow redirect tự nhiên. KHÔNG phải XHR.
+
+    Code cũ gửi XHR với Accept: application/json → server flag bot. Fix:
+    dùng ``_navigate_headers`` (Task 4.3).
+
+    Phase 7 Task 7.1: Bỏ fallback ``passwordless/send-otp`` — endpoint không
+    có trong record tay → chỉ-bot-mới-gọi. Nếu primary fail thì raise.
+    """
+    log("[request] [6/9] Sending OTP (page navigate)...")
+    headers = _navigate_headers("https://auth.openai.com/create-account/password")
     if device_id:
         headers["oai-device-id"] = device_id
 
@@ -591,22 +641,12 @@ def _step_send_otp(session, device_id: str, log: Callable) -> None:
         "https://auth.openai.com/api/accounts/email-otp/send",
         headers=headers,
         timeout=30,
+        allow_redirects=True,   # follow 302 → /email-verification
     )
-    if resp.status_code != 200:
-        # Fallback: try passwordless send
-        headers2 = _common_headers("https://auth.openai.com/create-account/password")
-        headers2["Content-Type"] = "application/json"
-        if device_id:
-            headers2["oai-device-id"] = device_id
-        resp2 = session.post(
-            "https://auth.openai.com/api/accounts/passwordless/send-otp",
-            headers=headers2,
-            timeout=30,
+    if resp.status_code not in (200, 302):
+        raise RequestPhaseError(
+            f"OTP send failed: HTTP {resp.status_code}: {(resp.text or '')[:200]}"
         )
-        if resp2.status_code != 200:
-            raise RequestPhaseError(
-                f"OTP send failed: primary={resp.status_code} fallback={resp2.status_code}"
-            )
     log("[request] OTP sent")
 
 
@@ -721,15 +761,8 @@ def _step_follow_redirects(session, start_url: str, log: Callable) -> tuple[str,
             callback_url = current
             break
 
-        headers = {
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://chatgpt.com/",
-            "User-Agent": USER_AGENT,
-            "sec-ch-ua": SEC_CH_UA,
-            "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
-            "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
-        }
+        # Page navigate (Task 7.5) — persona-aware redirect follow
+        headers = _navigate_headers("https://chatgpt.com/")
         resp = session.get(current, headers=headers, timeout=30, allow_redirects=False)
 
         if resp.status_code in (301, 302, 303, 307, 308):
@@ -772,15 +805,8 @@ def _consume_callback(session, callback_url: str, log: Callable) -> bool:
     if not callback_url or "code=" not in callback_url:
         return False
 
-    headers = {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://auth.openai.com/",
-        "User-Agent": USER_AGENT,
-        "sec-ch-ua": SEC_CH_UA,
-        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
-        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
-    }
+    # Page navigate (Task 7.5) — persona-aware callback follow
+    headers = _navigate_headers("https://auth.openai.com/")
 
     current = callback_url
     try:
@@ -1174,18 +1200,27 @@ def _run_request_phase_sync(
                 request.proxy, log, login_hint=request.email,
             )
 
-            # Step 4: GET /create-account/password page to establish server signup state.
-            # HAR confirms browser does NOT call authorize/continue before user/register.
-            # Instead it relies on the authorize URL (with login_hint) + this page visit
-            # to set the state machine into "create account" mode.
+            # Step 4: GET /email-verification HTML (page navigate) để seed
+            # server signup state + cookie ``oai-login-csrf_dev_*`` (Task 4.2).
+            #
+            # Trace tay (HAR `web_record_20260625-120705_manual`): browser
+            # navigate /email-verification rồi SPA tự chuyển /create-account/password
+            # client-side (KHÔNG có request HTTP /create-account/password).
+            #
+            # Code cũ GET /create-account/password = browser thật KHÔNG gửi →
+            # bất thường. Hơn nữa /email-verification response set 8+ session
+            # cookies (oai-login-csrf_dev_*, rg_context, login_session, ...)
+            # mà /create-account/password KHÔNG set → cookie chain mismatch.
             try:
+                ev_headers = _navigate_headers("https://chatgpt.com/")
                 session.get(
-                    "https://auth.openai.com/create-account/password",
-                    headers=_common_headers("https://auth.openai.com/create-account"),
+                    "https://auth.openai.com/email-verification",
+                    headers=ev_headers,
                     timeout=15,
+                    allow_redirects=True,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                log(f"[request] /email-verification visit failed (continue): {exc}")
 
             # Step 5: Sentinel (flow=username_password_create) + user/register
             sentinel = _get_sentinel_token(
@@ -1255,10 +1290,13 @@ def _run_request_phase_sync(
         otp_started_at = datetime.now(timezone.utc)
 
         if reg_continue and "/email-otp/send" in reg_continue:
-            otp_headers = _common_headers("https://auth.openai.com/email-verification")
+            # Page navigate (Task 4.3) — server trả 302 → /email-verification HTML.
+            otp_headers = _navigate_headers("https://auth.openai.com/email-verification")
             if device_id:
                 otp_headers["oai-device-id"] = device_id
-            resp = session.get(reg_continue, headers=otp_headers, timeout=30)
+            resp = session.get(
+                reg_continue, headers=otp_headers, timeout=30, allow_redirects=True,
+            )
             if resp.status_code not in (200, 302):
                 log(f"[request] OTP send via continue_url returned {resp.status_code}")
                 _step_send_otp(session, device_id, log)

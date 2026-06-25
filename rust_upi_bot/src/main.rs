@@ -57,8 +57,12 @@ struct Cli {
     #[arg(long, env = "MAX_CONCURRENT", default_value = "100", global = true)]
     max_concurrent: usize,
 
-    /// Số tiến trình tối đa 1 user chạy đồng thời.
-    #[arg(long, env = "MAX_PER_USER", default_value = "5", global = true)]
+    /// Số tiến trình tối đa 1 user chạy đồng thời. Đây là giá trị **seed** ban
+    /// đầu cho DB key `limits.max_per_user_default` (chỉ dùng nếu DB chưa có
+    /// row). Sau đó admin đổi qua `/set_max_per_user <n>` — thay đổi persist
+    /// vào DB và áp ngay (không restart). Mỗi user có thể được override
+    /// riêng qua `/set_user_limit @user <n>`. Range hợp lệ 1..=10.
+    #[arg(long, env = "MAX_PER_USER", default_value = "2", global = true)]
     max_per_user: u32,
 
     /// Hard cap số job pending trong queue. Khi đầy, job mới bị reject. Bảo vệ RAM.
@@ -230,6 +234,9 @@ fn localized_commands(lang: Lang, is_admin: bool) -> Vec<(&'static str, &'static
             ("cancel", "Xóa bộ đệm văn bản đang chờ"),
             ("proxy_set", "Đặt proxy riêng của bạn"),
             ("proxy_remove", "Xóa proxy của bạn"),
+            ("proxy_check", "Kiểm tra live proxy của bạn"),
+            ("login_proxy_check", "Kiểm tra live login proxy"),
+            ("my_limit", "Xem giới hạn tiến trình của bạn"),
             ("2fa", "Lấy mã 2FA (TOTP)"),
             ("settings", "Cài đặt"),
             ("language", "Đổi ngôn ngữ"),
@@ -243,6 +250,9 @@ fn localized_commands(lang: Lang, is_admin: bool) -> Vec<(&'static str, &'static
             ("cancel", "Clear pending text buffer"),
             ("proxy_set", "Set your own proxy"),
             ("proxy_remove", "Remove your proxy"),
+            ("proxy_check", "Live check your proxy"),
+            ("login_proxy_check", "Live check login proxy"),
+            ("my_limit", "Show your concurrent process limit"),
             ("2fa", "Get a 2FA (TOTP) code"),
             ("settings", "Settings"),
             ("language", "Change language"),
@@ -264,6 +274,9 @@ fn localized_commands(lang: Lang, is_admin: bool) -> Vec<(&'static str, &'static
                 ("notify_test", "Test kênh thông báo (admin)"),
                 ("proxy_login_set", "Đặt login proxy chung (admin)"),
                 ("proxy_login_remove", "Xóa login proxy chung (admin)"),
+                ("proxy_check_user", "Xem proxy của user (admin, raw)"),
+                ("set_max_per_user", "Đặt giới hạn tiến trình/user toàn cục (admin)"),
+                ("set_user_limit", "Override giới hạn cho 1 user (admin)"),
             ],
             Lang::En => vec![
                 ("notify", "Broadcast to all users (admin)"),
@@ -278,6 +291,9 @@ fn localized_commands(lang: Lang, is_admin: bool) -> Vec<(&'static str, &'static
                 ("notify_test", "Test notify channel (admin)"),
                 ("proxy_login_set", "Set shared login proxy (admin)"),
                 ("proxy_login_remove", "Remove shared login proxy (admin)"),
+                ("proxy_check_user", "Show user's proxy (admin, raw)"),
+                ("set_max_per_user", "Set global concurrent process limit (admin)"),
+                ("set_user_limit", "Override per-user limit (admin)"),
             ],
         };
         v.extend(admin);
@@ -371,10 +387,47 @@ async fn main() -> Result<()> {
 
     let (queue, queue_rx) = JobQueue::new(cli.queue_capacity);
     let queue = Arc::new(queue);
+
+    // ── max_per_user: resolve effective default + load overrides từ DB ────
+    // Ưu tiên: DB key `limits.max_per_user_default` win. Nếu key chưa có,
+    // seed = CLI flag (đã clamp 1..=10) — sau đó mọi thay đổi qua
+    // `/set_max_per_user` ghi DB → restart vẫn nhớ. Override per-user load
+    // bulk vào limiter cache (write-through khi admin set/xóa qua lệnh).
+    let initial_default_max = match store.get_max_per_user_default() {
+        Some(n) => n,
+        None => {
+            let seed = cli
+                .max_per_user
+                .clamp(settings::Settings::MAX_PER_USER_MIN, settings::Settings::MAX_PER_USER_MAX);
+            if let Err(e) = store.set_max_per_user_default(seed) {
+                warn!("seed limits.max_per_user_default fail: {}", e);
+            } else {
+                info!(
+                    "seeded limits.max_per_user_default={} (DB lần đầu)",
+                    seed
+                );
+            }
+            seed
+        }
+    };
+    let initial_overrides = match store.list_user_limits() {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("list_user_limits fail (boot với cache rỗng): {}", e);
+            Vec::new()
+        }
+    };
+    info!(
+        "max_per_user default={} overrides={}",
+        initial_default_max,
+        initial_overrides.len()
+    );
+
     let limiter = UserLimiter::new(
         Duration::from_secs(cli.user_cooldown_seconds),
         cli.user_msg_rate_per_min,
-        cli.max_per_user,
+        initial_default_max,
+        initial_overrides,
     );
     let registry = JobRegistry::new();
     let board = JobBoard::new();
@@ -442,6 +495,9 @@ async fn main() -> Result<()> {
         ("language", "Language / Ngôn ngữ"),
         ("proxy_set", "Set your own proxy"),
         ("proxy_remove", "Remove your proxy"),
+        ("proxy_check", "Live check your proxy"),
+        ("login_proxy_check", "Live check login proxy"),
+        ("my_limit", "Show your concurrent process limit"),
         ("2fa", "Get a 2FA (TOTP) code"),
         ("help", "Show help"),
     ];
@@ -458,6 +514,9 @@ async fn main() -> Result<()> {
             ("cancel", "Clear pending text buffer"),
             ("proxy_set", "Set your own proxy"),
             ("proxy_remove", "Remove your proxy"),
+            ("proxy_check", "Live check your proxy"),
+            ("login_proxy_check", "Live check login proxy"),
+            ("my_limit", "Show your concurrent process limit"),
             ("2fa", "Get a 2FA (TOTP) code"),
             ("help", "Show help"),
             ("notify", "Broadcast to all users (admin)"),
@@ -473,6 +532,9 @@ async fn main() -> Result<()> {
             ("notify_test", "Test notify channel (admin)"),
             ("proxy_login_set", "Set shared login proxy (admin)"),
             ("proxy_login_remove", "Remove shared login proxy (admin)"),
+            ("proxy_check_user", "Show user's proxy (admin, raw)"),
+            ("set_max_per_user", "Set global concurrent process limit (admin)"),
+            ("set_user_limit", "Override per-user limit (admin)"),
         ];
         if let Err(e) = tg
             .set_my_commands_for_chat(cli.admin_chat_id, admin_commands)
@@ -758,13 +820,27 @@ async fn handle_message(
                 handle_2fa(&tg, &msg, text, lang).await;
                 return Ok(());
             }
+            "/proxy_check" => {
+                handle_proxy_check(&tg, &store, &msg, user_id, lang).await;
+                return Ok(());
+            }
+            "/login_proxy_check" => {
+                handle_login_proxy_check(&tg, &store, &msg, lang, cli.proxy_from_step).await;
+                return Ok(());
+            }
+            "/my_limit" => {
+                handle_my_limit(&tg, &limiter, &msg, user_id, lang).await;
+                return Ok(());
+            }
             _ => {}
         }
 
         match cmd_base {
             "/notify" | "/chat" | "/ban" | "/unban" | "/banlist"
             | "/proxy_login_set" | "/proxy_login_remove" | "/stopall" | "/flushall"
-            | "/set_notify" | "/notify_remove" | "/notify_test" => {
+            | "/set_notify" | "/notify_remove" | "/notify_test"
+            | "/proxy_check_user"
+            | "/set_max_per_user" | "/set_user_limit" => {
                 if !is_admin {
                     tg.send_message(
                         msg.chat.id,
@@ -806,6 +882,21 @@ async fn handle_message(
                     "/notify_test" => {
                         handle_notify_test(&tg, &store, &msg, cli.admin_chat_id).await
                     }
+                    "/proxy_check_user" => {
+                        handle_proxy_check_user(&tg, &store, &msg, text, cli.admin_chat_id).await
+                    }
+                    "/set_max_per_user" => {
+                        handle_set_max_per_user(
+                            &tg, &store, &limiter, &msg, text, cli.admin_chat_id,
+                        )
+                        .await
+                    }
+                    "/set_user_limit" => {
+                        handle_set_user_limit(
+                            &tg, &store, &limiter, &msg, text, cli.admin_chat_id,
+                        )
+                        .await
+                    }
                     _ => unreachable!(),
                 }
                 return Ok(());
@@ -836,9 +927,11 @@ async fn handle_message(
                     return Ok(());
                 }
 
-                // Cap số dòng xử lý 1 lần = max tiến trình/user (chống flood khi
-                // dán quá nhiều dòng). Phần dư bị bỏ, báo rõ trong header.
-                let cap = cli.max_per_user.max(1) as usize;
+                // Cap số dòng xử lý 1 lần = effective max tiến trình/user (chống
+                // flood khi dán quá nhiều dòng). Đọc qua limiter để áp đúng
+                // override per-user khi user trả phí được mức cao hơn default.
+                // Phần dư bị bỏ, báo rõ trong header.
+                let cap = limiter.effective_max(user_id).await.max(1) as usize;
                 let dropped = combos.len().saturating_sub(cap);
                 let combos: Vec<AccountCombo> = combos.into_iter().take(cap).collect();
 
@@ -2624,7 +2717,7 @@ async fn handle_callback(
                 async move { bot::proxy_status::PROXY_STATUS.refresh(&raw).await }
             });
             let results = futures_util::future::join_all(probes).await;
-            let body = render_pool_probe_result(lang, &lines, &results);
+            let body = render_pool_probe_result(lang, &lines, &results, true);
             tg.send_message_kb_html(chat_id, &body, proxy_keyboard(lang))
                 .await
                 .ok();
@@ -3194,11 +3287,16 @@ fn proxy_keyboard(lang: Lang) -> Value {
 }
 
 /// Render probe result CHO POOL nhiều proxy thành 1 card gọn: header summary
-/// (live/dead/slow) + danh sách đánh số (mask + status + latency).
+/// (live/dead/slow) + danh sách đánh số (line + status + latency).
+///
+/// `mask = true` → che credential (<code>host:port:***:***</code>) cho nhãn user
+/// thường. `mask = false` → in NGUYÊN raw line (cho admin `/proxy_check_user`
+/// để admin tap-copy đi đặt lại). Caller chịu trách nhiệm ngữ cảnh hiển thị.
 fn render_pool_probe_result(
     lang: Lang,
     lines: &[String],
     results: &[std::sync::Arc<bot::proxy_probe::ProbeResult>],
+    mask: bool,
 ) -> String {
     let limit_ms = 2000u64; // hiển thị heuristic; threshold thực dùng `cli.proxy_latency_limit_ms`.
     let mut live = 0usize;
@@ -3238,11 +3336,16 @@ fn render_pool_probe_result(
         } else {
             "✅"
         };
+        let display = if mask {
+            proxy_format::mask_proxy(raw)
+        } else {
+            raw.clone()
+        };
         body.push_str(&format!(
             "\n{}. {} <code>{}</code> · {} · {}ms",
             i + 1,
             icon,
-            bot::board::html_escape(&proxy_format::mask_proxy(raw)),
+            bot::board::html_escape(&display),
             status,
             r.latency_ms
         ));
@@ -3637,6 +3740,464 @@ async fn handle_proxy_login_remove(
     }
 }
 
+/// `/proxy_check` — user kiểm tra LIVE pool proxy của chính mình. Là shortcut
+/// text cho callback `proxy:check` (nút trên card `/proxy_set`). Mask credential.
+async fn handle_proxy_check(
+    tg: &Arc<TelegramClient>,
+    store: &Arc<settings::Settings>,
+    msg: &Message,
+    user_id: i64,
+    lang: Lang,
+) {
+    let lines = match store.get_user_proxies(user_id) {
+        Ok(v) if !v.is_empty() => v,
+        Ok(_) => {
+            tg.send_message(msg.chat.id, &i18n::proxy_not_set(lang), Some(msg.message_id))
+                .await
+                .ok();
+            return;
+        }
+        Err(e) => {
+            tg.send_message(
+                msg.chat.id,
+                &i18n::db_error(lang, &e.to_string()),
+                Some(msg.message_id),
+            )
+            .await
+            .ok();
+            return;
+        }
+    };
+    let probes = lines.iter().map(|raw| {
+        let raw = raw.clone();
+        async move { bot::proxy_status::PROXY_STATUS.refresh(&raw).await }
+    });
+    let results = futures_util::future::join_all(probes).await;
+    let mut body = i18n::proxy_check_header_self(lang);
+    body.push_str(&render_pool_probe_result(lang, &lines, &results, true));
+    tg.send_message_kb_html(msg.chat.id, &body, proxy_keyboard(lang))
+        .await
+        .ok();
+}
+
+/// `/login_proxy_check` — bất kỳ user nào (cả admin) check LIVE pool login
+/// proxy admin set. Mask credential — user thường không cần thấy raw, admin
+/// vẫn có thể đọc lại pool qua `/proxy_login_set` (no arg).
+async fn handle_login_proxy_check(
+    tg: &Arc<TelegramClient>,
+    store: &Arc<settings::Settings>,
+    msg: &Message,
+    lang: Lang,
+    proxy_from_step: u32,
+) {
+    let lines = store.get_login_proxies();
+    if lines.is_empty() {
+        tg.send_message(
+            msg.chat.id,
+            &i18n::login_proxy_check_empty(lang),
+            Some(msg.message_id),
+        )
+        .await
+        .ok();
+        return;
+    }
+    let probes = lines.iter().map(|raw| {
+        let raw = raw.clone();
+        async move { bot::proxy_status::PROXY_STATUS.refresh(&raw).await }
+    });
+    let results = futures_util::future::join_all(probes).await;
+    let upper_step = proxy_from_step.saturating_sub(1).max(1);
+    let mut body = i18n::login_proxy_check_header(lang, upper_step);
+    body.push_str(&render_pool_probe_result(lang, &lines, &results, true));
+    tg.send_message_kb_html(msg.chat.id, &body, Value::Array(vec![]))
+        .await
+        .ok();
+}
+
+/// `/proxy_check_user <@username | id>` — ADMIN xem RAW pool proxy của 1 user
+/// (kèm credential để admin tap-copy đặt lại) + check live song song.
+/// Resolve target giống `/chat` `/ban`. KHÔNG kèm keyboard remove — admin
+/// không nên vô tình xóa proxy của user khác.
+async fn handle_proxy_check_user(
+    tg: &Arc<TelegramClient>,
+    store: &Arc<settings::Settings>,
+    msg: &Message,
+    text: &str,
+    admin_id: i64,
+) {
+    let alang = lang_or_default(store, admin_id);
+
+    let Some((arg, _)) = command_body(text) else {
+        tg.send_message(
+            msg.chat.id,
+            &i18n::admin_check_proxy_usage(alang),
+            Some(msg.message_id),
+        )
+        .await
+        .ok();
+        return;
+    };
+    let token = arg.split_whitespace().next().unwrap_or("");
+    if token.is_empty() {
+        tg.send_message(
+            msg.chat.id,
+            &i18n::admin_check_proxy_usage(alang),
+            Some(msg.message_id),
+        )
+        .await
+        .ok();
+        return;
+    }
+
+    // Resolve target → user_id. Số (có/không '@') = user_id; còn lại = username.
+    let stripped = token.trim_start_matches('@');
+    let (target_id, uname): (i64, Option<String>) = match stripped.parse::<i64>() {
+        Ok(id) => (id, store.known_username(id).ok().flatten()),
+        Err(_) => match store.resolve_username(stripped) {
+            Ok(Some(id)) => (id, Some(stripped.to_string())),
+            Ok(None) => {
+                tg.send_message(
+                    msg.chat.id,
+                    &i18n::admin_username_not_seen_chat(alang, stripped),
+                    Some(msg.message_id),
+                )
+                .await
+                .ok();
+                return;
+            }
+            Err(e) => {
+                tg.send_message(
+                    msg.chat.id,
+                    &i18n::admin_username_resolve_err(alang, &e.to_string()),
+                    Some(msg.message_id),
+                )
+                .await
+                .ok();
+                return;
+            }
+        },
+    };
+    let uname_disp = uname
+        .as_deref()
+        .map(|u| format!(" (@{})", u))
+        .unwrap_or_default();
+
+    let lines = match store.get_user_proxies(target_id) {
+        Ok(v) => v,
+        Err(e) => {
+            tg.send_message(
+                msg.chat.id,
+                &i18n::db_error(alang, &e.to_string()),
+                Some(msg.message_id),
+            )
+            .await
+            .ok();
+            return;
+        }
+    };
+    if lines.is_empty() {
+        tg.send_message_kb_html(
+            msg.chat.id,
+            &i18n::admin_check_proxy_no_proxy(alang, target_id, &uname_disp),
+            Value::Array(vec![]),
+        )
+        .await
+        .ok();
+        return;
+    }
+
+    let probes = lines.iter().map(|raw| {
+        let raw = raw.clone();
+        async move { bot::proxy_status::PROXY_STATUS.refresh(&raw).await }
+    });
+    let results = futures_util::future::join_all(probes).await;
+
+    let mut body = i18n::admin_check_proxy_target_header(alang, target_id, &uname_disp);
+    // mask=false → in raw để admin copy. Caller chấp nhận chia sẻ credential
+    // (đã có cảnh báo trong header).
+    body.push_str(&render_pool_probe_result(alang, &lines, &results, false));
+    tg.send_message_kb_html(msg.chat.id, &body, Value::Array(vec![]))
+        .await
+        .ok();
+}
+
+/// `/set_max_per_user [n]` — ADMIN đổi default toàn cục cho `max_per_user`.
+/// No-arg: hiển thị giá trị + số user có override. Có arg: validate 1..=10,
+/// ghi DB + push atomic vào limiter (hot reload, áp ngay cho mọi user không
+/// có override).
+async fn handle_set_max_per_user(
+    tg: &Arc<TelegramClient>,
+    store: &Arc<settings::Settings>,
+    limiter: &UserLimiter,
+    msg: &Message,
+    text: &str,
+    admin_id: i64,
+) {
+    let alang = lang_or_default(store, admin_id);
+    let body_opt = command_body(text);
+    if body_opt.is_none() {
+        let current = limiter.default_max_per_user();
+        let overrides = limiter.snapshot_overrides().await.len();
+        tg.send_message_kb_html(
+            msg.chat.id,
+            &i18n::limit_show_global(alang, current, overrides),
+            Value::Array(vec![]),
+        )
+        .await
+        .ok();
+        return;
+    }
+
+    let (arg, _) = body_opt.unwrap();
+    let token = arg.split_whitespace().next().unwrap_or("");
+    let parsed: Option<u32> = token.parse().ok();
+    let Some(n) = parsed else {
+        tg.send_message_kb_html(
+            msg.chat.id,
+            &i18n::limit_invalid_range(
+                alang,
+                token,
+                settings::Settings::MAX_PER_USER_MIN,
+                settings::Settings::MAX_PER_USER_MAX,
+            ),
+            Value::Array(vec![]),
+        )
+        .await
+        .ok();
+        return;
+    };
+    if !(settings::Settings::MAX_PER_USER_MIN..=settings::Settings::MAX_PER_USER_MAX)
+        .contains(&n)
+    {
+        tg.send_message_kb_html(
+            msg.chat.id,
+            &i18n::limit_invalid_range(
+                alang,
+                token,
+                settings::Settings::MAX_PER_USER_MIN,
+                settings::Settings::MAX_PER_USER_MAX,
+            ),
+            Value::Array(vec![]),
+        )
+        .await
+        .ok();
+        return;
+    }
+
+    let old = limiter.default_max_per_user();
+    // Persist trước, rồi push vào limiter — fail DB → không thay đổi runtime
+    // (caller thấy lỗi rõ ràng, không có drift giữa atomic và DB).
+    if let Err(e) = store.set_max_per_user_default(n) {
+        tg.send_message(
+            msg.chat.id,
+            &i18n::db_error(alang, &e.to_string()),
+            Some(msg.message_id),
+        )
+        .await
+        .ok();
+        return;
+    }
+    limiter.set_default_max_per_user(n);
+    tg.send_message_kb_html(
+        msg.chat.id,
+        &i18n::limit_set_global_ok(alang, old, n),
+        Value::Array(vec![]),
+    )
+    .await
+    .ok();
+}
+
+/// `/set_user_limit <@user|id> [n|default]` — ADMIN set/show/xóa override
+/// per-user. Hỗ trợ:
+///   - `<target>` — show effective + override + default global.
+///   - `<target> <n>` — set override (1..=10).
+///   - `<target> default` — xóa override (về default global). Cũng chấp nhận
+///     `0` / `none` / `clear` cho cùng nghĩa.
+async fn handle_set_user_limit(
+    tg: &Arc<TelegramClient>,
+    store: &Arc<settings::Settings>,
+    limiter: &UserLimiter,
+    msg: &Message,
+    text: &str,
+    admin_id: i64,
+) {
+    let alang = lang_or_default(store, admin_id);
+    let Some((arg, _)) = command_body(text) else {
+        tg.send_message_kb_html(
+            msg.chat.id,
+            &i18n::limit_user_set_usage(alang),
+            Value::Array(vec![]),
+        )
+        .await
+        .ok();
+        return;
+    };
+    let mut it = arg.split_whitespace();
+    let token_target = it.next().unwrap_or("");
+    let token_value = it.next().map(|s| s.to_string());
+    if token_target.is_empty() {
+        tg.send_message_kb_html(
+            msg.chat.id,
+            &i18n::limit_user_set_usage(alang),
+            Value::Array(vec![]),
+        )
+        .await
+        .ok();
+        return;
+    }
+
+    // Resolve target → user_id (giống /chat /ban /proxy_check_user).
+    let stripped = token_target.trim_start_matches('@');
+    let (target_id, uname): (i64, Option<String>) = match stripped.parse::<i64>() {
+        Ok(id) => (id, store.known_username(id).ok().flatten()),
+        Err(_) => match store.resolve_username(stripped) {
+            Ok(Some(id)) => (id, Some(stripped.to_string())),
+            Ok(None) => {
+                tg.send_message(
+                    msg.chat.id,
+                    &i18n::admin_username_not_seen_chat(alang, stripped),
+                    Some(msg.message_id),
+                )
+                .await
+                .ok();
+                return;
+            }
+            Err(e) => {
+                tg.send_message(
+                    msg.chat.id,
+                    &i18n::admin_username_resolve_err(alang, &e.to_string()),
+                    Some(msg.message_id),
+                )
+                .await
+                .ok();
+                return;
+            }
+        },
+    };
+    let uname_disp = uname
+        .as_deref()
+        .map(|u| format!(" (@{})", u))
+        .unwrap_or_default();
+
+    // Branch theo có/không token_value.
+    let Some(value) = token_value else {
+        // Show only.
+        let override_some = limiter.get_user_override(target_id).await;
+        let default_global = limiter.default_max_per_user();
+        tg.send_message_kb_html(
+            msg.chat.id,
+            &i18n::limit_user_show(alang, target_id, &uname_disp, override_some, default_global),
+            Value::Array(vec![]),
+        )
+        .await
+        .ok();
+        return;
+    };
+
+    // Token "default" / "none" / "clear" / "0" → xóa override.
+    let lc = value.to_lowercase();
+    if matches!(lc.as_str(), "default" | "none" | "clear" | "0") {
+        // Persist trước, rồi xóa cache.
+        match store.remove_user_limit(target_id) {
+            Ok(removed) => {
+                limiter.clear_user_override(target_id).await;
+                let default_global = limiter.default_max_per_user();
+                let body = if removed {
+                    i18n::limit_user_clear_ok(alang, target_id, &uname_disp, default_global)
+                } else {
+                    i18n::limit_user_clear_none(alang, target_id, &uname_disp)
+                };
+                tg.send_message_kb_html(msg.chat.id, &body, Value::Array(vec![]))
+                    .await
+                    .ok();
+            }
+            Err(e) => {
+                tg.send_message(
+                    msg.chat.id,
+                    &i18n::db_error(alang, &e.to_string()),
+                    Some(msg.message_id),
+                )
+                .await
+                .ok();
+            }
+        }
+        return;
+    }
+
+    // Else parse u32.
+    let parsed: Option<u32> = value.parse().ok();
+    let Some(n) = parsed else {
+        tg.send_message_kb_html(
+            msg.chat.id,
+            &i18n::limit_invalid_range(
+                alang,
+                &value,
+                settings::Settings::MAX_PER_USER_MIN,
+                settings::Settings::MAX_PER_USER_MAX,
+            ),
+            Value::Array(vec![]),
+        )
+        .await
+        .ok();
+        return;
+    };
+    if !(settings::Settings::MAX_PER_USER_MIN..=settings::Settings::MAX_PER_USER_MAX)
+        .contains(&n)
+    {
+        tg.send_message_kb_html(
+            msg.chat.id,
+            &i18n::limit_invalid_range(
+                alang,
+                &value,
+                settings::Settings::MAX_PER_USER_MIN,
+                settings::Settings::MAX_PER_USER_MAX,
+            ),
+            Value::Array(vec![]),
+        )
+        .await
+        .ok();
+        return;
+    }
+
+    // Persist trước, rồi push cache. DB fail → không thay đổi runtime.
+    if let Err(e) = store.set_user_limit(target_id, n) {
+        tg.send_message(
+            msg.chat.id,
+            &i18n::db_error(alang, &e.to_string()),
+            Some(msg.message_id),
+        )
+        .await
+        .ok();
+        return;
+    }
+    limiter.set_user_override(target_id, n).await;
+    tg.send_message_kb_html(
+        msg.chat.id,
+        &i18n::limit_user_set_ok(alang, target_id, &uname_disp, n),
+        Value::Array(vec![]),
+    )
+    .await
+    .ok();
+}
+
+/// `/my_limit` — user xem giới hạn tiến trình đồng thời của chính mình +
+/// default toàn cục để biết mình có override admin cấp riêng không.
+async fn handle_my_limit(
+    tg: &Arc<TelegramClient>,
+    limiter: &UserLimiter,
+    msg: &Message,
+    user_id: i64,
+    lang: Lang,
+) {
+    let override_some = limiter.get_user_override(user_id).await;
+    let effective = override_some.unwrap_or_else(|| limiter.default_max_per_user());
+    let default_global = limiter.default_max_per_user();
+    let body = i18n::my_limit_card(lang, effective, override_some.is_some(), default_global);
+    tg.send_message_kb_html(msg.chat.id, &body, Value::Array(vec![]))
+        .await
+        .ok();
+}
+
 /// `/help` — show full command list. Section admin chỉ hiện khi user là admin.
 /// Cũng đính kèm trạng thái proxy hiện tại của user (mask).
 async fn send_help(
@@ -3659,6 +4220,9 @@ async fn send_help(
              /board — bảng tiến trình của bạn + nút Dừng\n\
              /proxy_set &lt;line&gt; — đặt proxy riêng của bạn\n\
              /proxy_remove — xóa proxy của bạn\n\
+             /proxy_check — kiểm tra LIVE pool proxy của bạn\n\
+             /login_proxy_check — kiểm tra LIVE pool login proxy (admin set)\n\
+             /my_limit — xem giới hạn tiến trình đồng thời của bạn\n\
              /2fa &lt;secret | email|pass|secret&gt; — lấy mã 2FA (TOTP) + nút làm mới\n\
              /settings — cài đặt\n\
              /language — đổi ngôn ngữ\n\
@@ -3674,6 +4238,9 @@ async fn send_help(
              /board — your process board + Stop buttons\n\
              /proxy_set &lt;line&gt; — set your own proxy\n\
              /proxy_remove — remove your proxy\n\
+             /proxy_check — LIVE check your proxy pool\n\
+             /login_proxy_check — LIVE check the login proxy pool (admin set)\n\
+             /my_limit — show your concurrent process limit\n\
              /2fa &lt;secret | email|pass|secret&gt; — get a 2FA (TOTP) code + reload button\n\
              /settings — settings\n\
              /language — change language\n\
@@ -3694,7 +4261,10 @@ async fn send_help(
              /notify_remove — xóa kênh thông báo\n\
              /notify_test — gửi test message tới kênh thông báo\n\
              /proxy_login_set &lt;line(s)&gt; — đặt POOL login proxy (multi-line, mỗi job pick random)\n\
-             /proxy_login_remove — xóa toàn bộ pool login proxy\n"
+             /proxy_login_remove — xóa toàn bộ pool login proxy\n\
+             /proxy_check_user &lt;@user | id&gt; — xem RAW pool proxy của user (kèm credential) + LIVE check\n\
+             /set_max_per_user &lt;1-10&gt; — đổi default toàn cục số tiến trình/user (no-arg để xem)\n\
+             /set_user_limit &lt;@user | id&gt; [n|default] — set/show/xóa override quota per-user\n"
         } else {
             "\n<b>Admin:</b>\n\
              /notify &lt;message&gt; — broadcast to all users (keeps formatting)\n\
@@ -3708,7 +4278,10 @@ async fn send_help(
              /notify_remove — remove notify channel\n\
              /notify_test — send a test message to notify channel\n\
              /proxy_login_set &lt;line(s)&gt; — set login proxy POOL (multi-line, each job picks random)\n\
-             /proxy_login_remove — remove the entire login proxy pool\n"
+             /proxy_login_remove — remove the entire login proxy pool\n\
+             /proxy_check_user &lt;@user | id&gt; — show RAW user proxy pool (with credentials) + LIVE check\n\
+             /set_max_per_user &lt;1-10&gt; — change global default concurrent processes/user (no-arg to view)\n\
+             /set_user_limit &lt;@user | id&gt; [n|default] — set/show/clear per-user quota override\n"
         });
     }
 

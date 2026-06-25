@@ -883,6 +883,22 @@ async def list_session_jobs() -> JSONResponse:
     })
 
 
+@app.get("/api/session/jobs/secrets")
+async def get_session_jobs_secrets() -> JSONResponse:
+    """Trả map ``job_id → {email, password, secret}`` cho mọi Session job.
+
+    Frontend render 2 Output panes (Free/Plus) ở format
+    ``email|password|secret`` — secret KHÔNG nằm trong ``job.to_dict()`` /
+    SSE broadcast (tránh leak qua snapshot). Pattern y hệt
+    ``/api/upi/jobs/secrets``.
+
+    Phải đăng ký TRƯỚC route ``{job_id}`` để FastAPI không match
+    ``secrets`` thành path param.
+    """
+    sm = get_session_manager()
+    return JSONResponse({"secrets": sm.get_secrets_map()})
+
+
 @app.get("/api/session/jobs/{job_id}")
 async def get_session_job(job_id: str) -> JSONResponse:
     sm = get_session_manager()

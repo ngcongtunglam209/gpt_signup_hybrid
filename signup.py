@@ -26,7 +26,7 @@ from mail_providers import (
     build_provider_worker,
 )
 from models import SignupRequest, SignupResult
-from random_profile import random_profile
+from random_profile import random_profile, random_profile_for_locale
 from request_phase import RequestPhaseError, run_request_phase
 
 if TYPE_CHECKING:
@@ -48,6 +48,54 @@ SIGNUP_BASE_TIMEOUT_FLOOR = 360.0
 # browser_phase để deadline NỘI BỘ của flow chạm trước (báo lỗi sạch) thay vì
 # bị watchdog hủy cứng.
 SIGNUP_POST_OTP_GRACE = 180.0
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Persona cookie filtering (anti-ban Phase 6 Task 6.1)
+# ─────────────────────────────────────────────────────────────────────
+#
+# Cookies persist sau signup → re-login lần sau (`get_session`) inject lại
+# để server thấy "device cũ", không treat fresh device.
+#
+# Whitelist cookies QUAN TRỌNG (giữ identity + minimize size):
+#   - oai-did               : ext-oai-did, device identifier
+#   - oaicom-stable-id      : stable per-device UUID (Datadog/sentinel cross-check)
+#   - oai-asli              : auth_session_logging_id source
+#   - cf_clearance          : Cloudflare bot-management clearance
+#   - __cflb / __cf_bm      : Cloudflare load balancer + bot management (TTL ngắn)
+#   - _cfuvid               : Cloudflare unique visitor ID
+#
+# KHÔNG persist:
+#   - oai-sc, oai-client-auth-session, login_session, hydra_redirect,
+#     auth-session-minimized*, oai-login-csrf_dev_*  (server-side state,
+#     re-issued mỗi session, persist KHÔNG có ý nghĩa).
+#   - __Secure-next-auth.session-token  (full session — security risk persist
+#     plain text trong DB, login flow tự issue mới).
+
+_PERSONA_COOKIE_NAMES = frozenset({
+    "oai-did",
+    "oaicom-stable-id",
+    "oai-asli",
+    "cf_clearance",
+    "__cflb",
+    "__cf_bm",
+    "_cfuvid",
+})
+
+
+def _filter_persona_cookies(all_cookies: list[dict]) -> list[dict]:
+    """Filter cookies → chỉ giữ persona-relevant subset cho persist DB.
+
+    Args:
+        all_cookies: list cookie dicts (Camoufox/Playwright format).
+
+    Returns:
+        Filtered list — chỉ cookies trong ``_PERSONA_COOKIE_NAMES``.
+    """
+    return [
+        c for c in (all_cookies or [])
+        if c.get("name") in _PERSONA_COOKIE_NAMES and c.get("value")
+    ]
 
 
 def make_otp_grace_checkpoint(
@@ -173,16 +221,19 @@ async def run_signup(
     result = SignupResult(success=False, email=request.email)
 
     try:
-        # ── Random profile nếu chưa set ──────────────────────────
+        # ── Random profile nếu chưa set (anti-ban: tên khớp locale) ──
         if not request.password or request.name == "ChatGPT User" or request.birthdate == "2000-01-01":
-            profile = random_profile()
+            # Locale ưu tiên: request.locale (CLI explicit) → None (Task 1.4
+            # sẽ auto-detect theo proxy ở browser_phase). None ở đây → default
+            # US pool (safe — tránh tên Ấn khi proxy chưa biết).
+            profile = random_profile_for_locale(request.locale)
             if not request.password:
                 request = request.model_copy(update={"password": profile["password"]})
             if request.name == "ChatGPT User":
                 request = request.model_copy(update={"name": profile["name"]})
             if request.birthdate == "2000-01-01":
                 request = request.model_copy(update={"birthdate": profile["birthdate"]})
-            log(f"[signup] profile: name={request.name} age={profile['age']}")
+            log(f"[signup] profile: name={request.name} age={profile['age']} locale={request.locale or 'default'}")
 
         # ── Build mail provider (shared for both modes) ───────────
         provider = _build_mail_provider(request, settings=settings, combo_repo=combo_repo)
@@ -206,6 +257,17 @@ async def run_signup(
         # ═══════════════════════════════════════════════════════════
         if request.reg_mode == "pure_request":
             log(f"[signup] mode=pure_request → HTTP-only registration (email={request.email})")
+            # Anti-ban runtime warning (Phase 7 Task 7.4):
+            # pure_request KHÔNG có DOM events → so-token (Session Observer)
+            # KHÔNG thể gen → server flag account = bot, ban rate cao.
+            # Recommend dùng browser mode cho production REG. Pure_request OK
+            # cho login flow (get_session) vì login KHÔNG yêu cầu so-token.
+            log(
+                "[signup] ⚠ WARNING: pure_request signup KHÔNG gen được "
+                "openai-sentinel-so-token (cần DOM events thật). Server có thể "
+                "flag account = bot trong vòng 24h. Recommend reg_mode='browser' "
+                "cho production REG. Xem journal 260625-1224 bug C1."
+            )
             result = await run_request_phase(
                 request=request,
                 mail_provider=provider,
@@ -265,6 +327,24 @@ async def run_signup(
                 result.age = today.year - int(y) - ((today.month, today.day) < (int(m), int(d)))
             except Exception:
                 pass
+
+            # ── Persona cookies persist (anti-ban Phase 6 Task 6.1) ──
+            # Save subset cookies persona-aware vào DB (oai-did, oaicom-stable-id,
+            # oai-asli, etc.) để re-login lần sau (`get_session`) inject lại
+            # → server thấy "device cũ", không treat fresh device.
+            #
+            # Best-effort: KHÔNG fail signup nếu save fail (account đã create).
+            if combo_repo is not None and request.outlook_combo and result.cookies:
+                try:
+                    persona_cookies = _filter_persona_cookies(result.cookies)
+                    if persona_cookies:
+                        combo_repo.set_persona_cookies(request.email, persona_cookies)
+                        log(
+                            f"[signup] persisted {len(persona_cookies)} persona cookies "
+                            f"({sorted(c['name'] for c in persona_cookies)[:6]}...)"
+                        )
+                except Exception as exc:
+                    log(f"[signup] persona_cookies save failed (non-fatal): {exc}")
 
     except (BrowserPhaseError, HttpPhaseError, RequestPhaseError, TimeoutError, ValueError, OutlookComboError, OutlookProviderUnavailable) as exc:
         result.error = f"{type(exc).__name__}: {exc}"

@@ -251,8 +251,18 @@ body {
 .card-log      { grid-area: log; }
 .card-success  { grid-area: success; }
 .card-error    { grid-area: error; }
+.card-ses-free { grid-area: free; }
+.card-ses-plus { grid-area: plus; }
 
-#tab-session,
+#tab-session {
+  grid-template-areas:
+    "input jobs"
+    "log   jobs"
+    "free  plus"
+    "error error";
+  grid-template-rows: minmax(0, 1.0fr) minmax(0, 0.7fr) minmax(0, 0.46fr) minmax(0, 0.32fr);
+}
+
 #tab-link {
   grid-template-areas:
     "input jobs"
@@ -283,6 +293,16 @@ body {
       "log"
       "error";
     grid-template-rows: minmax(0, 1.1fr) minmax(0, 0.86fr) minmax(0, 0.62fr) minmax(0, 0.46fr);
+  }
+  #tab-session {
+    grid-template-areas:
+      "input"
+      "jobs"
+      "log"
+      "free"
+      "plus"
+      "error";
+    grid-template-rows: minmax(0, 1.1fr) minmax(0, 0.86fr) minmax(0, 0.62fr) minmax(0, 0.46fr) minmax(0, 0.46fr) minmax(0, 0.46fr);
   }
   .topbar {
     flex-wrap: wrap;

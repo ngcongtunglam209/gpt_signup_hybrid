@@ -1,161 +1,43 @@
-"""Windows Chrome browser persona — single source of truth cho mọi flow reg/request.
+"""Browser persona — single source of truth cho fingerprint stack mọi flow.
 
-Mục đích:
-    Đồng bộ User-Agent + sec-ch-ua family + TLS fingerprint + browser persona
-    giữa Phase 1 (browser_phase.py — Camoufox), Phase 2 (request_phase.py /
-    session_phase.py — curl_cffi) và Sentinel (PoW + QuickJS).
+Anti-ban (journal 260625-1224 Task 3.1 + bug H5):
+    Trace tay (Camoufox = Firefox 135 Mac) cho thấy server cross-check:
+        HTTP UA  ↔  TLS fingerprint (JA3/JA4)  ↔
+        Sentinel proof body (decoded chứa UA)  ↔
+        navigator.userAgent trong DOM
+    Tất cả 4 phải KHỚP nhau, nếu không → cờ đỏ.
 
-    Trước refactor mỗi module hardcode UA khác nhau (Mac Chrome 136 / Windows
-    Chrome 145 / Mac Firefox 135) → fingerprint mismatch giữa các tầng cùng 1
-    reg, anti-bot OpenAI có thể flag (biểu hiện: 200 OK nhưng OTP không gửi).
+    Code cũ ép tất cả về Chrome 145 Windows (kể cả khi Camoufox = Firefox).
+    Sentinel proof chứa "Chrome" trong khi HTTP UA Firefox = lệch → ban.
 
-Quy tắc khi nâng version:
-    1. Sửa CHROME_MAJOR (string).
-    2. Đảm bảo curl_cffi hiện hành có ``chrome{MAJOR}`` impersonate token
-       (kiểm tra: ``BrowserType`` enum trong curl_cffi.requests.impersonate).
-       Nếu không có → giữ MAJOR mới nhất mà curl_cffi support, fallback về
-       version cũ hơn cùng family.
-    3. KHÔNG hardcode ngoài file này. Tất cả module khác phải import.
-
-Tham khảo:
-    - sec-ch-ua format: https://wicg.github.io/ua-client-hints/
-    - curl_cffi browser impersonation: https://github.com/lexiforest/curl_cffi
-    - Camoufox OS pinning: AsyncCamoufox(os=["windows"]) → pin navigator.platform,
-      WebGL renderer, fonts, screen properties theo Windows persona.
+Module này expose:
+    - ``BrowserPersona`` dataclass — đóng gói full fingerprint stack.
+    - ``CHROME_145_WIN`` — Chrome desktop Windows (cho curl_cffi pure_request login).
+    - ``FIREFOX_135_MAC`` — Firefox desktop Mac (cho REG Camoufox + signup browser).
+    - ``get_persona(name)`` — lookup theo name (settings ``reg.persona``).
+    - Top-level constants — backward compat alias trỏ vào CHROME_145_WIN
+      (callers cũ không break).
 """
 from __future__ import annotations
 
-# ─── Chrome version (single knob) ─────────────────────────────────────
-
-CHROME_MAJOR = "145"
-"""Chrome major version. Chrome stable Windows desktop phổ biến (≥30% desktop
-traffic). Đồng bộ giữa UA, sec-ch-ua, sentinel sdk emulation, và TLS fingerprint."""
-
-CHROME_FULL = f"{CHROME_MAJOR}.0.0.0"
-"""Chrome full version theo format Mozilla UA. Chrome luôn dùng patch=0.0.0
-trong UA string (greaseing) — không reveal patch level."""
+from dataclasses import dataclass
 
 
-# ─── HTTP User-Agent ──────────────────────────────────────────────────
-
-WINDOWS_USER_AGENT = (
-    f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    f"AppleWebKit/537.36 (KHTML, like Gecko) "
-    f"Chrome/{CHROME_FULL} Safari/537.36"
-)
-"""User-Agent string Windows 10/11 desktop x64 Chrome stable.
-
-Windows NT 10.0 cover cả Win10 và Win11 (Microsoft không bump NT version cho
-Win11) → match >95% Windows desktop trên thực tế."""
-
-
-# ─── Client Hints (sec-ch-ua family) ──────────────────────────────────
-
-SEC_CH_UA = (
-    f'"Chromium";v="{CHROME_MAJOR}", '
-    f'"Google Chrome";v="{CHROME_MAJOR}", '
-    f'"Not_A Brand";v="24"'
-)
-"""sec-ch-ua header — brand list theo GREASE spec.
-
-Format Chrome thực tế gửi: 3 brand (Chromium / Google Chrome / GREASE brand).
-Chromium rotate greasing brand qua các major version để force ecosystem handle
-unknown brand gracefully. Chrome >= 130 dùng các giá trị: ``"Not_A Brand";v="24"``,
-``"Not?A_Brand";v="24"``, ``"Not(A:Brand";v="8"``. Trước Chrome 117 từng dùng
-``"Not.A/Brand";v="99"`` — đã obsolete.
-
-Server (OpenAI sentinel + cloudfront) KHÔNG validate brand string cụ thể, chỉ
-check 3 brand đều có và Chromium/Google Chrome version match. Giá trị greasing
-chỉ ảnh hưởng anti-bot heuristic phân loại Chrome version range."""
-
-SEC_CH_UA_MOBILE = "?0"
-"""Desktop, không phải mobile."""
-
-SEC_CH_UA_PLATFORM = '"Windows"'
-"""Platform name. Phải bọc trong dấu nháy kép theo spec sec-ch-ua."""
-
-SEC_CH_UA_PLATFORM_VERSION = '"15.0.0"'
-"""Platform version cho Windows 11. Win10=10.0.0, Win11=15.0.0 (ư cầu API
-GetHighEntropyValues — Microsoft map Win11 thành major 15+).
-
-Chỉ dùng khi server gửi Accept-CH yêu cầu sec-ch-ua-platform-version (low
-entropy hint, browser tự gửi nếu site có Critical-CH header)."""
-
-
-def common_chrome_headers(*, referer: str = "https://chatgpt.com/") -> dict[str, str]:
-    """Header tối thiểu Chrome desktop gửi cho mọi same-origin request.
-
-    Bao gồm UA + 3 sec-ch-ua headers low-entropy (browser thật gửi mặc định
-    không cần Accept-CH). KHÔNG bao gồm sec-fetch-* (caller tự thêm theo
-    context request).
-
-    Args:
-        referer: URL referer. Origin được suy ra từ scheme+netloc.
-
-    Returns:
-        dict[str, str] — đủ key để merge vào headers request.
-    """
-    return {
-        "User-Agent": WINDOWS_USER_AGENT,
-        "sec-ch-ua": SEC_CH_UA,
-        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
-        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": referer,
-    }
-
-
-# ─── curl_cffi TLS fingerprint ────────────────────────────────────────
-
-CURL_IMPERSONATE_PRIMARY = "chrome145"
-"""Token impersonate chính. TLS hello + HTTP/2 settings + header order khớp
-Chrome 145 trên Windows."""
-
-CURL_IMPERSONATE_FALLBACK: tuple[str, ...] = ("chrome142", "chrome136")
-"""Fallback chain khi TLS handshake error (curl: 35/56/7/handshake).
-
-Thứ tự: cùng family Chrome, version giảm dần. Phải tồn tại trong curl_cffi
-``BrowserType`` enum. KHÔNG fallback sang firefox/safari — sẽ làm UA ↔ TLS
-mismatch."""
-
-CURL_IMPERSONATE_CANDIDATES: tuple[str, ...] = (
-    CURL_IMPERSONATE_PRIMARY,
-    *CURL_IMPERSONATE_FALLBACK,
-)
-"""Full chain dùng cho TLS rotation: primary → fallback."""
-
-
-# ─── Camoufox browser persona ─────────────────────────────────────────
-
-CAMOUFOX_OS: tuple[str, ...] = ("windows",)
-"""Pin Camoufox persona OS = Windows. Khi pass vào ``AsyncCamoufox(os=...)``
-sẽ force navigator.platform="Win32", WebGL renderer "ANGLE Windows", screen
-properties Windows desktop, và font list Windows."""
-
-
-# ─── Sentinel sdk.js emulated navigator ───────────────────────────────
-
-NAVIGATOR_LANGUAGE = "en-US"
-NAVIGATOR_LANGUAGES: tuple[str, ...] = ("en-US", "en")
-HARDWARE_CONCURRENCY = 12
-"""logical core count. 12 = CPU 6c/12t (Win desktop / laptop tầm trung phổ
-biến nhất trên Steam HW Survey + StatCounter)."""
-
-DEVICE_MEMORY_GB = 8
-"""navigator.deviceMemory rounded value. 8GB là mode phổ biến nhất."""
+# ─────────────────────────────────────────────────────────────────────
+# Helper — parse sec-ch-ua header
+# ─────────────────────────────────────────────────────────────────────
 
 
 def _parse_brands_from_sec_ch_ua(value: str) -> list[dict[str, str]]:
-    """Parse SEC_CH_UA string thành list ``[{"brand", "version"}]``.
+    """Parse ``"Brand";v="x", "Brand2";v="y"`` thành list ``[{brand, version}]``.
 
-    Input format: ``'"Brand A";v="1", "Brand B";v="2", ...'``
+    Dùng cho navigator.userAgentData.brands trong sdk.js context.
     """
     out: list[dict[str, str]] = []
     for chunk in value.split(","):
         chunk = chunk.strip()
         if not chunk:
             continue
-        # Pattern: "Brand";v="version"
         try:
             brand_part, ver_part = chunk.split(";", 1)
             brand = brand_part.strip().strip('"')
@@ -166,39 +48,263 @@ def _parse_brands_from_sec_ch_ua(value: str) -> list[dict[str, str]]:
     return out
 
 
-def sentinel_navigator_payload() -> dict[str, object]:
-    """Payload bổ sung pass cho ``openai_sentinel_quickjs.js`` (sdk.js context).
+# ─────────────────────────────────────────────────────────────────────
+# BrowserPersona — fingerprint stack đóng gói
+# ─────────────────────────────────────────────────────────────────────
 
-    JS file đọc payload để build ``navigator`` + ``navigator.userAgentData`` (Chrome
-    90+ Client Hints API). Trước refactor caller không pass → fallback
-    ``"Mozilla/5.0"`` + userAgentData=undefined → fingerprint sdk.js cực kỳ generic
-    và bất thường (browser thật luôn có userAgentData).
 
-    Bao gồm:
-        - user_agent string (navigator.userAgent)
-        - language / languages (navigator.language(s))
-        - hardware_concurrency / device_memory
-        - sec_ch_ua_brands (navigator.userAgentData.brands)
-        - sec_ch_ua_mobile / platform / platform_version (high-entropy hints)
+@dataclass(frozen=True, slots=True)
+class BrowserPersona:
+    """Đóng gói full fingerprint stack của 1 browser persona.
+
+    Mọi field phải nội tại consistent — vd persona Firefox phải có sec_ch_ua=None
+    (Firefox KHÔNG gửi Client Hints), accept_language q=0.5 (Firefox style), v.v.
+
+    Public API:
+        - ``user_agent`` / ``sec_ch_ua`` / ``camoufox_os`` — top-level fingerprint
+        - ``navigator_payload()`` — dict cho ``openai_sentinel_quickjs.js``
+        - ``common_headers()`` — dict header tối thiểu cho HTTP request
+        - ``curl_impersonate_candidates`` — list impersonate token rotation
     """
-    return {
-        "user_agent": WINDOWS_USER_AGENT,
-        "language": NAVIGATOR_LANGUAGE,
-        "languages": list(NAVIGATOR_LANGUAGES),
-        "hardware_concurrency": HARDWARE_CONCURRENCY,
-        "device_memory": DEVICE_MEMORY_GB,
-        # Client Hints — phải khớp với header sec-ch-ua* gửi cùng request.
-        "sec_ch_ua_brands": _parse_brands_from_sec_ch_ua(SEC_CH_UA),
-        "sec_ch_ua_mobile": False,  # SEC_CH_UA_MOBILE = "?0"
-        "sec_ch_ua_platform": "Windows",
-        "sec_ch_ua_platform_version": "15.0.0",
-        "sec_ch_ua_arch": "x86",
-        "sec_ch_ua_bitness": "64",
-        "sec_ch_ua_model": "",
-    }
+    name: str
+    user_agent: str
+
+    # Client Hints (Chrome only — Firefox = None)
+    sec_ch_ua: str | None
+    sec_ch_ua_mobile: str | None
+    sec_ch_ua_platform: str | None
+    sec_ch_ua_platform_version: str | None
+
+    # Common headers
+    accept_language: str   # Chrome: "en-US,en;q=0.9", Firefox: "en-US,en;q=0.5"
+    accept_encoding: str   # cả 2 đều "gzip, deflate, br, zstd"
+
+    # Camoufox/Playwright launch
+    camoufox_os: tuple[str, ...]   # ("windows",) hoặc ("mac",)
+
+    # curl_cffi TLS fingerprint
+    curl_impersonate_primary: str
+    curl_impersonate_fallback: tuple[str, ...]
+
+    # Sentinel sdk.js navigator payload
+    navigator_language: str
+    navigator_languages: tuple[str, ...]
+    hardware_concurrency: int
+    device_memory: int
+    arch: str       # "x86" cho Win, "arm" cho Mac silicon
+    bitness: str    # "64"
+
+    @property
+    def curl_impersonate_candidates(self) -> tuple[str, ...]:
+        """Rotation chain: primary → fallback."""
+        return (self.curl_impersonate_primary, *self.curl_impersonate_fallback)
+
+    def common_headers(self, *, referer: str = "https://chatgpt.com/") -> dict[str, str]:
+        """Header tối thiểu cho HTTP request từ persona này.
+
+        Chrome: gửi đủ User-Agent + Accept-Language + 3 sec-ch-ua headers.
+        Firefox: chỉ User-Agent + Accept-Language (no Client Hints — đặc trưng).
+        """
+        headers: dict[str, str] = {
+            "User-Agent": self.user_agent,
+            "Accept-Language": self.accept_language,
+            "Accept-Encoding": self.accept_encoding,
+            "Referer": referer,
+        }
+        if self.sec_ch_ua:
+            # Chrome family — gửi sec-ch-ua* low-entropy hints
+            headers["sec-ch-ua"] = self.sec_ch_ua
+            if self.sec_ch_ua_mobile:
+                headers["sec-ch-ua-mobile"] = self.sec_ch_ua_mobile
+            if self.sec_ch_ua_platform:
+                headers["sec-ch-ua-platform"] = self.sec_ch_ua_platform
+        return headers
+
+    def navigator_payload(self) -> dict[str, object]:
+        """Navigator payload pass cho ``openai_sentinel_quickjs.js`` (sdk.js).
+
+        sdk.js đọc payload để build navigator + navigator.userAgentData. Nếu
+        persona = Firefox, navigator.userAgentData = undefined (giống Firefox
+        thật) — không inject brands/platform.
+        """
+        if self.sec_ch_ua:
+            brands = _parse_brands_from_sec_ch_ua(self.sec_ch_ua)
+            mobile = self.sec_ch_ua_mobile == "?1"
+            platform = (self.sec_ch_ua_platform or "").strip('"')
+            platform_version = (self.sec_ch_ua_platform_version or "").strip('"')
+        else:
+            brands = []
+            mobile = False
+            platform = ""
+            platform_version = ""
+
+        return {
+            "user_agent": self.user_agent,
+            "language": self.navigator_language,
+            "languages": list(self.navigator_languages),
+            "hardware_concurrency": self.hardware_concurrency,
+            "device_memory": self.device_memory,
+            # Client Hints — Chrome có, Firefox không (sdk.js sẽ thấy
+            # navigator.userAgentData=undefined nếu brands=[]).
+            "sec_ch_ua_brands": brands,
+            "sec_ch_ua_mobile": mobile,
+            "sec_ch_ua_platform": platform,
+            "sec_ch_ua_platform_version": platform_version,
+            "sec_ch_ua_arch": self.arch,
+            "sec_ch_ua_bitness": self.bitness,
+            "sec_ch_ua_model": "",
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Persona instances — KHÔNG hardcode bên ngoài file này
+# ─────────────────────────────────────────────────────────────────────
+
+# Chrome 145 Windows desktop — default cho curl_cffi pure_request flow
+# (login, get_session). HTTP UA + TLS impersonate đều Chrome → consistent.
+CHROME_145_WIN = BrowserPersona(
+    name="chrome_win",
+    user_agent=(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/145.0.0.0 Safari/537.36"
+    ),
+    sec_ch_ua=(
+        '"Chromium";v="145", '
+        '"Google Chrome";v="145", '
+        '"Not_A Brand";v="24"'
+    ),
+    sec_ch_ua_mobile="?0",
+    sec_ch_ua_platform='"Windows"',
+    sec_ch_ua_platform_version='"15.0.0"',
+    accept_language="en-US,en;q=0.9",
+    accept_encoding="gzip, deflate, br, zstd",
+    camoufox_os=("windows",),
+    curl_impersonate_primary="chrome145",
+    curl_impersonate_fallback=("chrome142", "chrome136"),
+    navigator_language="en-US",
+    navigator_languages=("en-US", "en"),
+    hardware_concurrency=12,
+    device_memory=8,
+    arch="x86",
+    bitness="64",
+)
+
+
+# Firefox 135 Mac desktop — default cho REG signup flow (Camoufox = Firefox).
+# HTTP UA Firefox + TLS Firefox (Camoufox tự handle) + Sentinel payload Firefox
+# → tất cả KHỚP. Trace tay xác nhận persona này là default thực tế của Camoufox.
+FIREFOX_135_MAC = BrowserPersona(
+    name="firefox_mac",
+    user_agent=(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:135.0) "
+        "Gecko/20100101 Firefox/135.0"
+    ),
+    sec_ch_ua=None,             # Firefox KHÔNG gửi Client Hints — đặc trưng quan trọng
+    sec_ch_ua_mobile=None,
+    sec_ch_ua_platform=None,
+    sec_ch_ua_platform_version=None,
+    accept_language="en-US,en;q=0.5",   # Firefox q-value 0.5 (Chrome dùng 0.9)
+    accept_encoding="gzip, deflate, br, zstd",
+    camoufox_os=("mac",),
+    # NOTE: curl_cffi có thể không hỗ trợ firefox impersonate cho version mới.
+    # REG flow (Camoufox) KHÔNG dùng curl_impersonate — sentinel iframe trong page
+    # tự handle TLS. Chỉ dùng nếu pure_request bridge sang Firefox persona (Phase 6).
+    curl_impersonate_primary="firefox135",
+    curl_impersonate_fallback=("firefox133", "firefox120"),
+    navigator_language="en-US",
+    navigator_languages=("en-US", "en"),
+    hardware_concurrency=10,    # Mac M1/M2 8c/10c phổ biến
+    device_memory=8,
+    arch="arm",                  # Mac silicon
+    bitness="64",
+)
+
+
+_PERSONA_REGISTRY: dict[str, BrowserPersona] = {
+    p.name: p for p in (CHROME_145_WIN, FIREFOX_135_MAC)
+}
+
+
+def get_persona(name: str) -> BrowserPersona:
+    """Lookup persona theo name (vd "firefox_mac"). Raise nếu unknown.
+
+    Caller pattern:
+        persona = get_persona(settings.get("reg.persona") or "firefox_mac")
+    """
+    p = _PERSONA_REGISTRY.get(name)
+    if p is None:
+        raise ValueError(
+            f"unknown persona: {name!r}. Available: {sorted(_PERSONA_REGISTRY)}"
+        )
+    return p
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Backward-compatible top-level constants (default = CHROME_145_WIN)
+#
+# Caller cũ (request_phase.py, sentinel_*.py, session_phase.py) import constant
+# trực tiếp. Giữ alias để KHÔNG break — mặc định Chrome (vì pure_request +
+# get_session dùng curl_cffi Chrome impersonate). REG flow nên dùng
+# ``get_persona("firefox_mac")`` trực tiếp.
+# ─────────────────────────────────────────────────────────────────────
+
+CHROME_MAJOR = "145"
+CHROME_FULL = f"{CHROME_MAJOR}.0.0.0"
+
+WINDOWS_USER_AGENT = CHROME_145_WIN.user_agent
+SEC_CH_UA = CHROME_145_WIN.sec_ch_ua or ""
+SEC_CH_UA_MOBILE = CHROME_145_WIN.sec_ch_ua_mobile or ""
+SEC_CH_UA_PLATFORM = CHROME_145_WIN.sec_ch_ua_platform or ""
+SEC_CH_UA_PLATFORM_VERSION = CHROME_145_WIN.sec_ch_ua_platform_version or ""
+
+CURL_IMPERSONATE_PRIMARY = CHROME_145_WIN.curl_impersonate_primary
+CURL_IMPERSONATE_FALLBACK = CHROME_145_WIN.curl_impersonate_fallback
+CURL_IMPERSONATE_CANDIDATES = CHROME_145_WIN.curl_impersonate_candidates
+
+CAMOUFOX_OS = CHROME_145_WIN.camoufox_os
+
+NAVIGATOR_LANGUAGE = CHROME_145_WIN.navigator_language
+NAVIGATOR_LANGUAGES = CHROME_145_WIN.navigator_languages
+HARDWARE_CONCURRENCY = CHROME_145_WIN.hardware_concurrency
+DEVICE_MEMORY_GB = CHROME_145_WIN.device_memory
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Helper functions — backward compat
+# ─────────────────────────────────────────────────────────────────────
+
+
+def common_chrome_headers(*, referer: str = "https://chatgpt.com/") -> dict[str, str]:
+    """Chrome desktop common headers (alias cho ``CHROME_145_WIN.common_headers``)."""
+    return CHROME_145_WIN.common_headers(referer=referer)
+
+
+def sentinel_navigator_payload(
+    persona: BrowserPersona | None = None,
+) -> dict[str, object]:
+    """Sentinel sdk.js navigator payload.
+
+    Args:
+        persona: BrowserPersona instance. None = backward compat = CHROME_145_WIN.
+
+    Caller mới nên pass persona explicit:
+        from user_agent_profile import get_persona, sentinel_navigator_payload
+        payload = sentinel_navigator_payload(get_persona("firefox_mac"))
+    """
+    p = persona or CHROME_145_WIN
+    return p.navigator_payload()
 
 
 __all__ = [
+    # New public API
+    "BrowserPersona",
+    "CHROME_145_WIN",
+    "FIREFOX_135_MAC",
+    "get_persona",
+    "sentinel_navigator_payload",
+    "common_chrome_headers",
+    # Backward compat constants
     "CHROME_MAJOR",
     "CHROME_FULL",
     "WINDOWS_USER_AGENT",
@@ -206,7 +312,6 @@ __all__ = [
     "SEC_CH_UA_MOBILE",
     "SEC_CH_UA_PLATFORM",
     "SEC_CH_UA_PLATFORM_VERSION",
-    "common_chrome_headers",
     "CURL_IMPERSONATE_PRIMARY",
     "CURL_IMPERSONATE_FALLBACK",
     "CURL_IMPERSONATE_CANDIDATES",
@@ -215,5 +320,4 @@ __all__ = [
     "NAVIGATOR_LANGUAGES",
     "HARDWARE_CONCURRENCY",
     "DEVICE_MEMORY_GB",
-    "sentinel_navigator_payload",
 ]

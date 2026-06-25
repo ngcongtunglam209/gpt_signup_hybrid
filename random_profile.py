@@ -112,6 +112,54 @@ def random_profile() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Locale-aware profile (anti-ban: tên khớp proxy country)
+# ─────────────────────────────────────────────────────────────────────
+#
+# Trace tay (HAR `web_record_20260625-120705_manual`) cho thấy server cross-check
+# IP country (proxy) ↔ tên submit ↔ địa chỉ → profile US "Aaron Smith" submit
+# qua proxy India = anti-fraud signal. Helper này chọn name pool theo locale.
+#
+# Mapping (mở rộng được khi có thêm pool):
+#   en-IN, hi-* → India pool (random_india_profile, password+birthdate giữ)
+#   en-US, en-GB, en-AU, en → US/EU pool (random_profile)
+#   en-* khác   → US/EU pool (default)
+#   không khớp  → US/EU pool (safe fallback)
+#
+# Pool mở rộng (Phase 5):
+#   zh-CN, zh-* → CN pool (chưa có)
+#   pt-BR       → BR pool (chưa có)
+#   …
+
+
+def random_profile_for_locale(locale: str | None) -> dict:
+    """Random profile theo locale string.
+
+    Trả về dict cùng shape với ``random_profile()`` (name, age, password,
+    birthdate) — KHÔNG bao gồm các field địa chỉ India (caller dùng
+    ``random_india_profile()`` trực tiếp khi cần billing form).
+
+    Args:
+        locale: locale BCP-47 (vd "en-IN", "en-US"). None → default US.
+    """
+    loc = (locale or "").lower().strip()
+
+    # India: en-IN hoặc bất kỳ ngôn ngữ Ấn nào (hi, ta, te, bn, ...)
+    if loc.startswith("en-in") or loc.startswith("hi") or loc.startswith("bn-in") \
+            or loc.startswith("ta-in") or loc.startswith("te-in"):
+        full = random_india_profile()
+        # Strip phần địa chỉ — caller cần billing thì gọi random_india_profile() trực tiếp.
+        return {
+            "name": full["name"],
+            "age": full["age"],
+            "password": full["password"],
+            "birthdate": full["birthdate"],
+        }
+
+    # US/EU pool — bao gồm en-US, en-GB, en-AU, en-CA, en, hoặc fallback unknown.
+    return random_profile()
+
+
+# ─────────────────────────────────────────────────────────────────────
 # India profile / billing generator
 # ─────────────────────────────────────────────────────────────────────
 

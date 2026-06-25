@@ -26,10 +26,15 @@
     jobSummary:   $('ses-job-summary'),
     logPane:      $('ses-log-pane'),
     logTarget:    $('ses-log-target'),
-    successPane:  null,
+    freePane:     $('ses-free-pane'),
+    plusPane:     $('ses-plus-pane'),
+    freeCount:    $('ses-free-count'),
+    plusCount:    $('ses-plus-count'),
+    btnCopyFree:  $('ses-btn-copy-free'),
+    btnCopyPlus:  $('ses-btn-copy-plus'),
     errorPane:    $('ses-error-pane'),
-    btnCopyError:   $('ses-btn-copy-error'),
-    btnClearDone:   $('ses-btn-clear-done'),
+    btnCopyError: $('ses-btn-copy-error'),
+    btnClearDone: $('ses-btn-clear-done'),
   };
 
   // ── Helpers ───────────────────────────────────────────────────────
@@ -139,18 +144,150 @@
   // Session data lưu local khi job success (để copy/download)
   const sessionCache = new Map(); // job_id → session_data
 
+  // Output panes: 2 blocks Free / Plus, format `email|password|secret`.
+  //
+  // 2 nguồn lookup secret theo thứ tự ưu tiên (giống pattern UPI tab):
+  //   1. _pastedSecretsByEmail — parse trực tiếp từ textarea lúc user click
+  //      Run; có NGAY, không phụ thuộc network. Persist localStorage để
+  //      sống qua reload.
+  //   2. secretsCache — fetch async từ /api/session/jobs/secrets (fallback
+  //      khi input bị clear hoặc reload mất localStorage).
+  // Backend KHÔNG đưa password/secret vào job.to_dict() (tránh leak qua
+  // SSE snapshot) → frontend phải tự cache.
+  const secretsCache = new Map(); // job_id → {email, password, secret}
+  const _pastedSecretsByEmail = new Map(); // emailLower → {password, secret}
+  let _secretsRefreshScheduled = false;
+
+  const LS_PASTED_SECRETS_SES = 'gpt_reg.session.pasted_secrets';
+
+  function _persistPastedSecrets() {
+    try {
+      const obj = {};
+      for (const [k, v] of _pastedSecretsByEmail.entries()) obj[k] = v;
+      localStorage.setItem(LS_PASTED_SECRETS_SES, JSON.stringify(obj));
+    } catch (_) { /* quota — ignore */ }
+  }
+
+  function _loadPastedSecrets() {
+    try {
+      const raw = localStorage.getItem(LS_PASTED_SECRETS_SES);
+      if (!raw) return;
+      const obj = JSON.parse(raw);
+      if (obj && typeof obj === 'object') {
+        for (const [k, v] of Object.entries(obj)) _pastedSecretsByEmail.set(k, v);
+      }
+    } catch (_) { /* corrupt — ignore */ }
+  }
+
+  // Parse input textarea, populate _pastedSecretsByEmail. Gọi NGAY khi user
+  // click Run (trước khi POST add_jobs) để cache có data trước khi SSE job
+  // event đầu tiên về. KHÔNG validate format ở đây — backend đã validate.
+  function _capturePastedSecrets(rawText) {
+    const lines = rawText.split('\n');
+    let added = 0;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const parts = trimmed.split('|').map((p) => p.trim());
+      if (parts.length < 2 || !parts[0].includes('@')) continue;
+      const email = parts[0].toLowerCase();
+      _pastedSecretsByEmail.set(email, {
+        password: parts[1] || '',
+        secret: parts[2] || '',
+      });
+      added += 1;
+    }
+    if (added > 0) _persistPastedSecrets();
+    return added;
+  }
+
+  function scheduleSecretsRefresh() {
+    if (_secretsRefreshScheduled) return;
+    _secretsRefreshScheduled = true;
+    // Debounce ~150ms — gom nhiều SSE event vào 1 fetch.
+    setTimeout(() => {
+      _secretsRefreshScheduled = false;
+      refreshSecrets();
+    }, 150);
+  }
+
+  function refreshSecrets() {
+    return api('/api/session/jobs/secrets').then((data) => {
+      const map = data.secrets || {};
+      // Replace toàn bộ cache (server là source of truth — job removed sẽ
+      // biến mất khỏi map). Không merge vì stale entry sẽ leak qua copy.
+      secretsCache.clear();
+      for (const id of Object.keys(map)) {
+        secretsCache.set(id, map[id] || {});
+      }
+      renderOutputs();
+    }).catch((err) => {
+      console.warn('[session] refreshSecrets failed:', err && err.message);
+    });
+  }
+
+  function _resolveSecretsFor(j) {
+    // Lookup password+secret cho 1 job, ưu tiên pasted map (chắc chắn có
+    // ngay khi user click Run) → fallback secretsCache (fetch async).
+    const id = j.id;
+    const emailLow = (j.email || '').toLowerCase();
+    const pasted = _pastedSecretsByEmail.get(emailLow);
+    if (pasted && pasted.password) {
+      return { password: pasted.password, secret: pasted.secret || '' };
+    }
+    const cached = secretsCache.get(id);
+    if (cached && cached.password) {
+      return { password: cached.password, secret: cached.secret || '' };
+    }
+    return { password: '', secret: '' };
+  }
+
+  // Phân loại plan: PLUS = bất kỳ paid plan (plus/pro/team/enterprise/business),
+  // FREE = phần còn lại (free hoặc null/unknown). User yêu cầu chỉ 2 blocks
+  // → gộp tất cả paid vào PLUS để không drop data.
+  function _isPlusPlan(planType) {
+    if (!planType) return false;
+    const p = String(planType).toLowerCase().trim();
+    return p !== '' && p !== 'free';
+  }
+
+  function _formatAccountLine(j) {
+    const { password, secret } = _resolveSecretsFor(j);
+    if (!password) {
+      return `${j.email}  (đang tải secrets...)`;
+    }
+    return secret
+      ? `${j.email}|${password}|${secret}`
+      : `${j.email}|${password}`;
+  }
+
   function renderOutputs() {
+    const freeLines = [];
+    const plusLines = [];
     const errorLines = [];
     for (const id of state.order) {
       const j = state.jobs.get(id);
       if (!j) continue;
-      if (j.status === 'success' && j.has_session && !sessionCache.has(id)) {
-        // Auto-fetch session data khi job success
-        loadSessionData(id);
-      } else if (j.status === 'error') {
+      if (j.status === 'success') {
+        // Auto-fetch full session data nếu chưa có (cho download/copy JSON).
+        if (j.has_session && !sessionCache.has(id)) loadSessionData(id);
+        if (_isPlusPlan(j.plan_type)) {
+          plusLines.push(_formatAccountLine(j));
+        } else {
+          freeLines.push(_formatAccountLine(j));
+        }
+      } else if (j.status === 'error' && j.error) {
         errorLines.push(`${j.email}  →  ${j.error || 'unknown'}`);
       }
     }
+    dom.freePane.textContent = freeLines.length
+      ? freeLines.join('\n')
+      : 'Format: email|password|secret_2fa';
+    dom.plusPane.textContent = plusLines.length
+      ? plusLines.join('\n')
+      : 'Format: email|password|secret_2fa';
+    dom.freeCount.textContent = freeLines.length;
+    dom.plusCount.textContent = plusLines.length;
     dom.errorPane.textContent = errorLines.length
       ? errorLines.join('\n')
       : 'No errors yet.';
@@ -289,6 +426,10 @@
   dom.btnRun.addEventListener('click', async () => {
     const combos = dom.comboInput.value.trim();
     if (!combos) { await Dialog.alert({ message: 'Paste combos first.' }); return; }
+    // Capture pasted secrets NGAY (trước khi POST) để Output panes có data
+    // ngay khi SSE job event đầu tiên về — không phụ thuộc race condition
+    // /api/session/jobs/secrets fetch.
+    _capturePastedSecrets(combos);
     dom.btnRun.disabled = true;
     try {
       // Sync config
@@ -303,6 +444,7 @@
         method: 'POST',
         body: JSON.stringify({ combos, reg_mode: regMode }),
       });
+      scheduleSecretsRefresh();
     } catch (err) {
       await Dialog.alert({ message: 'Error: ' + err.message });
     } finally {
@@ -339,9 +481,15 @@
     } catch (err) { console.error(err); }
   });
 
-  // ── Copy error button ──────────────────────────────────────────────
+  // ── Copy buttons ──────────────────────────────────────────────────
   dom.btnCopyError.addEventListener('click', () => {
     window.GptUi.copyText(dom.errorPane.textContent);
+  });
+  dom.btnCopyFree.addEventListener('click', () => {
+    window.GptUi.copyText(dom.freePane.textContent);
+  });
+  dom.btnCopyPlus.addEventListener('click', () => {
+    window.GptUi.copyText(dom.plusPane.textContent);
   });
 
   // ── SSE (via SseBus) ────────────────────────────────────────────
@@ -353,6 +501,9 @@
     for (const cachedId of Array.from(sessionCache.keys())) {
       if (!state.jobs.has(cachedId)) sessionCache.delete(cachedId);
     }
+    // Refresh secretsCache để có password/secret cho Output panes (snapshot
+    // có thể chứa jobs từ DB recovery — không qua Run button capture).
+    scheduleSecretsRefresh();
     renderJobs();
     renderOutputs();
   }
@@ -361,6 +512,7 @@
     const prev = state.jobs.get(j.id);
     if (!prev) state.order.push(j.id);
     state.jobs.set(j.id, j);
+    if (!prev) scheduleSecretsRefresh();
     renderJobs();
     renderOutputs();
     if (state.activeJobId === j.id) renderLog(j.id);
@@ -408,6 +560,13 @@
   const _savedSes = localStorage.getItem(LS_INPUT_SES);
   if (_savedSes) dom.comboInput.value = _savedSes;
   updateComboCount();
+
+  // Load pasted secrets từ localStorage + capture lại từ textarea hiện có
+  // (cover trường hợp localStorage bị clear nhưng textarea vẫn còn data).
+  _loadPastedSecrets();
+  if (dom.comboInput.value) _capturePastedSecrets(dom.comboInput.value);
+  // Initial fetch — pickup secrets cho jobs đã restore từ DB.
+  scheduleSecretsRefresh();
 
   // Duration timer
   setInterval(() => {

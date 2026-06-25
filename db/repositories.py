@@ -60,6 +60,13 @@ _EXACT_KEYS: frozenset[str] = frozenset([
     "reg.post_reg_link_region", "reg.auto_retry", "reg.auto_retry_max",
     "reg.auto_retry_delay", "reg.max_concurrent", "reg.use_proxy",
     "reg.mfa_inline",
+    # --- Anti-ban hardening (journal 260625-1224) ---
+    "reg.persona",                      # str enum: "firefox_mac" | "chrome_win"
+    "reg.fresh_profile",                # bool: bắt buộc fresh profile dir per signup
+    "reg.har_validate",                 # bool: auto-run HAR alignment script sau reg
+    "reg.human_typing_delay_ms_min",    # int [40, 500]: min delay khi gõ form
+    "reg.human_typing_delay_ms_max",    # int [60, 800]: max delay khi gõ form
+    "reg.locale_auto_geo",              # bool: tự chọn locale theo proxy country
     "proxy.pool", "proxy.rotation_mode",
     "proxy.probe_endpoint", "proxy.probe_timeout", "proxy.max_tries",
     "proxy.sid_len", "proxy.sid_retry_per_line", "proxy.probe_concurrency",
@@ -127,6 +134,44 @@ def _validate_type_constraint(key: str, value: Any) -> None:
         if not isinstance(value, bool):
             raise RepositoryError(
                 "set", TypeError(f"{key}: must be bool, got {type(value).__name__}")
+            )
+        return
+
+    # --- Anti-ban hardening (journal 260625-1224) — bool group ---
+    if key in ("reg.fresh_profile", "reg.har_validate", "reg.locale_auto_geo"):
+        if not isinstance(value, bool):
+            raise RepositoryError(
+                "set", TypeError(f"{key}: must be bool, got {type(value).__name__}")
+            )
+        return
+
+    if key == "reg.persona":
+        _allowed_personas = ("firefox_mac", "chrome_win")
+        if not isinstance(value, str) or value not in _allowed_personas:
+            raise RepositoryError(
+                "set", ValueError(f"{key}: must be str in {set(_allowed_personas)}, got {value!r}")
+            )
+        return
+
+    if key == "reg.human_typing_delay_ms_min":
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise RepositoryError(
+                "set", TypeError(f"{key}: must be int, got {type(value).__name__}")
+            )
+        if not (40 <= value <= 500):
+            raise RepositoryError(
+                "set", ValueError(f"{key}: must be in [40, 500], got {value}")
+            )
+        return
+
+    if key == "reg.human_typing_delay_ms_max":
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise RepositoryError(
+                "set", TypeError(f"{key}: must be int, got {type(value).__name__}")
+            )
+        if not (60 <= value <= 800):
+            raise RepositoryError(
+                "set", ValueError(f"{key}: must be in [60, 800], got {value}")
             )
         return
 
@@ -829,6 +874,74 @@ class ComboRepository:
         conn = self._engine.raw_connection()
         rows = conn.execute("SELECT * FROM outlook_combos").fetchall()
         return [dict(row) for row in rows]
+
+    # ─── Persona cookies (anti-ban journal 260625-1224 Task 3.3) ───
+    #
+    # Lưu cookies persona-aware (vd `oaicom-stable-id`, `oai-did`) per combo
+    # để re-login lần sau (`get_session`) thấy "device cũ" — server không treat
+    # mỗi reg như fresh device. Format JSON list of cookie dicts.
+
+    def get_persona_cookies(self, email: str) -> list[dict] | None:
+        """Đọc persona_cookies JSON từ outlook_combos. None nếu chưa có.
+
+        Returns:
+            List cookie dicts hoặc None. Empty list cũng → None để caller
+            phân biệt "chưa lưu" vs "lưu list rỗng".
+        """
+        try:
+            conn = self._engine.raw_connection()
+            row = conn.execute(
+                "SELECT persona_cookies FROM outlook_combos WHERE email = ?",
+                (email,),
+            ).fetchone()
+            if row is None or not row["persona_cookies"]:
+                return None
+            data = json.loads(row["persona_cookies"])
+            if not isinstance(data, list) or not data:
+                return None
+            return data
+        except RepositoryError:
+            raise
+        except Exception as exc:
+            raise RepositoryError("get_persona_cookies", exc) from exc
+
+    def set_persona_cookies(self, email: str, cookies: list[dict] | None) -> None:
+        """Ghi persona_cookies. Cookies=None → set NULL (clear).
+
+        Args:
+            email: combo email (PRIMARY KEY).
+            cookies: list cookie dicts từ Camoufox/Playwright ``ctx.cookies()``.
+                None / empty list → set DB column = NULL (clear).
+
+        Raises:
+            RepositoryError: Nếu row không tồn tại hoặc write fail.
+        """
+        try:
+            if cookies:
+                payload = json.dumps(cookies, ensure_ascii=False)
+            else:
+                payload = None
+            with self._engine.get_connection() as conn:
+                cursor = conn.execute(
+                    """
+                    UPDATE outlook_combos
+                    SET persona_cookies = ?
+                    WHERE email = ?
+                    """,
+                    (payload, email),
+                )
+                if cursor.rowcount == 0:
+                    raise RepositoryError(
+                        "set_persona_cookies",
+                        ValueError(
+                            f"no row found for email={email} — "
+                            f"persona cookies not persisted"
+                        ),
+                    )
+        except RepositoryError:
+            raise
+        except Exception as exc:
+            raise RepositoryError("set_persona_cookies", exc) from exc
 
 
 # --- SessionResultRepository ---

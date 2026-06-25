@@ -587,7 +587,12 @@ def signup_cmd(
     # Browser opts
     headless: bool = typer.Option(False, "--headless/--headed"),
     off_font: bool = typer.Option(False, "--off-font", help="Tắt camoufox font randomization."),
-    profile_template: bool = typer.Option(True, "--profile-template/--fresh-profile"),
+    profile_template: bool = typer.Option(
+        False, "--profile-template/--fresh-profile",
+        help="Clone profile template (cookies cũ). Mặc định FALSE — fresh "
+             "profile mỗi reg để tránh CF/Sentinel cluster ban (anti-ban "
+             "hardening 2026-06-25, journal 260625-1224).",
+    ),
     proxy: str | None = typer.Option(None, "--proxy", help="HTTP/HTTPS proxy."),
     browser_tls_insecure: bool = typer.Option(
         False,
@@ -599,6 +604,22 @@ def signup_cmd(
     otp_interval: float = typer.Option(4.0, "--otp-interval", min=0.5),
     sentinel_timeout: float = typer.Option(30.0, "--sentinel-timeout", min=5),
     har_capture: bool = typer.Option(False, "--har/--no-har", help="Bật HAR capture Phase 1 cho debug."),
+    har_validate: bool = typer.Option(
+        False, "--har-validate/--no-har-validate",
+        help=(
+            "Sau khi reg xong, tự chạy `test/check_har_alignment.py` để so HAR "
+            "runtime với golden record (anti-ban Phase 5). Yêu cầu --har. "
+            "Override Settings Store ``reg.har_validate``."
+        ),
+    ),
+    persona: str = typer.Option(
+        "firefox_mac", "--persona",
+        help=(
+            "Browser persona cho REG: 'firefox_mac' (default — Camoufox khớp Firefox 135 Mac) "
+            "hoặc 'chrome_win' (Chrome 145 Windows — chỉ dùng khi engine=chromium). "
+            "Override Settings Store ``reg.persona``."
+        ),
+    ),
     output: Path | None = typer.Option(None, "--output", "-o", help="Lưu SignupResult ra JSON file."),
     # SQLite persistence opts
     no_file_output: bool = typer.Option(
@@ -739,6 +760,7 @@ def signup_cmd(
         otp_poll_interval_seconds=otp_interval,
         sentinel_cookie_timeout_seconds=sentinel_timeout,
         har_capture=har_capture,
+        persona=persona,
         # CLI signup không persist 2FA → tắt inline để giữ behavior cũ (account
         # không bị bật 2FA mà mất secret). Dùng `enable-2fa` command riêng.
         mfa_inline=False,
@@ -908,8 +930,53 @@ def signup_cmd(
         summary["output"] = str(output)
 
     typer.echo(json.dumps(summary, indent=2, ensure_ascii=False))
+
+    # ── HAR alignment post-validation (anti-ban Phase 5 Task 5.3) ──
+    # Chỉ run nếu --har-validate + --har enabled + reg success.
+    if har_validate and har_capture and result.success:
+        _run_har_alignment_validate(settings, log)
+
     if not result.success:
         sys.exit(1)
+
+
+def _run_har_alignment_validate(settings, log) -> None:
+    """Chạy test/check_har_alignment.py trên HAR runtime mới nhất.
+
+    Anti-ban Phase 5 Task 5.3: post-reg validate runtime HAR vs golden record
+    để bắt regression sentinel/cookie/endpoint sequence sớm. KHÔNG fail reg
+    (chỉ log warning cho user xem).
+    """
+    import subprocess as _sp
+
+    har_dir = settings.runtime_dir / "har_hybrid"
+    if not har_dir.exists():
+        log("[har-validate] no HAR dir — skip")
+        return
+    har_files = sorted(har_dir.glob("hybrid-*.har"), key=lambda p: p.stat().st_mtime)
+    if not har_files:
+        log("[har-validate] no HAR files in dir — skip")
+        return
+    latest = har_files[-1]
+    log(f"[har-validate] running on latest HAR: {latest.name}")
+    script = settings.root_dir / "test" / "check_har_alignment.py"
+    if not script.exists():
+        log(f"[har-validate] script missing: {script} — skip")
+        return
+    try:
+        proc = _sp.run(
+            [str(settings.root_dir / ".venv" / "bin" / "python3"),
+             str(script), str(latest)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if proc.returncode == 0:
+            log("[har-validate] PASS — runtime khớp golden")
+        else:
+            log("[har-validate] FAIL — review output:")
+            for line in (proc.stdout + proc.stderr).splitlines():
+                log(f"  {line}")
+    except Exception as exc:
+        log(f"[har-validate] error (non-fatal): {exc}")
 
 
 if __name__ == "__main__":

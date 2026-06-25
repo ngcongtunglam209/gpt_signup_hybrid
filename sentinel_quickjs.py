@@ -28,7 +28,11 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from user_agent_profile import sentinel_navigator_payload as _navigator_payload
+from user_agent_profile import (
+    BrowserPersona as _BrowserPersona,
+    CHROME_145_WIN as _DEFAULT_PERSONA,
+    sentinel_navigator_payload as _navigator_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,35 +79,37 @@ def _quickjs_script_path() -> Path:
     return Path(__file__).resolve().parent / "openai_sentinel_quickjs.js"
 
 
-def _ensure_sdk_file(session: Any, timeout_ms: int) -> Path:
-    """Download OpenAI's sdk.js to /tmp cache (one-shot per version)."""
+def _ensure_sdk_file(
+    session: Any,
+    timeout_ms: int,
+    *,
+    persona: Optional[_BrowserPersona] = None,
+) -> Path:
+    """Download OpenAI's sdk.js to /tmp cache (one-shot per version).
+
+    Headers theo persona — Chrome có sec-ch-ua, Firefox không (Task 3.2).
+    """
     cache_dir = Path(tempfile.gettempdir()) / "openai-sentinel-demo" / SENTINEL_VERSION
     cache_dir.mkdir(parents=True, exist_ok=True)
     sdk_file = cache_dir / "sdk.js"
     if sdk_file.exists() and sdk_file.stat().st_size > 0:
         return sdk_file
 
-    from user_agent_profile import (
-        SEC_CH_UA,
-        SEC_CH_UA_MOBILE,
-        SEC_CH_UA_PLATFORM,
-        WINDOWS_USER_AGENT,
-    )
+    p = persona or _DEFAULT_PERSONA
+    headers = p.common_headers(referer="https://auth.openai.com/")
+    headers.update({
+        "accept": "*/*",
+        "sec-fetch-dest": "script",
+        "sec-fetch-mode": "no-cors",
+        "sec-fetch-site": "same-site",
+    })
+    # Lowercase versions cũng giữ (curl_cffi case-insensitive nhưng để đồng bộ
+    # với code cũ → headers có cả "User-Agent" capital + "user-agent" lowercase
+    # đều được — curl_cffi normalize).
 
     resp = session.get(
         SENTINEL_SDK_URL,
-        headers={
-            "accept": "*/*",
-            "accept-language": "en-US,en;q=0.9",
-            "referer": "https://auth.openai.com/",
-            "user-agent": WINDOWS_USER_AGENT,
-            "sec-ch-ua": SEC_CH_UA,
-            "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
-            "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
-            "sec-fetch-dest": "script",
-            "sec-fetch-mode": "no-cors",
-            "sec-fetch-site": "same-site",
-        },
+        headers=headers,
         timeout=max(10, int(timeout_ms / 1000)),
     )
     if getattr(resp, "status_code", 0) != 200:
@@ -386,16 +392,14 @@ def _fetch_sentinel_challenge(
     flow: str,
     request_p: str,
     timeout_ms: int,
+    persona: Optional[_BrowserPersona] = None,
 ) -> dict:
-    from user_agent_profile import (
-        SEC_CH_UA,
-        SEC_CH_UA_MOBILE,
-        SEC_CH_UA_PLATFORM,
-        WINDOWS_USER_AGENT,
-    )
-
+    """POST /sentinel/req → challenge dict. Headers theo persona (Task 3.2)."""
+    p = persona or _DEFAULT_PERSONA
     body = {"p": request_p, "id": device_id, "flow": flow}
-    _headers = {
+
+    # Build headers theo persona — Chrome có sec-ch-ua, Firefox không.
+    _headers: dict[str, str] = {
         "origin": "https://sentinel.openai.com",
         "referer": (
             f"https://sentinel.openai.com/backend-api/sentinel/frame.html"
@@ -403,16 +407,19 @@ def _fetch_sentinel_challenge(
         ),
         "content-type": "text/plain;charset=UTF-8",
         "accept": "*/*",
-        "accept-encoding": "gzip, deflate, br, zstd",
-        "accept-language": "en-US,en;q=0.9",
-        "user-agent": WINDOWS_USER_AGENT,
-        "sec-ch-ua": SEC_CH_UA,
-        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
-        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
+        "accept-encoding": p.accept_encoding,
+        "accept-language": p.accept_language,
+        "user-agent": p.user_agent,
         "sec-fetch-dest": "empty",
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
     }
+    if p.sec_ch_ua:
+        _headers["sec-ch-ua"] = p.sec_ch_ua
+        if p.sec_ch_ua_mobile:
+            _headers["sec-ch-ua-mobile"] = p.sec_ch_ua_mobile
+        if p.sec_ch_ua_platform:
+            _headers["sec-ch-ua-platform"] = p.sec_ch_ua_platform
     _data = json.dumps(body, separators=(",", ":"))
     _timeout = max(10, int(timeout_ms / 1000))
 
@@ -453,10 +460,16 @@ def get_sentinel_token_via_quickjs(
     timeout_ms: int = 45000,
     log: Optional[Callable[[str], None]] = None,
     worker: Optional["SentinelNodeWorker"] = None,
+    persona: Optional[_BrowserPersona] = None,
 ) -> Optional[str]:
     """Run QuickJS sentinel path. Returns JSON string on success, None on failure.
 
     Caller should fall back to sentinel_pow.get_sentinel_token() on None.
+
+    Args:
+        persona: BrowserPersona để inject vào sdk.js navigator + HTTP headers.
+            None = backward compat = CHROME_145_WIN (Task 3.2). Caller mới nên
+            truyền explicit (vd ``CHROME_145_WIN`` cho pure_request login).
 
     Nếu ``worker`` được truyền → chạy action qua persistent Node process (warm,
     tránh cold-start). Nếu None → spawn Node one-shot mỗi action (hành vi cũ).
@@ -484,13 +497,12 @@ def get_sentinel_token_via_quickjs(
         )
 
     did = str(device_id or uuid.uuid4())
-    # Navigator persona (UA + language + hardware) — phải pass vào sdk.js để
-    # navigator.userAgent khớp Windows Chrome thực tế. Trước refactor không pass
-    # → sdk.js thấy navigator.userAgent="Mozilla/5.0" (default trong JS) →
-    # fingerprint cực kỳ generic, deep verification fail.
-    nav_payload = _navigator_payload()
+    # Navigator persona pass vào sdk.js — khớp UA HTTP + sec-ch-ua + hardware.
+    # Trước refactor không pass → sdk.js thấy navigator.userAgent="Mozilla/5.0"
+    # (default trong JS Node context) → fingerprint cực generic, fail deep verification.
+    nav_payload = _navigator_payload(persona)
     try:
-        sdk_file = _ensure_sdk_file(session, timeout_ms)
+        sdk_file = _ensure_sdk_file(session, timeout_ms, persona=persona)
 
         # Pass 1: generate requirements token (fingerprint)
         requirements = _action(
@@ -504,7 +516,8 @@ def get_sentinel_token_via_quickjs(
 
         # Pass 2: fetch challenge from server
         challenge = _fetch_sentinel_challenge(
-            session, device_id=did, flow=flow, request_p=request_p, timeout_ms=timeout_ms,
+            session, device_id=did, flow=flow, request_p=request_p,
+            timeout_ms=timeout_ms, persona=persona,
         )
         c_value = str(challenge.get("token") or "").strip()
         if not c_value:

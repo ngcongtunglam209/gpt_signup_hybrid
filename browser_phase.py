@@ -77,48 +77,24 @@ _REQUIRED_AUTH_COOKIES = (
 
 
 # ─────────────────────────────────────────────────────────────────────
-# JS helpers
+# JS helpers — REMOVED 2026-06-25 (anti-ban Phase 2 Task 2.1)
 # ─────────────────────────────────────────────────────────────────────
-
-# JS: POST /api/accounts/user/register trên auth.openai.com page context
-_REGISTER_USER_JS = r"""
-async ({username, password}) => {
-    const res = await fetch('/api/accounts/user/register', {
-        method: 'POST',
-        credentials: 'include',
-        headers: {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-            'Origin': window.location.origin,
-            'Referer': window.location.origin + '/create-account/password',
-        },
-        body: JSON.stringify({username, password}),
-    });
-    const text = await res.text();
-    let body = null;
-    try { body = JSON.parse(text); } catch { body = text; }
-    return {status: res.status, body};
-}
-"""
-
-# JS: fill /about-you (Sentinel monitor form interactions)
-_PAGE_CREATE_ACCOUNT_JS = r"""
-async ({name, birthdate}) => {
-    const res = await fetch('/api/accounts/create_account', {
-        method: 'POST',
-        credentials: 'include',
-        headers: {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({name, birthdate}),
-    });
-    const text = await res.text();
-    let body = null;
-    try { body = JSON.parse(text); } catch { body = text; }
-    return {status: res.status, body};
-}
-"""
+#
+# Trước fix có 2 JS constant:
+#   - _REGISTER_USER_JS:       fetch /api/accounts/user/register
+#   - _PAGE_CREATE_ACCOUNT_JS: fetch /api/accounts/create_account
+#
+# Cả 2 dùng `page.evaluate(fetch)` để bypass form UI. Sentinel SDK của OpenAI
+# build so-token (Session Observer) bằng cách track DOM events trên form input
+# (focus / keydown / blur / mousemove). Bypass form = so-token rỗng = server
+# flag bot.
+#
+# Thay thế:
+#   - Register password: state machine `password_create` branch dùng
+#     ``human_type`` + ``human_click`` (helper trong ``_human_input.py``).
+#   - About-you: ``_fill_about_you`` đã dùng UI typing từ trước.
+#
+# Xem journal `260625-1224-reg-anti-ban-master-plan.md` Task 2.1.
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -207,108 +183,10 @@ async def _bootstrap_oauth_url(page, *, email: str, device_id: str, logging_id: 
     return url
 
 
-async def _register_with_password(page, *, email: str, password: str, log) -> str:
-    """Đăng ký account bằng POST /api/accounts/user/register trên auth.openai.com.
-
-    Flow:
-      1. Click "Continue with password" (nếu cần)
-      2. POST /api/accounts/user/register {username, password}
-      3. GET continue_url (/email-otp/send) → trigger OTP
-
-    Returns: "otp_sent" (success) hoặc raise error.
-    """
-    # Click "Continue with password" button nếu đang ở /email-verification
-    try:
-        pwd_btn = page.locator(
-            'button:has-text("password"), a:has-text("password"), '
-            '[role="button"]:has-text("password")'
-        )
-        if await pwd_btn.count() > 0:
-            btn_text = await pwd_btn.first.text_content(timeout=1000)
-            await pwd_btn.first.click(timeout=3000)
-            log(f"[browser] clicked password button: {(btn_text or '').strip()[:60]}")
-            # Đợi page navigate tới /create-account/password (SPA)
-            deadline = time.monotonic() + 10.0
-            while time.monotonic() < deadline:
-                if "password" in page.url:
-                    break
-                # Hoặc password input visible
-                try:
-                    pwd_input = page.locator('input[type="password"]').first
-                    if await pwd_input.is_visible(timeout=500):
-                        break
-                except Exception:
-                    pass
-                await asyncio.sleep(0.3)
-            log(f"[browser] page ready: {page.url.split('?')[0]}")
-    except Exception:
-        pass
-
-    await asyncio.sleep(0.5)
-
-    # Check: nếu page ở /log-in/password → account đã tồn tại → login thay vì register
-    if "log-in" in page.url:
-        log("[browser] account exists → login with password")
-        # Fill password form
-        pwd_input = None
-        for sel in ('input[type="password"]', 'input[name="password"]'):
-            try:
-                loc = page.locator(sel).first
-                if await loc.is_visible(timeout=2000):
-                    pwd_input = loc
-                    break
-            except Exception:
-                continue
-        if pwd_input:
-            await pwd_input.click(force=True, timeout=3000)
-            await pwd_input.fill("")
-            await pwd_input.type(password, delay=50)
-            await asyncio.sleep(0.3)
-            for btn in ('button[type="submit"]', 'button:has-text("Continue")'):
-                try:
-                    await page.click(btn, timeout=3000)
-                    break
-                except Exception:
-                    continue
-            log("[browser] submitted login password")
-            return "login"
-        raise BrowserPhaseError(f"login page but no password input. URL: {page.url}")
-
-    # POST /api/accounts/user/register
-    log(f"[browser] POST /api/accounts/user/register (email={email})")
-    result = await page.evaluate(_REGISTER_USER_JS, {"username": email, "password": password})
-
-    if not isinstance(result, dict):
-        raise BrowserPhaseError(f"register unexpected result: {result}")
-
-    status = result.get("status")
-    body = result.get("body") or {}
-
-    if status == 200:
-        # Success → navigate tới continue_url để trigger OTP send
-        continue_url = None
-        if isinstance(body, dict):
-            continue_url = body.get("continue_url")
-        log(f"[browser] register OK → continue_url={continue_url}")
-
-        if continue_url:
-            if continue_url.startswith("/"):
-                continue_url = f"https://auth.openai.com{continue_url}"
-            await page.goto(continue_url, wait_until="domcontentloaded")
-            log("[browser] OTP send triggered")
-        # Đợi 1s để page settle — otp_started_at sẽ được set SAU đây bởi caller
-        await asyncio.sleep(1.0)
-        return "otp_sent"
-
-    # Error cases
-    body_str = json.dumps(body) if isinstance(body, dict) else str(body or "")
-
-    # Account already exists → fallback: submit OTP trực tiếp (email đã gửi)
-    if "already" in body_str.lower() or "exists" in body_str.lower() or status == 409:
-        log(f"[browser] register: account already exists (HTTP {status}) — fallback OTP login")
-        return "already_exists"
-
-    raise BrowserPhaseError(f"register failed HTTP {status}: {body_str[:200]}")
+# REMOVED 2026-06-25 (anti-ban Phase 2 Task 2.1):
+#   ``_register_with_password`` — legacy helper dùng ``page.evaluate(fetch)``
+#   bypass form. Đã được thay bằng UI form submit thật trong state machine
+#   ``password_create`` branch của ``_drive_signup_flow``. Không có caller khác.
 
 
 async def _wait_otp_form(page, *, timeout_seconds: float, log) -> str:
@@ -767,35 +645,140 @@ async def _drive_signup_flow(
                 continue_clicked = True
             except Exception as exc:
                 log(f"[flow] click password button failed: {exc}")
-            await asyncio.sleep(1.5)
+            # Dwell jitter (anti-ban Task 2.3) thay sleep cố định — sentinel
+            # observer thấy reading time realistic giữa state transitions.
+            from _human_input import dwell as _dwell_t
+            await _dwell_t(1.0, 2.2)
             continue
 
         if screen == "password_create":
             if register_attempted:
                 await asyncio.sleep(1.0)
                 continue
-            log(f"[flow] POST /api/accounts/user/register (email={request.email})")
-            result = await page.evaluate(
-                _REGISTER_USER_JS, {"username": request.email, "password": request.password},
+
+            # ── UI form submit thật (anti-ban Task 2.1 + 2.4 + 2.5) ──
+            # Trace tay xác nhận browser thật submit qua FORM thật, KHÔNG phải
+            # `fetch('/register')`. Sentinel SDK monitor input/keydown events
+            # trên password input để build so-token. Bypass form = so-token
+            # rỗng → server flag bot → ban.
+            #
+            # Strategy:
+            #   1. Wait `oai-sc` cookie (sentinel SDK đã chạy + observer ready).
+            #   2. Mouse wander để observer record cursor activity.
+            #   3. human_type password (Gaussian delay + occasional pause).
+            #   4. human_click submit (mousemove → click).
+            #   5. expect_response /register để capture HTTP status.
+
+            from _human_input import human_type, human_click, dwell, random_mouse_wander
+
+            # 1. Wait oai-sc cookie (Task 2.4)
+            try:
+                await _wait_oai_sc(ctx, timeout_seconds=15.0, log=log)
+            except BrowserPhaseError as exc:
+                log(f"[flow] oai-sc wait timeout (continue anyway): {exc}")
+
+            # 2. Mouse wander để sentinel observer record cursor activity (Task 2.5)
+            try:
+                await random_mouse_wander(page, count=2, log=log)
+            except Exception as exc:
+                log(f"[flow] mouse wander failed (continue): {exc}")
+
+            # 3. Find password input
+            pwd_input = None
+            for sel in (
+                'input[type="password"]',
+                'input[name="password"]',
+                'input[autocomplete*="password"]',
+            ):
+                try:
+                    loc = page.locator(sel).first
+                    if await loc.is_visible(timeout=2000):
+                        pwd_input = loc
+                        log(f"[flow] password input detected: {sel}")
+                        break
+                except Exception:
+                    continue
+            if pwd_input is None:
+                raise BrowserPhaseError(
+                    f"không tìm thấy password input trên /create-account/password. URL: {page.url}"
+                )
+
+            # 4. Human-type password (Task 2.2)
+            from _human_input import DEFAULT_DELAY_MIN_MS, DEFAULT_DELAY_MAX_MS
+            delay_min = DEFAULT_DELAY_MIN_MS
+            delay_max = DEFAULT_DELAY_MAX_MS
+            log(f"[flow] human-type password (delay {delay_min}-{delay_max}ms Gaussian)")
+            await human_type(
+                pwd_input, request.password,
+                delay_min_ms=delay_min, delay_max_ms=delay_max,
+                log=log,
             )
+            await dwell(0.4, 1.2)  # cursor pause sau khi gõ — tab/look at button
+
+            # 5. Submit form + capture response
             register_attempted = True
-            if not isinstance(result, dict):
-                raise BrowserPhaseError(f"register unexpected result: {result}")
-            status = result.get("status")
-            body = result.get("body") or {}
-            if status == 200:
-                continue_url = body.get("continue_url") if isinstance(body, dict) else None
-                log(f"[flow] register OK → continue_url={continue_url}")
-                if continue_url:
-                    if continue_url.startswith("/"):
-                        continue_url = f"https://auth.openai.com{continue_url}"
-                    await page.goto(continue_url, wait_until="domcontentloaded")
-                await asyncio.sleep(1.0)
-                continue
-            body_str = json.dumps(body) if isinstance(body, dict) else str(body or "")
-            if "already" in body_str.lower() or "exists" in body_str.lower() or status == 409:
-                log("[flow] account already exists — page sẽ chuyển login")
+            log("[flow] submit form → expect /api/accounts/user/register response")
+            try:
+                async with page.expect_response(
+                    lambda r: (
+                        "/api/accounts/user/register" in r.url
+                        and r.request.method == "POST"
+                    ),
+                    timeout=30000,
+                ) as resp_info:
+                    submitted = False
+                    for sel in (
+                        'button[type="submit"]',
+                        'button:has-text("Continue")',
+                        'button:has-text("Sign up")',
+                    ):
+                        try:
+                            btn = page.locator(sel).first
+                            if await btn.is_visible(timeout=1500) \
+                                    and await btn.is_enabled(timeout=500):
+                                await human_click(page, btn, log=log)
+                                log(f"[flow] clicked submit: {sel}")
+                                submitted = True
+                                break
+                        except Exception:
+                            continue
+                    if not submitted:
+                        log("[flow] no submit button found — fallback Enter key")
+                        await pwd_input.press("Enter")
+                resp = await resp_info.value
+            except Exception as exc:
+                # expect_response timeout — page có thể đã navigate tới screen mới
+                # (vd account đã tồn tại → SPA chuyển login mà không POST register).
+                log(
+                    f"[flow] expect_response /register timeout/error: "
+                    f"{type(exc).__name__}: {exc} — continue detect screen"
+                )
                 await asyncio.sleep(1.5)
+                continue
+
+            status = resp.status
+            try:
+                body_text = await resp.text()
+                body = json.loads(body_text) if body_text else {}
+            except Exception:
+                body = {}
+                body_text = ""
+
+            if status == 200:
+                log("[flow] register OK (HTTP 200) — page tự navigate qua redirect")
+                # Page tự follow continue_url (server trả 302 → /email-verification).
+                # KHÔNG manual goto — để form submit redirect chain tự nhiên (sentinel
+                # observer sẽ thấy navigation hoàn chỉnh).
+                # Dwell jitter (Task 2.3) — page đang redirect, observer cần thời gian.
+                from _human_input import dwell as _dwell_reg_ok
+                await _dwell_reg_ok(1.2, 2.5)
+                continue
+
+            body_str = json.dumps(body) if isinstance(body, dict) else (body_text or "")
+            if "already" in body_str.lower() or "exists" in body_str.lower() or status == 409:
+                log(f"[flow] account already exists (HTTP {status}) — page sẽ chuyển login")
+                from _human_input import dwell as _dwell_exists
+                await _dwell_exists(1.2, 2.5)
                 continue
             raise BrowserPhaseError(f"register failed HTTP {status}: {body_str[:200]}")
 
@@ -834,17 +817,32 @@ async def _drive_signup_flow(
                     continue
             if not pwd_input:
                 raise BrowserPhaseError(f"login page but no password input. URL: {page.url}")
-            await pwd_input.click(force=True, timeout=3000)
-            await pwd_input.fill("")
-            await pwd_input.type(request.password, delay=50)
-            await asyncio.sleep(0.3)
+
+            # Human-type password (anti-ban Task 2.2) thay delay cố định 50ms.
+            from _human_input import (
+                human_type as _hp_login_type,
+                human_click as _hc_login,
+                dwell as _dl_login,
+                DEFAULT_DELAY_MIN_MS,
+                DEFAULT_DELAY_MAX_MS,
+            )
+            delay_min = DEFAULT_DELAY_MIN_MS
+            delay_max = DEFAULT_DELAY_MAX_MS
+            await _hp_login_type(
+                pwd_input, request.password,
+                delay_min_ms=delay_min, delay_max_ms=delay_max,
+                log=log,
+            )
+            await _dl_login(0.3, 0.8)
             for btn in ('button[type="submit"]', 'button:has-text("Continue")'):
                 try:
-                    await page.click(btn, timeout=3000)
-                    break
+                    btn_loc = page.locator(btn).first
+                    if await btn_loc.is_visible(timeout=1000):
+                        await _hc_login(page, btn_loc, log=log)
+                        break
                 except Exception:
                     continue
-            log("[flow] submitted login password")
+            log("[flow] submitted login password (human-typed)")
             login_attempted = True
             await asyncio.sleep(1.5)
             continue
@@ -1061,7 +1059,10 @@ async def _drive_signup_flow(
             _otp_js_submit_done = False
             _otp_api_done = False
             otp_already_polled = True
-            await asyncio.sleep(2.0)
+            # Dwell jitter (anti-ban Task 2.3) sau submit OTP — page transition
+            # tới /about-you cần realistic delay (sentinel observer record).
+            from _human_input import dwell as _dwell_otp_done
+            await _dwell_otp_done(1.5, 3.0)
             continue
 
         if screen == "passkey_enroll":
@@ -1078,14 +1079,29 @@ async def _drive_signup_flow(
             # account chưa có password. Gọi register endpoint set password mới
             # trong session context đã verify OTP.
             if one_time_code_mode:
+                # NOTE (Task 2.1 edge case): /about-you KHÔNG có password input
+                # → không thể UI form thật. Dùng ctx.request (Camoufox) để giữ
+                # cookies + persona consistency thay vì page.evaluate(fetch).
+                # Đây là edge case hiếm (chỉ khi password sai → OTC fallback).
                 try:
-                    reg = await page.evaluate(
-                        _REGISTER_USER_JS,
-                        {"username": request.email, "password": request.password},
+                    resp_setpw = await ctx.request.post(
+                        "https://auth.openai.com/api/accounts/user/register",
+                        data={
+                            "username": request.email,
+                            "password": request.password,
+                        },
+                        headers={
+                            "Accept": "application/json",
+                            "Content-Type": "application/json",
+                            "Origin": "https://auth.openai.com",
+                            "Referer": "https://auth.openai.com/about-you",
+                        },
                     )
-                    st = reg.get("status") if isinstance(reg, dict) else None
-                    bd = reg.get("body") if isinstance(reg, dict) else reg
-                    log(f"[flow] set password (about_you ctx): HTTP {st}: {str(bd)[:100]}")
+                    body_setpw = await resp_setpw.text()
+                    log(
+                        f"[flow] set password (about_you ctx, OTC fallback): "
+                        f"HTTP {resp_setpw.status}: {body_setpw[:100]}"
+                    )
                 except Exception as exc:
                     log(f"[flow] set password (about_you ctx) failed: {exc}")
             try:
@@ -1408,6 +1424,9 @@ async def _fill_about_you(page, *, name: str, birthdate: str, timeout_seconds: f
 
     page.on("response", _on_resp)
     try:
+        # ── Human typing helpers (anti-ban Task 2.2) ──
+        from _human_input import human_type as _human_type, dwell as _dwell
+
         # Name input
         name_input = None
         for sel in ('input[name="name"]', 'input[autocomplete="name"]', 'input[id*="name" i]'):
@@ -1420,10 +1439,10 @@ async def _fill_about_you(page, *, name: str, birthdate: str, timeout_seconds: f
         if not name_input:
             raise BrowserPhaseError("không tìm thấy name input trên /about-you")
 
-        await page.click(name_input, force=True, timeout=3000)
-        await page.fill(name_input, "")
-        await page.type(name_input, name, delay=80)
-        await asyncio.sleep(0.2)
+        # Human-type name (Gaussian delay + occasional pause)
+        name_loc = page.locator(name_input).first
+        await _human_type(name_loc, name, log=log)
+        await _dwell(0.3, 0.8)  # tab/look at next field
 
         # Age (parse from birthdate)
         try:
@@ -1441,6 +1460,7 @@ async def _fill_about_you(page, *, name: str, birthdate: str, timeout_seconds: f
             pass
 
         if date_input:
+            # Date input không cần per-key typing (browser native picker); fill atomic.
             await page.fill('input[type="date"]', birthdate)
             log(f"[browser] filled birthday={birthdate}")
         else:
@@ -1453,20 +1473,34 @@ async def _fill_about_you(page, *, name: str, birthdate: str, timeout_seconds: f
                 except Exception:
                     continue
             if age_input:
-                await page.click(age_input, force=True, timeout=3000)
-                await page.fill(age_input, "")
-                await page.type(age_input, str(age), delay=120)
-                log(f"[browser] typed age={age}")
+                age_loc = page.locator(age_input).first
+                await _human_type(age_loc, str(age), log=log)
+                log(f"[browser] human-typed age={age}")
             else:
+                # Fallback: Tab + keyboard type
                 await page.keyboard.press("Tab")
-                await asyncio.sleep(0.4)
-                await page.keyboard.type(str(age), delay=120)
-                log(f"[browser] Tab + typed age={age}")
+                await _dwell(0.3, 0.6)
+                # Keyboard type with random delay per char
+                import random as _rand
+                for ch in str(age):
+                    await page.keyboard.type(
+                        ch, delay=_rand.randint(120, 260),
+                    )
+                log(f"[browser] Tab + human-typed age={age}")
 
         await asyncio.sleep(0.3)
 
         # Handle unchecked checkboxes/TOS trước submit — OpenAI có thể thêm field mới
         await _check_about_you_extras(page, log=log)
+
+        # Mouse wander + dwell trước submit (anti-ban Task 2.5 + 2.3) — sentinel
+        # observer cần thấy cursor activity + reading time trước action critical.
+        try:
+            from _human_input import random_mouse_wander as _wander, dwell as _dwell
+            await _wander(page, count=2, log=log)
+            await _dwell(0.5, 1.4)
+        except Exception as exc:
+            log(f"[browser] /about-you mouse wander/dwell failed (continue): {exc}")
 
         # Submit
         await _click_submit_about_you(page, log=log)
@@ -1762,8 +1796,25 @@ async def run_browser_phase(
         log(f"[browser] HAR capture → {har_path}")
 
     device_id = str(uuid.uuid4())
-    logging_id = str(uuid.uuid4())
-    log(f"[browser] device_id={device_id} logging_id={logging_id}")
+    # auth_session_logging_id: KHÔNG gen ở đây nữa — defer tới sau khi load
+    # chatgpt.com để đọc cookie `oai-asli` mà sentinel SDK đã set, đảm bảo
+    # query param `auth_session_logging_id` của signin/openai khớp cookie. Xem
+    # journal `260625-1224-reg-anti-ban-master-plan.md` (Task 1.1, bug C2).
+    log(f"[browser] device_id={device_id}")
+
+    async def _resolve_logging_id(ctx) -> str:
+        """Đọc cookie ``oai-asli`` từ ctx → dùng làm logging_id. Fallback UUID
+        mới nếu cookie chưa có (page chưa render sentinel SDK)."""
+        from _nextauth_bootstrap import read_oai_asli_from_ctx as _read_asli
+        val = await _read_asli(ctx)
+        if val:
+            log(f"[browser] auth_session_logging_id={val} (from oai-asli cookie)")
+            logging_id_holder["value"] = val
+            return val
+        new_id = str(uuid.uuid4())
+        log(f"[browser] auth_session_logging_id={new_id} (gen — cookie missing)")
+        logging_id_holder["value"] = new_id
+        return new_id
 
     w, h = settings.browser_viewport_width, settings.browser_viewport_height
     viewport = {"width": w, "height": h}
@@ -1772,6 +1823,53 @@ async def run_browser_phase(
     if request.proxy:
         proxy_kwargs["proxy"] = _parse_proxy(request.proxy)
         _ensure_geoip_cache(settings.runtime_dir, log=log)
+
+    # ── Locale auto-detect theo proxy country (anti-ban Task 1.4) ──
+    # Trace tay xác nhận server cross-check IP country ↔ navigator.language ↔
+    # timezone ↔ geo. Hardcode locale en-US + proxy India → mismatch → flag.
+    # Logic priority:
+    #   1. request.locale (CLI explicit) > auto-detect > default en-US.
+    resolved_locale = request.locale or "en-US"
+    resolved_timezone = request.timezone
+    resolved_geo: tuple[float, float] | None = None
+    if request.proxy and (request.locale is None or request.timezone is None):
+        try:
+            from _geo_locale import resolve_proxy_locale as _resolve_geo
+            auto_locale, auto_tz, auto_geo, auto_cc = _resolve_geo(
+                request.proxy, timeout=10.0, log=log,
+            )
+            if request.locale is None:
+                resolved_locale = auto_locale
+            if request.timezone is None:
+                resolved_timezone = auto_tz
+            resolved_geo = auto_geo
+            log(
+                f"[browser] proxy locale: country={auto_cc or '?'} "
+                f"locale={resolved_locale} tz={resolved_timezone} geo={resolved_geo}"
+            )
+        except Exception as exc:  # noqa: BLE001 — fail-safe
+            log(f"[browser] proxy locale auto-detect failed: {exc}")
+    elif request.locale or request.timezone:
+        log(
+            f"[browser] locale=explicit ({resolved_locale}, "
+            f"tz={resolved_timezone or 'auto'})"
+        )
+    else:
+        log(f"[browser] locale=default {resolved_locale} (no proxy)")
+
+    # Camoufox locale: pass list[str] thay vì string đơn → first dùng cho Intl
+    # API, others vào navigator.languages (Firefox style "en-IN,en;q=0.5").
+    # Browser thật (record tay) navigator.languages = ["en-US", "en"].
+    def _locale_to_list(loc: str) -> list[str]:
+        out = [loc]
+        if "-" in loc:
+            base = loc.split("-", 1)[0]
+            if base and base != loc:
+                out.append(base)
+        return out
+
+    resolved_locale_list = _locale_to_list(resolved_locale)
+    log(f"[browser] navigator.languages={resolved_locale_list}")
 
     state_param: str | None = None
     handoff_cookies: list[dict[str, Any]] = []
@@ -1810,6 +1908,12 @@ async def run_browser_phase(
     def _mark_otp_started() -> None:
         flow_progress["otp_started"] = True
 
+    # auth_session_logging_id holder — inner runner đọc cookie oai-asli sau
+    # khi load chatgpt.com (Phase 1 Task 1.1) và write vào holder. Outer scope
+    # đọc giá trị này để build BrowserHandoff. Default UUID nếu inner không
+    # set (vd browser launch fail trước page.goto).
+    logging_id_holder: dict[str, str] = {"value": str(uuid.uuid4())}
+
     # ─── Inner runners (mỗi runner là 1 lần launch + drive flow) ───
     async def _run_camoufox_once() -> tuple[str, float, str, list[dict[str, Any]]]:
         from camoufox.async_api import AsyncCamoufox
@@ -1840,9 +1944,20 @@ async def run_browser_phase(
             user_data_dir=str(profile_dir),
             os=list(_CAMOUFOX_OS),
             viewport=viewport,
-            locale="en-US",
+            locale=resolved_locale_list,
             ignore_https_errors=request.tls_insecure,
             geoip=bool(request.proxy),
+            # ── Anti-detect hardening (Phase 9 audit) ──
+            # block_webrtc=True: chặn WebRTC mDNS leak IP thật khi dùng proxy.
+            # Camoufox-Firefox mặc định KHÔNG block → IP local rò rỉ qua
+            # WebRTC stun servers → server (sentinel) detect mismatch IP proxy
+            # vs WebRTC IP → flag bot.
+            block_webrtc=True,
+            # humanize=True: Camoufox tự jitter mouse movement natively
+            # (smoother than Python-level random_mouse_wander). Vẫn giữ
+            # random_mouse_wander Python ở Phase 2 vì wander control timing
+            # giữa actions còn humanize chỉ jitter trong 1 mouse.move call.
+            humanize=True,
             config=extra_config,
             **screen_kwargs,
             **proxy_kwargs,
@@ -1864,6 +1979,7 @@ async def run_browser_phase(
 
             await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
             log("[browser] chatgpt.com loaded")
+            logging_id = await _resolve_logging_id(ctx)
             _authorize_url = await _bootstrap_oauth_url(
                 page, email=request.email, device_id=device_id, logging_id=logging_id, log=log,
             )
@@ -1924,13 +2040,24 @@ async def run_browser_phase(
         page = None
         try:
             channel = settings.browser_channel or None
+            # Chrome runner: explicit timezone_id + geolocation (Playwright hỗ trợ
+            # native, không có geoip auto-detect như Camoufox).
+            chrome_ctx_kwargs: dict[str, Any] = {
+                "user_data_dir": str(profile_dir),
+                "headless": request.headless,
+                "channel": channel,
+                "viewport": viewport,
+                "locale": resolved_locale,
+                "ignore_https_errors": request.tls_insecure,
+            }
+            if resolved_timezone:
+                chrome_ctx_kwargs["timezone_id"] = resolved_timezone
+            if resolved_geo:
+                lat, lon = resolved_geo
+                chrome_ctx_kwargs["geolocation"] = {"latitude": lat, "longitude": lon}
+                chrome_ctx_kwargs["permissions"] = ["geolocation"]
             ctx = await playwright.chromium.launch_persistent_context(
-                user_data_dir=str(profile_dir),
-                headless=request.headless,
-                channel=channel,
-                viewport=viewport,
-                locale="en-US",
-                ignore_https_errors=request.tls_insecure,
+                **chrome_ctx_kwargs,
                 **proxy_kwargs,
                 **har_kwargs,
             )
@@ -1947,6 +2074,7 @@ async def run_browser_phase(
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
             await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
             log("[browser] chatgpt.com loaded")
+            logging_id = await _resolve_logging_id(ctx)
             _authorize_url = await _bootstrap_oauth_url(
                 page, email=request.email, device_id=device_id, logging_id=logging_id, log=log,
             )
@@ -2090,7 +2218,7 @@ async def run_browser_phase(
             cookies=handoff_cookies,
             state_param=state_param,
             device_id=device_id,
-            auth_session_logging_id=logging_id,
+            auth_session_logging_id=logging_id_holder["value"],
             callback_url=callback_url,
             two_factor=mfa_holder.get("two_factor"),
             two_factor_partial=mfa_holder.get("two_factor_partial"),

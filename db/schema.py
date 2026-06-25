@@ -1,7 +1,7 @@
 """Schema definitions — DDL strings và version management cho SQLite persistence layer."""
 
 # Schema version hiện tại. Tăng khi có thay đổi DDL.
-CURRENT_VERSION = 11
+CURRENT_VERSION = 12
 
 # --- DDL: Schema version tracking ---
 
@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS outlook_combos (
     last_failed_at TEXT,
     used_at TEXT,
     last_refresh_at TEXT,
+    persona_cookies TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
@@ -574,5 +575,18 @@ MIGRATIONS: dict[int, list[str]] = {
         "DROP TABLE icloud_accounts;",
         # 4. Rename
         "ALTER TABLE icloud_accounts_new RENAME TO icloud_accounts;",
+    ],
+    # v12: Anti-ban persistent cookie store per combo (journal 260625-1224 Task 3.3).
+    #
+    # Lưu cookies persona-aware (vd `oaicom-stable-id`, `oai-did`) per email
+    # combo để re-login lần sau (`get_session`) thấy "device cũ" — tránh server
+    # treat reg như fresh device mỗi lần.
+    #
+    # Format JSON: list[{"name": str, "value": str, "domain": str, "path": str,
+    #                    "expires": float | None, "httpOnly": bool, "secure": bool,
+    #                    "sameSite": str | None}]
+    # Empty (NULL) = combo chưa từng login thành công, không có history.
+    12: [
+        "ALTER TABLE outlook_combos ADD COLUMN persona_cookies TEXT;",
     ],
 }

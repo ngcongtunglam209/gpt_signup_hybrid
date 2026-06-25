@@ -89,6 +89,16 @@ impl Settings {
                 lang    TEXT NOT NULL,
                 set_at  INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
             );
+
+            -- Per-user override cho `max_per_user` (số tiến trình đồng thời).
+            -- Mặc định global đặt qua key `limits.max_per_user_default` trong
+            -- bảng `settings`. User có row ở đây thì giá trị override thắng.
+            -- Range hợp lệ: 1..=10 (caller validate trước khi insert).
+            CREATE TABLE IF NOT EXISTS user_limits (
+                user_id      INTEGER PRIMARY KEY,
+                max_per_user INTEGER NOT NULL,
+                set_at       INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER))
+            );
             "#,
         )?;
         Ok(Self {
@@ -505,5 +515,98 @@ impl Settings {
             params![user_id, lang],
         )?;
         Ok(())
+    }
+
+    // ── max_per_user (global default + per-user override) ─────────────────
+    /// Min/max cho `max_per_user` cả global lẫn per-user. Caller PHẢI clamp
+    /// trước khi gọi setter — setter sẽ KHÔNG tự clamp (fail-fast nếu vượt).
+    pub const MAX_PER_USER_MIN: u32 = 1;
+    pub const MAX_PER_USER_MAX: u32 = 10;
+    /// Giá trị mặc định ban đầu khi key chưa được set lần nào (boot lần đầu).
+    /// Sẵn để main caller dùng nếu CLI flag không xài. Hiện tại main đang
+    /// dùng `cli.max_per_user` (đã default 2 ở clap) → const này giữ làm
+    /// reference cho tài liệu/test.
+    #[allow(dead_code)]
+    pub const MAX_PER_USER_DEFAULT_FALLBACK: u32 = 2;
+    /// Settings key cho global default. Mọi user không có override đọc giá trị này.
+    pub const KEY_MAX_PER_USER_DEFAULT: &'static str = "limits.max_per_user_default";
+
+    /// Đọc global default từ settings store. Trả `None` nếu chưa set lần nào
+    /// → caller chịu trách nhiệm seed `MAX_PER_USER_DEFAULT_FALLBACK`.
+    pub fn get_max_per_user_default(&self) -> Option<u32> {
+        self.get_u32(Self::KEY_MAX_PER_USER_DEFAULT)
+            .map(|n| n.clamp(Self::MAX_PER_USER_MIN, Self::MAX_PER_USER_MAX))
+    }
+
+    /// Set global default. Caller PHẢI clamp 1..=10 trước. Trả `Err` nếu DB
+    /// fail. Effect: chỉ persist — caller phải gọi `UserLimiter::set_default`
+    /// để áp ngay (không restart).
+    pub fn set_max_per_user_default(&self, n: u32) -> Result<()> {
+        debug_assert!(
+            (Self::MAX_PER_USER_MIN..=Self::MAX_PER_USER_MAX).contains(&n),
+            "set_max_per_user_default: out of range {}",
+            n
+        );
+        self.set(Self::KEY_MAX_PER_USER_DEFAULT, &n.to_string())
+    }
+
+    /// Lấy override cho 1 user — `None` nếu user chưa có override.
+    /// Hiện tại main pre-load qua `list_user_limits` rồi giữ trong cache
+    /// `UserLimiter::user_overrides`; method này dành cho tool/test trực tiếp.
+    #[allow(dead_code)]
+    pub fn get_user_limit(&self, user_id: i64) -> Result<Option<u32>> {
+        let n = self
+            .lock()
+            .query_row(
+                "SELECT max_per_user FROM user_limits WHERE user_id = ?1",
+                params![user_id],
+                |r| r.get::<_, u32>(0),
+            )
+            .optional()?
+            .map(|n| n.clamp(Self::MAX_PER_USER_MIN, Self::MAX_PER_USER_MAX));
+        Ok(n)
+    }
+
+    /// Set override cho 1 user (upsert). Caller PHẢI clamp 1..=10 trước.
+    pub fn set_user_limit(&self, user_id: i64, max_per_user: u32) -> Result<()> {
+        debug_assert!(
+            (Self::MAX_PER_USER_MIN..=Self::MAX_PER_USER_MAX).contains(&max_per_user),
+            "set_user_limit: out of range {}",
+            max_per_user
+        );
+        self.lock().execute(
+            "INSERT INTO user_limits(user_id, max_per_user) VALUES(?1, ?2)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 max_per_user = excluded.max_per_user,
+                 set_at       = CAST(strftime('%s','now') AS INTEGER)",
+            params![user_id, max_per_user],
+        )?;
+        Ok(())
+    }
+
+    /// Xóa override của 1 user (sau đó user dùng global default). Trả `true`
+    /// nếu có row bị xóa.
+    pub fn remove_user_limit(&self, user_id: i64) -> Result<bool> {
+        let n = self
+            .lock()
+            .execute("DELETE FROM user_limits WHERE user_id = ?1", params![user_id])?;
+        Ok(n > 0)
+    }
+
+    /// Liệt kê tất cả override per-user — `(user_id, max_per_user)` sort theo
+    /// user_id. Dùng để boot pre-load cache trong `UserLimiter` + lệnh admin
+    /// xem danh sách user có quota cao hơn default.
+    pub fn list_user_limits(&self) -> Result<Vec<(i64, u32)>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT user_id, max_per_user FROM user_limits ORDER BY user_id",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, u32>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .map(|(uid, n)| (uid, n.clamp(Self::MAX_PER_USER_MIN, Self::MAX_PER_USER_MAX)))
+            .collect())
     }
 }
