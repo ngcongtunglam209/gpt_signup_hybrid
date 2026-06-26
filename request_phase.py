@@ -92,6 +92,84 @@ def _datadog_trace_headers() -> dict[str, str]:
     }
 
 
+# Cookies cần nhập từ sidecar Camoufox vào curl_cffi session để khớp browser.
+# Ngoài __cf_bm/__cflb (Camoufox-Cloudflare set sẵn khi load chatgpt.com),
+# 3 cookie sau chỉ tồn tại khi JS chạy:
+#   - oai-sc      : Sentinel SDK init token  (anti-bot signal cốt lõi)
+#   - _dd_s       : Datadog RUM session ID
+#   - oai-asli    : auth_session_logging_id từ NextAuth
+# Thêm các cookie session khác mà server cấp khi navigate /email-verification.
+_SIDECAR_COOKIE_ALLOWLIST = frozenset({
+    "oai-sc", "_dd_s", "oai-asli", "oai-did",
+    "oaicom-stable-id",
+    # Cloudflare bot-management — đã có trong jar curl từ prime, nhưng có
+    # thể có giá trị mới hơn từ Camoufox (RTT khác) → cập nhật cho fresh.
+    "__cf_bm", "__cflb", "_cfuvid", "cf_clearance",
+})
+
+# Cookies that are IP-bound (Cloudflare bot management). If sidecar's
+# upstream proxy differs from caller's proxy, syncing these would send
+# CF cookies issued for IP_A from IP_B → server detects mismatch and
+# re-issues a challenge. When the proxies match (or both ``None``),
+# syncing is fine and saves a round-trip.
+_CF_IP_BOUND_COOKIES = frozenset({
+    "__cf_bm", "__cflb", "_cfuvid", "cf_clearance",
+})
+
+
+def _import_cookies_from_sidecar(
+    session, sidecar, log: Callable, caller_proxy: str | None = None,
+) -> int:
+    """Dump cookies từ Camoufox sidecar → inject vào curl_cffi session jar.
+
+    Returns: số cookie thực sự import. 0 = sidecar không trả gì.
+
+    Chỉ import cookies trong allowlist để tránh nhập rác (perf-cookie,
+    consent, ...) làm header Cookie phình to bất thường.
+
+    IP-bound cookies (Cloudflare) are skipped when ``caller_proxy`` differs
+    from the sidecar's proxy (``SIDECAR_SHARED_PROXY`` mode). Caller's
+    curl session will fetch its own CF cookies via the prime GET to
+    ``/auth/login`` instead.
+    """
+    cookies = sidecar.dump_cookies()
+    if not cookies:
+        return 0
+    # Resolve the IP boundary: sidecar's proxy vs caller's proxy.
+    sidecar_proxy = getattr(sidecar, "proxy", None)
+    skip_cf = (sidecar_proxy or None) != (caller_proxy or None)
+    if skip_cf:
+        log(
+            f"[request] sidecar proxy={sidecar_proxy or 'direct'} ≠ caller "
+            f"proxy={caller_proxy or 'direct'} → skipping IP-bound CF cookies"
+        )
+    imported = 0
+    skipped_cf = 0
+    for c in cookies:
+        name = (c.get("name") or "").strip()
+        if name not in _SIDECAR_COOKIE_ALLOWLIST:
+            continue
+        if skip_cf and name in _CF_IP_BOUND_COOKIES:
+            skipped_cf += 1
+            continue
+        value = c.get("value") or ""
+        if not value:
+            continue
+        domain = (c.get("domain") or "").strip() or ".chatgpt.com"
+        path = c.get("path") or "/"
+        try:
+            session.cookies.set(name, value, domain=domain, path=path)
+            imported += 1
+        except Exception as exc:  # noqa: BLE001
+            log(f"[request] cookie {name} inject failed: {exc}")
+    if imported or skipped_cf:
+        log(
+            f"[request] imported {imported} cookies from sidecar"
+            + (f" (skipped {skipped_cf} CF cookies)" if skipped_cf else "")
+        )
+    return imported
+
+
 # ─── Session factory ─────────────────────────────────────────────────
 
 
@@ -167,6 +245,14 @@ def _get_sentinel_token(
             (Task 7.2 + Phase 3.2). None = default CHROME_145_WIN — phù hợp
             cho pure_request flow (curl_cffi impersonate Chrome).
         worker: SentinelNodeWorker (persistent Node), None = one-shot Node spawn.
+
+    SECURITY NOTE (deferred-ban root cause):
+        QuickJS / Node KHÔNG có canvas, WebGL, AudioContext, navigator.plugins
+        thật → sdk.js đọc giá trị empty/undefined → so-token "zero-fingerprint"
+        → server flag account → ban async 1-24h sau. Path ưu tiên thực sự là
+        ``get_sentinel_token_async`` với ``browser_oracle`` từ Camoufox page
+        sống. Function sync này chỉ dùng khi không có page (vd pure_request
+        flow), chấp nhận risk fingerprint yếu.
     """
     disable_quickjs = os.getenv("OPENAI_SENTINEL_DISABLE_QUICKJS", "0").lower() in (
         "1", "true", "yes",
@@ -191,6 +277,64 @@ def _get_sentinel_token(
 
     from sentinel_pow import get_sentinel_token as _pow_token
     return _pow_token(session, device_id, flow=flow, persona=persona)
+
+
+async def _get_sentinel_token_async(
+    session,
+    device_id: str,
+    flow: str,
+    log: Callable,
+    worker=None,
+    *,
+    persona: _BrowserPersona | None = None,
+    browser_oracle=None,
+) -> str:
+    """Async-aware sentinel-token gen with page-native priority.
+
+    Path order:
+        1. ``browser_oracle`` page-native (REAL canvas/WebGL/audio from
+           Camoufox Firefox) — anti-ban path. Token quality matches manual
+           user; server không flag.
+        2. QuickJS fallback — only if oracle missing OR returns None.
+           Caller MUST log this as degraded path (so-token weak).
+        3. Python PoW fallback — only if QuickJS also fails.
+
+    ``browser_oracle``: instance of ``sentinel_browser.SentinelBrowserOracle``
+    (already constructed by session_phase with a live Camoufox page). None
+    means caller is sync (vd request_phase pure_request flow) — degrade to
+    QuickJS with explicit warning log so operator knows the risk.
+    """
+    if browser_oracle is not None:
+        try:
+            token = await browser_oracle.get_token(
+                device_id=device_id, flow=flow,
+            )
+            if token:
+                log(f"[sentinel] page-native OK (flow={flow})")
+                return token
+            log(
+                f"[sentinel] page-native returned None — fallback QuickJS "
+                f"(token will have weak fingerprint; risk deferred ban)"
+            )
+        except Exception as exc:
+            log(
+                f"[sentinel] page-native error {type(exc).__name__}: {exc} "
+                f"— fallback QuickJS (risk deferred ban)"
+            )
+    else:
+        log(
+            f"[sentinel] no browser_oracle — using QuickJS "
+            f"(flow={flow}; risk deferred ban for new accounts)"
+        )
+
+    # Sync fallback. asyncio.to_thread to avoid blocking event loop on
+    # subprocess.Popen + readline loop inside SentinelNodeWorker.
+    import asyncio
+    return await asyncio.to_thread(
+        _get_sentinel_token,
+        session, device_id, flow, log, worker,
+        persona=persona,
+    )
 
 
 # ─── Common headers ──────────────────────────────────────────────────
@@ -712,11 +856,14 @@ def _step_verify_otp(
 def _step_create_account(
     session, name: str, birthdate: str, device_id: str, log: Callable,
     sentinel_token: str | None = None, worker=None,
+    so_token: str | None = None,
 ) -> str:
     """Step 8: Create account (fill name + birthdate) → continue_url.
 
     ``sentinel_token``: nếu đã pre-compute sẵn (song song lúc poll OTP) thì dùng
     luôn, bỏ qua bước tính sentinel tại đây. None → tính mới.
+    ``so_token``: ``openai-sentinel-so-token`` header (Session Observer JSON).
+    None → bỏ header (chỉ pure_request không có sidecar mới None).
     """
     log("[request] [8/9] Creating account...")
 
@@ -729,6 +876,14 @@ def _step_create_account(
     headers["Content-Type"] = "application/json"
     if sentinel:
         headers["openai-sentinel-token"] = sentinel
+    # so-token = Session Observer JSON {so, c}. Server REQUIRES this on
+    # /create_account khi sentinel SDK đã observe DOM events. Bỏ header này
+    # = signal "Sentinel Observer chưa init" = bot. Sidecar gen so-token
+    # bằng cách simulate form interaction trên Camoufox page trước khi
+    # gọi sdk.js.token(). None → caller (pure_request không có sidecar)
+    # đã log warning ở chỗ khác.
+    if so_token:
+        headers["openai-sentinel-so-token"] = so_token
     if device_id:
         headers["oai-device-id"] = device_id
 
@@ -1139,17 +1294,24 @@ def _run_request_phase_sync(
     mail_provider: MailProvider,
     log: Callable,
     on_checkpoint: Callable | None = None,
+    sidecar: Any = None,
 ) -> dict[str, Any]:
     """Synchronous core — runs in thread via asyncio.to_thread.
+
+    ``sidecar``: optional ``SentinelSidecar`` (from ``sentinel_sidecar.py``).
+    When provided, sentinel-token + so-token + key cookies (oai-sc, _dd_s,
+    oai-asli) are sourced from a real Camoufox page running in a daemon
+    thread — eliminates the QuickJS zero-fingerprint path that triggers
+    deferred account ban. None → fall back to QuickJS (legacy, risky).
 
     Flow (matching browser HAR):
       1. CSRF + signin/openai (login_hint) → auth_url
       2. GET auth_url (OAuth init) → device_id
-      3. Sentinel token
+      3. Sentinel token  (sidecar.get_sentinel_token if available)
       4. POST /api/accounts/user/register (email + password) — DIRECT, no authorize/continue
       5. GET /api/accounts/email-otp/send
       6. Poll OTP (started_at = exact send time) → POST email-otp/validate
-      7. POST /api/accounts/create_account
+      7. POST /api/accounts/create_account  (+openai-sentinel-so-token via sidecar)
       8. Follow redirect chain → callback → session
     """
     worker = None
@@ -1223,9 +1385,163 @@ def _run_request_phase_sync(
                 log(f"[request] /email-verification visit failed (continue): {exc}")
 
             # Step 5: Sentinel (flow=username_password_create) + user/register
-            sentinel = _get_sentinel_token(
-                session, device_id, "username_password_create", log, worker=worker,
-            )
+            #
+            # Prefer the page-native path via ``sidecar`` (Phase 10/11):
+            # real Firefox canvas/WebGL/audio → token fingerprint matches
+            # browser users. QuickJS fallback ONLY when sidecar missing or
+            # returns None (degrade with warning — operator sees the risk).
+            #
+            # Order (best → worst fingerprint quality):
+            #   1. K2 intercept_register_token — sidecar drives a real form
+            #      submission, captures ``openai-sentinel-token`` from the
+            #      live /register POST headers, aborts. sdk.js fires the
+            #      CORRECT path (no Xray buildGenerateFailMessage trap)
+            #      because submission is user-initiated. Body is not
+            #      hashed in sentinel-token, so caller reuses it for the
+            #      REAL /register POST with the user's password.
+            #   2. get_sentinel_token (page.evaluate(sdk)) — degrades on
+            #      Firefox Xray when sdk's fail path runs; works for many
+            #      flows but not all sdk.js versions.
+            #   3. QuickJS — no canvas/WebGL/audio → weak fingerprint.
+            #   4. Python PoW — no fingerprint at all.
+            sentinel = None
+            if sidecar is not None:
+                # K2's bootstrap_authorize_url needs ``auth_session_logging_id``
+                # matching the page's ``oai-asli`` cookie. In pure_request mode
+                # the curl jar has NO ``oai-asli`` yet (sentinel SDK that sets
+                # it never ran on chatgpt.com — there's no JS engine). Read it
+                # from the sidecar's BrowserContext instead, where it was set
+                # during ``acquire_context``'s chatgpt.com load.
+                k2_logging_id = ""
+                try:
+                    sc_cookies = sidecar.dump_cookies()
+                    sc_cookie_names = sorted({
+                        (c.get("name") or "").strip()
+                        for c in (sc_cookies or ())
+                        if c.get("name")
+                    })
+                    log(
+                        f"[sentinel] K2 sidecar cookies "
+                        f"(n={len(sc_cookies or ())}): {sc_cookie_names!r}"
+                    )
+                    for c in sc_cookies or ():
+                        if (c.get("name") or "").strip() == "oai-asli":
+                            k2_logging_id = (c.get("value") or "").strip()
+                            if k2_logging_id:
+                                break
+                except Exception as exc:  # noqa: BLE001
+                    log(f"[sentinel] K2 read oai-asli from sidecar failed: {exc}")
+                # Curl jar fallback (browser mode imported it earlier).
+                if not k2_logging_id:
+                    try:
+                        from _nextauth_bootstrap import (
+                            read_oai_asli_from_session as _read_asli_for_k2,
+                        )
+                        k2_logging_id = _read_asli_for_k2(session) or ""
+                    except Exception as exc:  # noqa: BLE001
+                        log(f"[sentinel] K2 read oai-asli from session failed: {exc}")
+                # Last resort: synthesize a UUID. Sentinel SDK doesn't seem to
+                # set ``oai-asli`` on chatgpt.com in headless Camoufox (probably
+                # because Sentinel's first action is /sentinel/req which fails
+                # under Xray in our patched build). The server treats
+                # ``auth_session_logging_id`` as a CLIENT-generated correlation
+                # ID — it accepts whatever we send and echoes via cookie.
+                # So generating one here is fine; the sidecar's signin/openai
+                # response will then set ``oai-asli`` matching this value.
+                if not k2_logging_id:
+                    import uuid as _uuid
+                    k2_logging_id = str(_uuid.uuid4())
+                    log(
+                        f"[sentinel] K2 synthesized auth_session_logging_id="
+                        f"{k2_logging_id} (sidecar+jar both missing)"
+                    )
+
+                disable_k2 = os.getenv(
+                    "OPENAI_SENTINEL_DISABLE_K2", "0",
+                ).lower() in ("1", "true", "yes")
+
+                if not disable_k2 and k2_logging_id:
+                    try:
+                        captured = sidecar.intercept_register_token(
+                            email=request.email,
+                            device_id=device_id,
+                            logging_id=k2_logging_id,
+                        )
+                        if captured and captured.get("sentinel_token"):
+                            # sentinel-token is bound to whatever device_id
+                            # sdk.js SAW inside the sidecar's page (which is
+                            # the sidecar's own ``oai-did`` cookie, not the
+                            # caller's). After K2, we ALSO sync sidecar
+                            # cookies (oai-did + oai-asli + oai-sc + ...)
+                            # into the curl jar via ``_import_cookies_from_sidecar``,
+                            # so the whole session shifts to sidecar's
+                            # identity. The header ``oai-device-id`` must
+                            # follow suit — ADOPT the captured device_id.
+                            captured_did = (captured.get("device_id") or "").strip()
+                            if captured_did and captured_did != device_id:
+                                log(
+                                    f"[sentinel] K2 adopting sidecar device_id="
+                                    f"{captured_did} (was {device_id}) — session "
+                                    f"shifts to sidecar identity"
+                                )
+                                device_id = captured_did
+                            sentinel = captured["sentinel_token"]
+                            log(
+                                f"[sentinel] K2 page-form intercept OK "
+                                f"(len={len(sentinel)} "
+                                f"so_token={'yes' if captured.get('so_token') else 'no'} "
+                                f"flow=username_password_create)"
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        log(
+                            f"[sentinel] K2 intercept_register_token error "
+                            f"{type(exc).__name__}: {exc} — fallback get_token"
+                        )
+                elif disable_k2:
+                    log("[sentinel] K2 skipped (OPENAI_SENTINEL_DISABLE_K2=1)")
+                else:
+                    log(
+                        "[sentinel] K2 skipped — auth_session_logging_id "
+                        "missing in jar (bootstrap may have failed)"
+                    )
+
+                # K2 failed or skipped → page.evaluate(sdk) fallback.
+                if not sentinel:
+                    try:
+                        sentinel = sidecar.get_sentinel_token(
+                            device_id=device_id, flow="username_password_create",
+                        )
+                        if sentinel:
+                            log(
+                                "[sentinel] page-native get_token OK "
+                                "(flow=username_password_create)"
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        log(
+                            f"[sentinel] sidecar.get_sentinel_token error "
+                            f"{type(exc).__name__}: {exc} — fallback QuickJS"
+                        )
+            if not sentinel:
+                if sidecar is not None:
+                    log(
+                        "[sentinel] sidecar returned None — fallback QuickJS "
+                        "(weak fingerprint; risk deferred ban)"
+                    )
+                sentinel = _get_sentinel_token(
+                    session, device_id, "username_password_create", log, worker=worker,
+                )
+
+            # Inject sidecar cookies (oai-sc, _dd_s, oai-asli, oai-did, ...)
+            # vào curl_cffi session jar TRƯỚC khi POST register. Browser thật
+            # luôn có những cookie này khi request /register; pure HTTP không
+            # tự gen được mà không chạy JS → import từ sidecar.
+            if sidecar is not None:
+                try:
+                    _import_cookies_from_sidecar(
+                        session, sidecar, log, caller_proxy=request.proxy,
+                    )
+                except Exception as exc:
+                    log(f"[request] cookie import from sidecar failed (continue): {exc}")
 
             log("[request] [4/8] Registering account (password)...")
             reg_headers = _common_headers("https://auth.openai.com/create-account/password")
@@ -1404,11 +1720,151 @@ def _run_request_phase_sync(
         finally:
             _loop.close()
 
-        # Step 8: Create account (sentinel create_account tính tuần tự tại đây)
+        # Step 8: Create account (sentinel create_account + so-token if sidecar)
+        #
+        # Order (best → worst fingerprint quality), mirroring Step 5 (K2):
+        #   1. K2c ``intercept_create_account_token`` — sidecar drives a
+        #      fake /about-you submit, captures ``openai-sentinel-token``
+        #      AND ``openai-sentinel-so-token`` from the live POST headers,
+        #      aborts. Real Firefox canvas/audio + Observer activity from
+        #      human-like typing → ``so`` field non-null, fingerprint
+        #      matches a legitimate user.
+        #   2. sidecar.get_sentinel_token / get_so_token via page.evaluate
+        #      — degrades on Firefox Xray (``buildGenerateFailMessage``
+        #      hits TypedArray cross-realm). Often returns None.
+        #   3. QuickJS — no canvas/audio/Observer → weak fingerprint;
+        #      so-token stays None entirely.
+        ca_sentinel = None
+        ca_so_token = None
+        if sidecar is not None:
+            disable_k2c = os.getenv(
+                "OPENAI_SENTINEL_DISABLE_K2C", "0",
+            ).lower() in ("1", "true", "yes")
+
+            if not disable_k2c:
+                # Dump caller's full curl jar — sidecar needs the
+                # post-OTP auth state to access /about-you.
+                curl_cookies: list[dict] = []
+                try:
+                    for c in session.cookies.jar:
+                        curl_cookies.append({
+                            "name": c.name,
+                            "value": c.value,
+                            "domain": getattr(c, "domain", "") or "",
+                            "path": getattr(c, "path", "/") or "/",
+                        })
+                except Exception as exc:  # noqa: BLE001
+                    log(f"[sentinel] K2c cookie jar dump failed: {exc}")
+
+                if curl_cookies:
+                    log(
+                        f"[sentinel] K2c attempt — dumped {len(curl_cookies)} "
+                        f"caller cookies, calling intercept_create_account_token..."
+                    )
+                    try:
+                        captured = sidecar.intercept_create_account_token(
+                            device_id=device_id,
+                            name=request.name,
+                            birthdate=request.birthdate,
+                            caller_cookies=curl_cookies,
+                        )
+                        if captured and captured.get("sentinel_token"):
+                            ca_sentinel = captured["sentinel_token"]
+                            ca_so_token = captured.get("so_token")
+                            # Adopt device_id if sidecar's flow saw a
+                            # different one (mirror Step 5 logic).
+                            captured_did = (
+                                captured.get("device_id") or ""
+                            ).strip()
+                            if (
+                                captured_did
+                                and captured_did != device_id
+                            ):
+                                log(
+                                    f"[sentinel] K2c adopting sidecar "
+                                    f"device_id={captured_did} "
+                                    f"(was {device_id})"
+                                )
+                                device_id = captured_did
+                            log(
+                                f"[sentinel] K2c create_account "
+                                f"intercept OK "
+                                f"(sentinel-len={len(ca_sentinel)} "
+                                f"so_token="
+                                f"{'yes' if ca_so_token else 'no'})"
+                            )
+                        else:
+                            # K2c returned None (or no sentinel_token in
+                            # the captured dict). Logging happens inside
+                            # the method (e.g. "[sidecar.K2c] ..."); add a
+                            # caller-side breadcrumb so the log shows that
+                            # K2c WAS attempted but failed.
+                            log(
+                                "[sentinel] K2c returned None — see "
+                                "[sidecar.K2c] logs above for reason; "
+                                "fallback page.evaluate/QuickJS"
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        log(
+                            f"[sentinel] K2c intercept_create_account_"
+                            f"token error {type(exc).__name__}: {exc} "
+                            f"— fallback get_sentinel_token"
+                        )
+                else:
+                    log("[sentinel] K2c skipped — curl jar empty (cannot sync)")
+            else:
+                log("[sentinel] K2c skipped (OPENAI_SENTINEL_DISABLE_K2C=1)")
+
+            # K2c failed or skipped → page.evaluate(sdk) fallback for
+            # sentinel-token (likely Xray-degraded but try anyway).
+            if not ca_sentinel:
+                try:
+                    ca_sentinel = sidecar.get_sentinel_token(
+                        device_id=device_id, flow="create_account",
+                    )
+                    if ca_sentinel:
+                        log("[sentinel] page-native OK (flow=create_account)")
+                except Exception as exc:
+                    log(
+                        f"[sentinel] sidecar create_account error "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            # If K2c didn't give us so-token, try page.evaluate fallback
+            # (also likely Xray-degraded but no harm trying).
+            if not ca_so_token:
+                try:
+                    ca_so_token = sidecar.get_so_token(
+                        device_id=device_id, flow="create_account",
+                    )
+                    if ca_so_token:
+                        log("[sentinel] so-token from sidecar OK (page.evaluate)")
+                    else:
+                        log(
+                            "[sentinel] so-token NULL from sidecar "
+                            "(Observer chưa đủ events?) — gửi /create_account "
+                            "không có so-token (rủi ro flag)"
+                        )
+                except Exception as exc:
+                    log(
+                        f"[sentinel] sidecar.get_so_token error "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
+            # Refresh cookies từ sidecar (sentinel SDK có thể đã rotate oai-sc,
+            # _dd_s sau khi gen token mới). Đảm bảo POST /create_account dùng
+            # cookies state cuối cùng — khớp browser thật flow.
+            try:
+                _import_cookies_from_sidecar(
+                    session, sidecar, log, caller_proxy=request.proxy,
+                )
+            except Exception as exc:
+                log(f"[request] cookie refresh from sidecar failed: {exc}")
+
         continue_url = _step_create_account(
             session, request.name, request.birthdate, device_id, log,
-            sentinel_token=None,
+            sentinel_token=ca_sentinel,
             worker=worker,
+            so_token=ca_so_token,
         )
 
         # Step 9: Follow redirects + get session
@@ -1513,13 +1969,76 @@ async def run_request_phase(
     The sync core runs in a worker thread (asyncio.to_thread) and polls OTP
     inline via a fresh event loop, with started_at = exact OTP send time so
     stale codes from previous attempts are never picked up.
+
+    Sidecar (Phase 10 hardening, opt-in via env):
+        ``REG_SIDECAR_DISABLED=1`` → keep legacy QuickJS path (debug only).
+        Default ON: spawn ``SentinelSidecar`` (headless Camoufox in daemon
+        thread) for real sentinel-token + so-token + JS cookies. Eliminates
+        the zero-fingerprint deferred-ban path for the pure-HTTP flow.
     """
     result = SignupResult(success=False, email=request.email)
     t_start = time.monotonic()
 
+    sidecar = None
+    sidecar_disabled = os.getenv("REG_SIDECAR_DISABLED", "0").lower() in (
+        "1", "true", "yes",
+    )
+    if not sidecar_disabled:
+        try:
+            from sentinel_sidecar import SentinelSidecar
+            # RAM optimization: ``SentinelSidecarPool`` shares a single
+            # Camoufox process per (proxy, headless, os) key. If every
+            # signup uses a UNIQUE upstream proxy, that's 1 Camoufox
+            # per signup (~150MB each). ``SIDECAR_SHARED_PROXY`` env
+            # overrides the per-signup proxy with a SHARED value so all
+            # concurrent signups pool to one Camoufox process. Trade-off:
+            # all sentinel-token traffic comes from one IP, but the
+            # ACTUAL signup HTTP requests (via curl_cffi) still use
+            # ``request.proxy`` so server still sees N different IPs
+            # for N signups. Set to empty string ``""`` for direct
+            # (no proxy on sidecar) — recommended for local dev.
+            shared_proxy = os.getenv("SIDECAR_SHARED_PROXY")
+            if shared_proxy is not None:
+                # Explicit override (empty string = direct).
+                sidecar_proxy = shared_proxy or None
+                log(
+                    f"[request] sidecar SHARED proxy="
+                    f"{sidecar_proxy or 'direct'} (SIDECAR_SHARED_PROXY env "
+                    f"override; pool keys all signups to one Camoufox)"
+                )
+            else:
+                # Legacy behavior: sidecar uses caller's proxy →
+                # one Camoufox per unique proxy.
+                sidecar_proxy = request.proxy
+            log("[request] starting sentinel sidecar (Camoufox headless)...")
+            sidecar = SentinelSidecar(
+                proxy=sidecar_proxy,
+                headless=True,
+                log=log,
+            )
+            sidecar.start(timeout=60.0)
+            log("[request] sentinel sidecar ready")
+        except Exception as exc:
+            log(
+                f"[request] sentinel sidecar FAILED to start "
+                f"({type(exc).__name__}: {exc}) — fallback QuickJS "
+                f"(zero-fingerprint risk; expect deferred ban)"
+            )
+            if sidecar is not None:
+                try:
+                    sidecar.close()
+                except Exception:
+                    pass
+            sidecar = None
+    else:
+        log(
+            "[request] REG_SIDECAR_DISABLED=1 — sidecar bypass "
+            "(legacy QuickJS path; ZERO-FINGERPRINT bot risk)"
+        )
+
     try:
         phase_result = await asyncio.to_thread(
-            _run_request_phase_sync, request, mail_provider, log, on_checkpoint,
+            _run_request_phase_sync, request, mail_provider, log, on_checkpoint, sidecar,
         )
 
         result.success = True
@@ -1557,5 +2076,11 @@ async def run_request_phase(
     finally:
         total = time.monotonic() - t_start
         log(f"[request] Total time: {total:.2f}s")
+        if sidecar is not None:
+            try:
+                sidecar.close()
+                log("[request] sentinel sidecar closed")
+            except Exception as exc:
+                log(f"[request] sidecar.close exception: {exc}")
 
     return result

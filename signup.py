@@ -257,16 +257,14 @@ async def run_signup(
         # ═══════════════════════════════════════════════════════════
         if request.reg_mode == "pure_request":
             log(f"[signup] mode=pure_request → HTTP-only registration (email={request.email})")
-            # Anti-ban runtime warning (Phase 7 Task 7.4):
-            # pure_request KHÔNG có DOM events → so-token (Session Observer)
-            # KHÔNG thể gen → server flag account = bot, ban rate cao.
-            # Recommend dùng browser mode cho production REG. Pure_request OK
-            # cho login flow (get_session) vì login KHÔNG yêu cầu so-token.
+            # Anti-ban Phase 10: sidecar Camoufox headless gen sentinel-token
+            # thật + so-token + JS cookies (oai-sc, _dd_s, oai-asli). Spawn
+            # tự động trong run_request_phase. Set REG_SIDECAR_DISABLED=1 để
+            # tắt (debug only — kéo về QuickJS path = ZERO-FINGERPRINT bot risk).
             log(
-                "[signup] ⚠ WARNING: pure_request signup KHÔNG gen được "
-                "openai-sentinel-so-token (cần DOM events thật). Server có thể "
-                "flag account = bot trong vòng 24h. Recommend reg_mode='browser' "
-                "cho production REG. Xem journal 260625-1224 bug C1."
+                "[signup] pure_request: sentinel sidecar (Camoufox headless) "
+                "sẽ spawn — đảm bảo sentinel-token + so-token real-browser. "
+                "Set REG_SIDECAR_DISABLED=1 để tắt (NGUY HIỂM, bypass anti-ban)."
             )
             result = await run_request_phase(
                 request=request,

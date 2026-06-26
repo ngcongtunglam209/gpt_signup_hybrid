@@ -206,73 +206,161 @@ async def _wait_otp_form(page, *, timeout_seconds: float, log) -> str:
     raise BrowserPhaseError(f"OTP input không xuất hiện sau {timeout_seconds}s. URL: {page.url}")
 
 
-async def _submit_otp(ctx, page, *, otp_code: str, otp_selector: str, log) -> None:
-    """Fill OTP + click submit qua UI. Fallback: gọi validate API qua context request.
+async def _submit_otp(ctx, page, *, otp_code: str, otp_selector: str, log) -> tuple[str | None, str]:
+    """Submit OTP qua UI (human-like type + Enter), wrap trong expect_response
+    để detect server validate sớm. Fallback: gọi validate API qua
+    ``context.request``.
 
-    Plan A — defensive:
-      - Pre-check page.is_closed() trước khi fill
-      - Nếu UI fill/click raise driver-dead error → fallback ctx.request.post()
-        (không dùng page.evaluate vì page đã chết)
-      - Mọi failure log kèm browser health snapshot (Plan D)
-      - Cuối cùng vẫn fail → raise BrowserPhaseError với message rõ
+    Strategy (theo HAR manual user thật):
+      - User mở /email-verification (OTP form), gõ 6 ký số → form autoSubmit
+        khi đủ độ dài HOẶC user nhấn Enter trên input.
+      - Code cũ ``page.fill + click button[type="submit"]`` không trigger
+        handler React (button có thể không có type=submit hoặc handler nằm
+        trên form.onSubmit chứ không onClick).
+      - Cách user-like: gõ per-char qua ``human_type`` (Gaussian delay) →
+        ``locator.press("Enter")``. Wrap trong ``expect_response`` 12s; nếu
+        UI không trigger POST → fallback ``_submit_otp_via_api`` ngay.
+
+    Returns:
+        Tuple ``(continue_url, source)``:
+          - ``continue_url`` (str) khi server validate OK + trả continue_url
+            trong body, ``None`` khi 4xx hoặc body thiếu.
+          - ``source``: ``"ui"`` khi UI POST đi qua form thật của page (page
+            **sẽ tự navigate** sau response — caller KHÔNG cần goto, sẽ
+            trigger NS_BINDING_ABORTED nếu cố tình). ``"api"`` khi submit
+            qua ``ctx.request.post`` fallback — page KHÔNG biết navigate,
+            caller phải ``page.goto(continue_url)`` thủ công.
     """
     log(f"[browser] typing OTP {otp_code} ({_browser_health(ctx, page)})")
 
     if _safe_is_closed(page):
         log(f"[browser] page closed before OTP fill — fallback API ({_browser_health(ctx, page)})")
-        await _submit_otp_via_api(ctx, otp_code=otp_code, log=log)
-        return
+        return (await _submit_otp_via_api(ctx, otp_code=otp_code, log=log), "api")
 
-    # UI path: fill input + click submit
-    ui_failed_with: BaseException | None = None
+    from _human_input import human_type, dwell
+
+    otp_input = page.locator(otp_selector).first
+
+    # Wrap toàn bộ submission trong expect_response để biết UI có trigger
+    # POST /email-otp/validate hay không trong 12s. Đa số UI trigger sau
+    # Enter; một số autoSubmit ngay khi length == 6.
     try:
-        await page.fill(otp_selector, otp_code)
-    except Exception as exc:
-        ui_failed_with = exc
-        if _is_driver_dead_error(exc):
-            log(
-                f"[browser] page.fill failed — driver/page dead "
-                f"({type(exc).__name__}: {exc}) — fallback API "
-                f"({_browser_health(ctx, page)})"
-            )
-            await _submit_otp_via_api(ctx, otp_code=otp_code, log=log)
-            return
-        # Lỗi non-driver-dead khi fill (vd: selector mismatch) — vẫn thử click button
-        log(
-            f"[browser] page.fill error (non-driver) "
-            f"{type(exc).__name__}: {exc} — vẫn thử click submit"
-        )
-
-    if ui_failed_with is None:
-        for btn in ('button[type="submit"]', 'button:has-text("Continue")', 'button:has-text("Verify")'):
+        async with page.expect_response(
+            lambda r: (
+                "/api/accounts/email-otp/validate" in r.url
+                and r.request.method == "POST"
+            ),
+            timeout=12000,
+        ) as resp_info:
+            # 1. Human-type OTP (Gaussian per-char). human_type tự click force
+            #    + fill("") trước khi gõ.
             try:
-                await page.click(btn, timeout=2000)
-                log(f"[browser] clicked {btn}")
-                return
+                await human_type(
+                    otp_input, otp_code,
+                    delay_min_ms=80, delay_max_ms=180, log=log,
+                )
             except Exception as exc:
                 if _is_driver_dead_error(exc):
                     log(
-                        f"[browser] click {btn} — driver dead "
+                        f"[browser] human_type OTP — driver dead "
                         f"({type(exc).__name__}: {exc}) — fallback API "
                         f"({_browser_health(ctx, page)})"
                     )
-                    await _submit_otp_via_api(ctx, otp_code=otp_code, log=log)
-                    return
-                continue
+                    return (await _submit_otp_via_api(ctx, otp_code=otp_code, log=log), "api")
+                # Non-driver-dead: vẫn cố submit (input có thể đã có một phần)
+                log(f"[browser] human_type OTP non-fatal: {type(exc).__name__}: {exc}")
 
-    # Không click được button nào (hoặc fill fail non-driver-dead) → fallback API
-    log(
-        f"[browser] no submit button worked — fallback API "
-        f"({_browser_health(ctx, page)})"
-    )
-    await _submit_otp_via_api(ctx, otp_code=otp_code, log=log)
+            # 2. Dwell ngắn trước submit (user-like)
+            await dwell(0.25, 0.6)
+
+            # 3. Submit: ưu tiên Enter trên OTP input (user thật làm thế).
+            submitted_via: str | None = None
+            try:
+                await otp_input.press("Enter", timeout=2000)
+                submitted_via = "Enter"
+            except Exception as exc:
+                if _is_driver_dead_error(exc):
+                    log(
+                        f"[browser] Enter — driver dead "
+                        f"({type(exc).__name__}: {exc}) — fallback API "
+                        f"({_browser_health(ctx, page)})"
+                    )
+                    return (await _submit_otp_via_api(ctx, otp_code=otp_code, log=log), "api")
+                log(f"[browser] OTP Enter failed: {type(exc).__name__}: {exc} — thử click button")
+
+            if submitted_via is None:
+                for btn in (
+                    'button[type="submit"]',
+                    'button:has-text("Continue")',
+                    'button:has-text("Verify")',
+                ):
+                    try:
+                        await page.click(btn, timeout=1500)
+                        submitted_via = btn
+                        break
+                    except Exception as exc:
+                        if _is_driver_dead_error(exc):
+                            log(
+                                f"[browser] click {btn} — driver dead — fallback API "
+                                f"({_browser_health(ctx, page)})"
+                            )
+                            return (await _submit_otp_via_api(ctx, otp_code=otp_code, log=log), "api")
+                        continue
+            log(f"[browser] OTP submitted via {submitted_via or '(no UI trigger fired)'}")
+
+        # expect_response context closed → POST đã observed
+        resp = await resp_info.value
+        status = resp.status
+        log(f"[browser] OTP validate UI → HTTP {status}")
+        if status >= 400:
+            # OTP sai (incorrect/expired) — caller resend / pop pending code
+            return (None, "ui")
+        # 2xx → parse continue_url. Schema (từ HAR manual):
+        #   {"continue_url": "...", "method": "GET", "page": {...}}
+        try:
+            body = await resp.text()
+        except Exception as exc:
+            log(f"[browser] OTP response body read failed: {exc}")
+            return (None, "ui")
+        if not body:
+            return (None, "ui")
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            return (None, "ui")
+        if not isinstance(data, dict):
+            return (None, "ui")
+        cu = (data.get("continue_url") or "").strip()
+        return (cu or None, "ui")
+
+    except Exception as exc:
+        # expect_response timeout (UI không trigger POST trong 12s) hoặc lỗi context.
+        # Fallback API — server-side state có thể đã consume input value khác,
+        # cứ thử qua API để xác định.
+        log(
+            f"[browser] OTP UI submit không trigger POST trong 12s "
+            f"({type(exc).__name__}: {str(exc)[:80]}) — fallback API"
+        )
+        return (await _submit_otp_via_api(ctx, otp_code=otp_code, log=log), "api")
 
 
-async def _submit_otp_via_api(ctx, *, otp_code: str, log) -> None:
+async def _submit_otp_via_api(ctx, *, otp_code: str, log) -> str | None:
     """Submit OTP qua context.request — không phụ thuộc page sống.
 
     Dùng cookies từ context (đã chia sẻ với page) để giữ session.
     Fail-fast nếu HTTP status không OK.
+
+    Returns:
+        ``continue_url`` (str) khi server trả 200 + body JSON có field này
+        (vd ``https://auth.openai.com/about-you``). Caller dùng để
+        ``page.goto(continue_url)`` cho SPA navigation thật, vì validate
+        gọi qua context.request KHÔNG trigger page navigation event.
+
+        ``None`` khi server trả 200 nhưng body không parse được hoặc thiếu
+        ``continue_url`` (rare; log warning, không raise vì validate đã pass).
+
+    Raises:
+        BrowserPhaseError khi network fail hoặc HTTP ≥ 400.
     """
     request_ctx = getattr(ctx, "request", None)
     if request_ctx is None:
@@ -301,12 +389,33 @@ async def _submit_otp_via_api(ctx, *, otp_code: str, log) -> None:
     try:
         body_text = await resp.text()
     except Exception:
-        body_text = "<no body>"
+        body_text = ""
     log(f"[browser] OTP fallback API → HTTP {status} body={body_text[:120]}")
     if status >= 400:
         raise BrowserPhaseError(
             f"OTP validate API rejected: HTTP {status}: {body_text[:200]}"
         )
+
+    # Parse continue_url từ JSON body. Server trả schema (HAR manual record):
+    #   {"continue_url": "https://auth.openai.com/about-you",
+    #    "method": "GET",
+    #    "page": {"type": "about_you", ...}}
+    if not body_text:
+        log("[browser] OTP fallback API: empty body, không có continue_url")
+        return None
+    try:
+        data = json.loads(body_text)
+    except json.JSONDecodeError:
+        log("[browser] OTP fallback API: body không phải JSON, không có continue_url")
+        return None
+    if not isinstance(data, dict):
+        log(f"[browser] OTP fallback API: body không phải object (got {type(data).__name__})")
+        return None
+    continue_url = (data.get("continue_url") or "").strip()
+    if not continue_url:
+        log("[browser] OTP fallback API: response thiếu continue_url field")
+        return None
+    return continue_url
 
 
 async def _wait_after_login(page, *, timeout_seconds: float, log) -> str:
@@ -581,6 +690,7 @@ async def _drive_signup_flow(
     _otp_reclick_done = False
     _otp_js_submit_done = False
     _otp_api_done = False
+    _otp_last_code: str | None = None  # code đang chờ confirm (cho API fallback)
     one_time_code_mode = False  # True sau khi click "Log in with a one-time code"
     tried_codes: set[str] = set()  # codes đã submit + bị reject
     pending_codes: list[str] = []  # codes chưa submit (mail delay catch)
@@ -662,39 +772,37 @@ async def _drive_signup_flow(
             # trên password input để build so-token. Bypass form = so-token
             # rỗng → server flag bot → ban.
             #
-            # Strategy:
-            #   1. Wait `oai-sc` cookie (sentinel SDK đã chạy + observer ready).
-            #   2. Mouse wander để observer record cursor activity.
-            #   3. human_type password (Gaussian delay + occasional pause).
+            # Thứ tự (đảo lại P2 — fix 32s gap detect input):
+            #   1. Tìm password input (max 15s) — page SPA có thể đang render.
+            #      Đảo lên đầu vì code cũ chạy mouse_wander + page.evaluate
+            #      block trên page chưa stable → tốn 30s+ trước khi detect input.
+            #   2. Wait `oai-sc` cookie (8s) — sentinel SDK đã chạy ready.
+            #   3. Dwell ngắn (user-like reading) → human_type password.
             #   4. human_click submit (mousemove → click).
             #   5. expect_response /register để capture HTTP status.
+            #
+            # Bỏ ``random_mouse_wander`` ở đây — manual user không wander
+            # trước khi gõ password; ``human_type`` per-char đã đủ keydown
+            # events cho sentinel build so-token. Wander chỉ tốn wall-clock
+            # và risk block trên page chưa load xong.
 
-            from _human_input import human_type, human_click, dwell, random_mouse_wander
+            from _human_input import human_type, human_click, dwell
 
-            # 1. Wait oai-sc cookie (Task 2.4)
-            try:
-                await _wait_oai_sc(ctx, timeout_seconds=15.0, log=log)
-            except BrowserPhaseError as exc:
-                log(f"[flow] oai-sc wait timeout (continue anyway): {exc}")
-
-            # 2. Mouse wander để sentinel observer record cursor activity (Task 2.5)
-            try:
-                await random_mouse_wander(page, count=2, log=log)
-            except Exception as exc:
-                log(f"[flow] mouse wander failed (continue): {exc}")
-
-            # 3. Find password input
+            # 1. Find password input (đảo lên đầu)
             pwd_input = None
-            for sel in (
+            pwd_selector_used = None
+            for idx, sel in enumerate((
                 'input[type="password"]',
                 'input[name="password"]',
                 'input[autocomplete*="password"]',
-            ):
+            )):
                 try:
                     loc = page.locator(sel).first
-                    if await loc.is_visible(timeout=2000):
+                    # Selector đầu chờ tối đa 15s (SPA render); fallback 2s
+                    sel_timeout = 15000 if idx == 0 else 2000
+                    if await loc.is_visible(timeout=sel_timeout):
                         pwd_input = loc
-                        log(f"[flow] password input detected: {sel}")
+                        pwd_selector_used = sel
                         break
                 except Exception:
                     continue
@@ -702,6 +810,17 @@ async def _drive_signup_flow(
                 raise BrowserPhaseError(
                     f"không tìm thấy password input trên /create-account/password. URL: {page.url}"
                 )
+            log(f"[flow] password input detected: {pwd_selector_used}")
+
+            # 2. Wait oai-sc cookie (giảm timeout 15→8s — sentinel set rất sớm
+            #    khi page bắt đầu render; nếu 8s không có thì page có vấn đề).
+            try:
+                await _wait_oai_sc(ctx, timeout_seconds=8.0, log=log)
+            except BrowserPhaseError as exc:
+                log(f"[flow] oai-sc wait timeout (continue anyway): {exc}")
+
+            # 3. Pre-typing dwell — user-like (đọc form rồi gõ)
+            await dwell(0.5, 1.2)
 
             # 4. Human-type password (Task 2.2)
             from _human_input import DEFAULT_DELAY_MIN_MS, DEFAULT_DELAY_MAX_MS
@@ -734,8 +853,13 @@ async def _drive_signup_flow(
                     ):
                         try:
                             btn = page.locator(sel).first
+                            # is_enabled timeout 2000ms (tăng từ 500): button có
+                            # thể đang disabled vì password validator chưa pass
+                            # (sentinel observer build so-token). 500ms quá ngắn
+                            # → loop qua selector kế (cũng disabled) → mất time
+                            # tổng. 2000ms cho phép button enable bình thường.
                             if await btn.is_visible(timeout=1500) \
-                                    and await btn.is_enabled(timeout=500):
+                                    and await btn.is_enabled(timeout=2000):
                                 await human_click(page, btn, log=log)
                                 log(f"[flow] clicked submit: {sel}")
                                 submitted = True
@@ -870,14 +994,41 @@ async def _drive_signup_flow(
                             next_code = pending_codes.pop(0)
                             log(f"[flow] OTP rejected: {err_text.strip()[:60]} — thử code kế: {next_code}")
                             otp_selector = await _wait_otp_form(page, timeout_seconds=5.0, log=log)
-                            await _submit_otp(ctx, page, otp_code=next_code, otp_selector=otp_selector, log=log)
+                            otp_continue_url, otp_source = await _submit_otp(
+                                ctx, page, otp_code=next_code,
+                                otp_selector=otp_selector, log=log,
+                            )
                             tried_codes.add(next_code)
                             otp_submitted = True
                             _otp_submit_ts = time.monotonic()
+                            _otp_last_code = next_code
                             _otp_reclick_done = False
                             _otp_js_submit_done = False
                             _otp_api_done = False
                             same_screen_count = 0
+                            # Chỉ goto khi API path (page không tự nav). UI path
+                            # → page tự nav, goto sẽ gây NS_BINDING_ABORTED.
+                            if otp_continue_url and otp_source == "api":
+                                log(f"[flow] OTP OK (pending, API path) → goto {otp_continue_url}")
+                                try:
+                                    await page.goto(
+                                        otp_continue_url,
+                                        wait_until="domcontentloaded",
+                                        timeout=15000,
+                                    )
+                                except Exception as exc:
+                                    log(f"[flow] goto continue_url failed: {type(exc).__name__}: {exc}")
+                                otp_submitted = False
+                                _otp_submit_ts = None
+                                _otp_last_code = None
+                            elif otp_continue_url and otp_source == "ui":
+                                log(
+                                    f"[flow] OTP OK (pending, UI path) — page sẽ "
+                                    f"tự nav, KHÔNG goto. State machine detect screen mới."
+                                )
+                                otp_submitted = False
+                                _otp_submit_ts = None
+                                _otp_last_code = None
                             await asyncio.sleep(2.0)
                             continue
                         # Không còn pending → resend
@@ -924,14 +1075,54 @@ async def _drive_signup_flow(
                     _otp_js_submit_done = True
                 elif _otp_wait_elapsed > 25.0 and not _otp_api_done:
                     log("[flow] OTP UI+JS submit không work — thử validate qua API")
+                    # Ưu tiên `_otp_last_code` đã track lúc submit (chính xác,
+                    # không phụ thuộc state input box còn giữ giá trị hay không).
+                    # Fallback: đọc từ input box nếu vì lý do nào đó chưa track.
+                    code_to_send = _otp_last_code
+                    if not code_to_send:
+                        try:
+                            otp_inp = page.locator('input[name="code"]').first
+                            otp_val = await otp_inp.input_value()
+                            if otp_val and len(otp_val) == 6:
+                                code_to_send = otp_val
+                        except Exception:
+                            pass
+                    if not code_to_send:
+                        log("[flow] API fallback skip: không có OTP code để gửi")
+                        _otp_api_done = True
+                        await asyncio.sleep(0.5)
+                        continue
                     try:
-                        otp_inp = page.locator('input[name="code"]').first
-                        otp_val = await otp_inp.input_value()
-                        if otp_val and len(otp_val) == 6:
-                            await _submit_otp_via_api(ctx, otp_code=otp_val, log=log)
+                        continue_url = await _submit_otp_via_api(
+                            ctx, otp_code=code_to_send, log=log
+                        )
                     except Exception as exc:
                         log(f"[flow] API fallback failed: {type(exc).__name__}: {exc}")
+                        continue_url = None
                     _otp_api_done = True
+                    # API validate đã pass nhưng SPA của page KHÔNG nhận
+                    # navigation event (vì gọi qua context.request, không qua
+                    # form submit của page). Phải manual goto continue_url
+                    # để page chuyển sang /about-you, nếu không state machine
+                    # sẽ kẹt vô tận ở screen=otp.
+                    if continue_url:
+                        log(f"[flow] follow continue_url → {continue_url}")
+                        try:
+                            await page.goto(continue_url, wait_until="domcontentloaded", timeout=15000)
+                        except Exception as exc:
+                            log(f"[flow] goto continue_url failed: {type(exc).__name__}: {exc}")
+                        # Reset state OTP để state machine detect screen mới
+                        # (kỳ vọng `about_you`). Nếu page vẫn còn ở
+                        # /email-verification thì sẽ vào nhánh re-poll bên dưới.
+                        otp_submitted = False
+                        _otp_submit_ts = None
+                        _otp_reclick_done = False
+                        _otp_js_submit_done = False
+                        _otp_api_done = False
+                        _otp_last_code = None
+                        same_screen_count = 0
+                        await asyncio.sleep(0.5)
+                        continue
                 elif _otp_wait_elapsed > 35.0:
                     log("[flow] OTP stuck >35s — re-poll code mới")
                     otp_submitted = False
@@ -939,6 +1130,7 @@ async def _drive_signup_flow(
                     _otp_reclick_done = False
                     _otp_js_submit_done = False
                     _otp_api_done = False
+                    _otp_last_code = None
                     try:
                         otp_inp = page.locator('input[name="code"]').first
                         await otp_inp.fill("")
@@ -1052,13 +1244,48 @@ async def _drive_signup_flow(
                 except Exception:
                     pass
             tried_codes.add(otp_code)
-            await _submit_otp(ctx, page, otp_code=otp_code, otp_selector=otp_selector, log=log)
+            otp_continue_url, otp_source = await _submit_otp(
+                ctx, page, otp_code=otp_code, otp_selector=otp_selector, log=log,
+            )
             otp_submitted = True
             _otp_submit_ts = time.monotonic()
+            _otp_last_code = otp_code
             _otp_reclick_done = False
             _otp_js_submit_done = False
             _otp_api_done = False
             otp_already_polled = True
+
+            # Phase fix 2026-06-26: chỉ goto continue_url khi API path
+            # (page KHÔNG tự nav). UI path → page tự nav natively, goto
+            # đua với natural nav → NS_BINDING_ABORTED → cả 2 navigation
+            # bị huỷ → page stuck. Để state machine detect screen mới
+            # tự nhiên.
+            if otp_continue_url and otp_source == "api":
+                log(f"[flow] OTP OK (API fallback path) → goto {otp_continue_url}")
+                try:
+                    await page.goto(
+                        otp_continue_url,
+                        wait_until="domcontentloaded",
+                        timeout=15000,
+                    )
+                except Exception as exc:
+                    log(f"[flow] goto continue_url failed: {type(exc).__name__}: {exc}")
+                otp_submitted = False
+                _otp_submit_ts = None
+                _otp_last_code = None
+                same_screen_count = 0
+            elif otp_continue_url and otp_source == "ui":
+                log(
+                    f"[flow] OTP OK (UI form path) — page tự nav tới "
+                    f"{otp_continue_url.split('?')[0]}, KHÔNG goto manual"
+                )
+                # Reset state để state machine detect screen mới khi page
+                # nav xong. KHÔNG manual goto vì sẽ race với natural nav.
+                otp_submitted = False
+                _otp_submit_ts = None
+                _otp_last_code = None
+                same_screen_count = 0
+
             # Dwell jitter (anti-ban Task 2.3) sau submit OTP — page transition
             # tới /about-you cần realistic delay (sentinel observer record).
             from _human_input import dwell as _dwell_otp_done
@@ -1153,7 +1380,23 @@ async def _handle_login_after_password(
     )
     otp_seconds = time.monotonic() - t_otp
     log(f"[browser] login OTP={otp_code} in {otp_seconds:.1f}s")
-    await _submit_otp(ctx, page, otp_code=otp_code, otp_selector=otp_selector, log=log)
+    otp_continue_url, otp_source = await _submit_otp(
+        ctx, page, otp_code=otp_code, otp_selector=otp_selector, log=log,
+    )
+    # Chỉ goto khi API fallback path. UI path → page tự nav.
+    if otp_continue_url and otp_source == "api":
+        log(f"[browser] login OTP OK (API path) → goto {otp_continue_url}")
+        try:
+            await page.goto(
+                otp_continue_url, wait_until="domcontentloaded", timeout=15000,
+            )
+        except Exception as exc:
+            log(f"[browser] goto continue_url failed: {type(exc).__name__}: {exc}")
+    elif otp_continue_url and otp_source == "ui":
+        log(
+            f"[browser] login OTP OK (UI path) — page tự nav tới "
+            f"{otp_continue_url.split('?')[0]}, đợi state machine detect"
+        )
 
     # Sau OTP có 2 case:
     # 1. /about-you (account chưa onboard) → fill name+age → callback
@@ -1958,6 +2201,17 @@ async def run_browser_phase(
             # random_mouse_wander Python ở Phase 2 vì wander control timing
             # giữa actions còn humanize chỉ jitter trong 1 mouse.move call.
             humanize=True,
+            # main_world_eval=True (Phase 11.2): cho phép page.evaluate chạy
+            # main world, tránh Xray wrapper reject TypedArray của sdk.js.
+            main_world_eval=True,
+            # NOTE: ``fingerprint_preset=True`` removed (Phase 11.1, 2026-06-25)
+            # — older Camoufox versions (current pinned in this repo's venv)
+            # don't recognise this kwarg and forward it to Playwright's
+            # ``BrowserType.launch()``, which then raises
+            # ``TypeError: got an unexpected keyword argument 'fingerprint_preset'``.
+            # Camoufox already provides BrowserForge synthetic fingerprints
+            # by default; per-context persona rotation (Phase 11) re-seeds
+            # canvas/audio/font/WebGL per signup via ``ctx.add_init_script``.
             config=extra_config,
             **screen_kwargs,
             **proxy_kwargs,
@@ -1979,6 +2233,17 @@ async def run_browser_phase(
 
             await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
             log("[browser] chatgpt.com loaded")
+            # Fingerprint health probe (Phase 9 — anti-ban headless hardening):
+            # Confirm Camoufox produced real WebGL/canvas/audio/plugins. Empty
+            # values mean headless mode degraded → sdk.js so-token sẽ zero
+            # fingerprint → deferred ban. Log-only (strict=False) để không
+            # block account run nếu chỉ 1 vector miss; operator quyết định
+            # switch headed dựa trên log.
+            try:
+                from sentinel_browser import verify_fingerprint_health as _vfp
+                await _vfp(page, log=log)
+            except Exception as _exc:
+                log(f"[fingerprint] health probe exception: {_exc}")
             logging_id = await _resolve_logging_id(ctx)
             _authorize_url = await _bootstrap_oauth_url(
                 page, email=request.email, device_id=device_id, logging_id=logging_id, log=log,
@@ -2074,6 +2339,12 @@ async def run_browser_phase(
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
             await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
             log("[browser] chatgpt.com loaded")
+            # Fingerprint health probe (Phase 9 — anti-ban headless hardening).
+            try:
+                from sentinel_browser import verify_fingerprint_health as _vfp
+                await _vfp(page, log=log)
+            except Exception as _exc:
+                log(f"[fingerprint] health probe exception: {_exc}")
             logging_id = await _resolve_logging_id(ctx)
             _authorize_url = await _bootstrap_oauth_url(
                 page, email=request.email, device_id=device_id, logging_id=logging_id, log=log,

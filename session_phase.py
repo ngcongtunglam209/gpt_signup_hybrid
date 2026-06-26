@@ -176,6 +176,25 @@ async def _get_session_browser(
         log("[session] loading chatgpt.com...")
         await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
 
+        # Sentinel oracle — page-native sentinel-token (anti-ban):
+        #   QuickJS (Node) thiếu canvas/WebGL/audio thật → so-token "zero-fingerprint"
+        #   → OpenAI server flag account → deactivate async 1-24h sau.
+        #   Oracle dùng Camoufox page hiện tại để chạy sdk.js native — fingerprint
+        #   khớp Firefox thật. Construct ngay sau khi đã goto chatgpt.com để
+        #   context có đủ cookies cho sentinel.openai.com requests.
+        from sentinel_browser import (
+            SentinelBrowserOracle as _SentinelOracle,
+            verify_fingerprint_health as _verify_fp,
+        )
+        # Fingerprint health probe BEFORE creating oracle. Empty WebGL/canvas
+        # → oracle's sdk.js call also returns weak token → still degraded.
+        # Log-only here; operator may switch to headless=False if persistent.
+        try:
+            await _verify_fp(page, log=log)
+        except Exception as _exc:
+            log(f"[fingerprint] health probe exception: {_exc}")
+        sentinel_oracle = _SentinelOracle(page=page, ctx=ctx, log=log)
+
         from _nextauth_bootstrap import read_oai_asli_from_ctx as _read_asli
         cookie_logging_id = await _read_asli(ctx)
         if cookie_logging_id:
@@ -476,6 +495,13 @@ async def _get_session_browser(
             # Anti-detect hardening (Phase 9 audit) — sync với browser_phase
             block_webrtc=True,
             humanize=True,
+            # main_world_eval=True (Phase 11.2): sdk.js / Sentinel SDK gọi
+            # TypedArray + crypto cross-context. Firefox Xray wrapper reject
+            # → page.evaluate gọi SDK fail. Bật main world cho Camoufox.
+            main_world_eval=True,
+            # fingerprint_preset removed (Phase 11.1 — Camoufox in this venv
+            # doesn't support the kwarg; per-context add_init_script seeds
+            # handle persona rotation in the sidecar pool).
             config=extra_config,
             **screen_kwargs,
             **proxy_kwargs,
@@ -984,6 +1010,7 @@ async def get_session_pure_request(
         _step_csrf,
         _step_auth_url,
         _get_sentinel_token,
+        _get_sentinel_token_async,
         _common_headers,
         _step_authorize_continue,
         _step_follow_redirects,
@@ -1271,7 +1298,13 @@ async def get_session_pure_request(
                 # State machine giờ clean (no login_hint preset) → authorize/continue
                 # an toàn để drive flow. Vẫn catch 409 invalid_state để báo lỗi rõ.
                 log("[session-req] resolve qua authorize/continue (no login_hint)...")
-                ac_sentinel = _get_sentinel_token(session, device_id, "login", log)
+                # pure_request mode: no browser oracle → use sync QuickJS path.
+                # ``_sync`` is sync (wrapped via ``asyncio.to_thread``), so we
+                # MUST NOT ``await`` here. The ``_async`` variant is only for
+                # browser-mode session where ``sentinel_oracle`` exists.
+                ac_sentinel = _get_sentinel_token(
+                    session, device_id, "login", log,
+                )
                 try:
                     ac_data = _step_authorize_continue(
                         session, email, ac_sentinel,
@@ -1334,7 +1367,10 @@ async def get_session_pure_request(
                 # flow → required action; "login" có thể trả token không hợp lệ cho
                 # endpoint password/verify. legacy giữ "login".
                 _sentinel_flow = "password_verify" if flow_mode == "anti409" else "login"
-                sentinel_pw = _get_sentinel_token(session, device_id, _sentinel_flow, log)
+                # pure_request mode: no browser oracle → sync QuickJS.
+                sentinel_pw = _get_sentinel_token(
+                    session, device_id, _sentinel_flow, log,
+                )
                 if sentinel_pw:
                     headers["openai-sentinel-token"] = sentinel_pw
 
