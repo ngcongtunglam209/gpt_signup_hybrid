@@ -1177,6 +1177,13 @@ def build_icloud_router() -> APIRouter:
                 if not api_key:
                     api_key = worker_cfg.get("api_key", "")
 
+        # Resolve reg_mode từ Settings — KHÔNG có override từ API body (autoreg
+        # giữ pipeline mode đồng nhất per-process). Default "browser" để backward
+        # compat khi key chưa từng set.
+        reg_mode = str(all_settings.get("reg_mode.current") or "browser")
+        if reg_mode not in ("browser", "pure_request", "hybrid"):
+            reg_mode = "browser"
+
         config = AutoRegConfig(
             concurrency=body.concurrency,
             poll_interval=body.poll_interval,
@@ -1189,6 +1196,7 @@ def build_icloud_router() -> APIRouter:
             auto_retry=bool(all_settings.get("reg.auto_retry", False)),
             auto_retry_max=int(all_settings.get("reg.auto_retry_max", 3)),
             auto_retry_delay=float(all_settings.get("reg.auto_retry_delay", 30)),
+            reg_mode=reg_mode,
         )
         await _autoreg_runner.start(config)
 

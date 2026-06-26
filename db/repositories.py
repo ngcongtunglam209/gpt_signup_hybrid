@@ -122,9 +122,9 @@ def _validate_type_constraint(key: str, value: Any) -> None:
         return
 
     if key == "reg_mode.current":
-        if not isinstance(value, str) or value not in ("browser", "pure_request"):
+        if not isinstance(value, str) or value not in ("browser", "pure_request", "hybrid"):
             raise RepositoryError(
-                "set", ValueError(f"{key}: must be str in {{\"browser\",\"pure_request\"}}, got {value!r}")
+                "set", ValueError(f"{key}: must be str in {{\"browser\",\"pure_request\",\"hybrid\"}}, got {value!r}")
             )
         return
 

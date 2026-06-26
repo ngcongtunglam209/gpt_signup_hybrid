@@ -99,12 +99,21 @@ def _datadog_trace_headers() -> dict[str, str]:
 #   - _dd_s       : Datadog RUM session ID
 #   - oai-asli    : auth_session_logging_id từ NextAuth
 # Thêm các cookie session khác mà server cấp khi navigate /email-verification.
+#
+# Phase A.2 (chuẩn chatgpt_camoufox): THU HẸP allowlist — bỏ ``__cf_bm`` /
+# ``__cflb`` / ``_cfuvid`` (Cloudflare bot-management bound to TLS session).
+# Camoufox và curl_cffi có 2 TLS session khác nhau (JA3/JA4 khác), copy 3 cookie
+# này từ Camoufox sang curl = anti-bot signal (server thấy cookie issued cho
+# JA3_A nhưng request đến từ JA3_B → mismatch). Để curl_cffi TỰ NHẬN
+# ``__cf_bm`` etc. từ response của chính nó (tự nhiên, khớp JA3 của curl).
+# ``cf_clearance`` GIỮ vì đây là challenge response (browser-only, curl không
+# tự kiếm được) — IP-bound nên đã có skip-nếu-proxy-khác bên dưới.
 _SIDECAR_COOKIE_ALLOWLIST = frozenset({
     "oai-sc", "_dd_s", "oai-asli", "oai-did",
     "oaicom-stable-id",
-    # Cloudflare bot-management — đã có trong jar curl từ prime, nhưng có
-    # thể có giá trị mới hơn từ Camoufox (RTT khác) → cập nhật cho fresh.
-    "__cf_bm", "__cflb", "_cfuvid", "cf_clearance",
+    # Cloudflare clearance — challenge JS response, browser-only, curl không
+    # tự kiếm được. IP-bound nên skip khi proxy khác (xem _CF_IP_BOUND_COOKIES).
+    "cf_clearance",
 })
 
 # Cookies that are IP-bound (Cloudflare bot management). If sidecar's
@@ -112,8 +121,12 @@ _SIDECAR_COOKIE_ALLOWLIST = frozenset({
 # CF cookies issued for IP_A from IP_B → server detects mismatch and
 # re-issues a challenge. When the proxies match (or both ``None``),
 # syncing is fine and saves a round-trip.
+#
+# Phase A.2: chỉ còn ``cf_clearance`` (3 cookie ``__cf_bm``/``__cflb``/
+# ``_cfuvid`` đã bị loại khỏi allowlist trên — luôn không sync, không cần
+# check IP-bound nữa).
 _CF_IP_BOUND_COOKIES = frozenset({
-    "__cf_bm", "__cflb", "_cfuvid", "cf_clearance",
+    "cf_clearance",
 })
 
 
@@ -253,7 +266,29 @@ def _get_sentinel_token(
         ``get_sentinel_token_async`` với ``browser_oracle`` từ Camoufox page
         sống. Function sync này chỉ dùng khi không có page (vd pure_request
         flow), chấp nhận risk fingerprint yếu.
+
+    Phase B (chuẩn chatgpt_camoufox): env ``OPENAI_SENTINEL_REQUIRE_SIDECAR=1``
+    → raise RequestPhaseError thay vì fallback QuickJS. Dùng cho production
+    account creation — chấp nhận fail sớm hơn là tạo account với fingerprint
+    yếu rồi bị deferred ban (uổng combo + proxy + OTP).
     """
+    require_sidecar = os.getenv("OPENAI_SENTINEL_REQUIRE_SIDECAR", "0").lower() in (
+        "1", "true", "yes",
+    )
+    if require_sidecar:
+        raise RequestPhaseError(
+            f"sentinel sync path bị block (OPENAI_SENTINEL_REQUIRE_SIDECAR=1) cho "
+            f"flow={flow!r}. Sidecar Camoufox phải mint token — không có fallback "
+            f"QuickJS/PoW vì fingerprint yếu = deferred ban. Cân nhắc chuyển "
+            f"reg_mode='hybrid' (chatgpt_camoufox pipeline, sdk.js LIVE only)."
+        )
+
+    log(
+        f"[sentinel] WARN: fallback path QuickJS/PoW cho flow={flow!r} — "
+        f"fingerprint yếu, risk deferred ban. Set "
+        f"OPENAI_SENTINEL_REQUIRE_SIDECAR=1 để fail sớm thay vì burn combo."
+    )
+
     disable_quickjs = os.getenv("OPENAI_SENTINEL_DISABLE_QUICKJS", "0").lower() in (
         "1", "true", "yes",
     )
@@ -1620,6 +1655,63 @@ def _run_request_phase_sync(
             _step_send_otp(session, device_id, log)
         log("[request] OTP sent")
 
+        # ── Phase E (perf): pre-mint sentinel oauth_create_account ──
+        # Khi sidecar khả dụng, spawn 1 thread nền mint sentinel + so cho
+        # flow ``create_account`` song song với poll OTP (block ~15-30s).
+        # Khi K2c fail sau OTP, fallback path dùng cache pre-mint thay vì
+        # gọi sidecar.get_sentinel_token lại → tiết kiệm 3-6s/signup.
+        #
+        # Caveat: device_id có thể bị K2c "adopt sidecar's" sau OTP → cache
+        # stale. Check device_id_unchanged khi dùng cache.
+        # Env knob: HYBRID_PREMINT_DISABLED=1 để tắt (debug perf overhead).
+        _premint_ca_cache: dict = {"token": None, "so": None}
+        _premint_ca_thread = None
+        _premint_ca_device_id = device_id
+        _premint_disabled = os.getenv(
+            "HYBRID_PREMINT_DISABLED", "0",
+        ).lower() in ("1", "true", "yes")
+        if sidecar is not None and not _premint_disabled:
+            def _premint_create_account_sentinel():
+                try:
+                    log(
+                        "[premint] start sentinel oauth_create_account "
+                        "(background, song song poll OTP)"
+                    )
+                    t_premint = time.monotonic()
+                    try:
+                        tok = sidecar.get_sentinel_token(
+                            device_id=_premint_ca_device_id,
+                            flow="create_account",
+                        )
+                        if tok:
+                            _premint_ca_cache["token"] = tok
+                    except Exception as exc_t:
+                        log(f"[premint] sentinel-token error: {exc_t}")
+                    try:
+                        so = sidecar.get_so_token(
+                            device_id=_premint_ca_device_id,
+                            flow="create_account",
+                        )
+                        if so:
+                            _premint_ca_cache["so"] = so
+                    except Exception as exc_so:
+                        log(f"[premint] so-token error (non-fatal): {exc_so}")
+                    log(
+                        f"[premint] done in {time.monotonic() - t_premint:.2f}s "
+                        f"(token={'OK' if _premint_ca_cache['token'] else 'MISS'} "
+                        f"so={'OK' if _premint_ca_cache['so'] else 'MISS'})"
+                    )
+                except Exception as exc:  # noqa: BLE001 — best-effort
+                    log(f"[premint] error (will fallback): {exc}")
+
+            import threading as _threading
+            _premint_ca_thread = _threading.Thread(
+                target=_premint_create_account_sentinel,
+                name="pure-request-premint-ca",
+                daemon=True,
+            )
+            _premint_ca_thread.start()
+
         # Step 6: Poll OTP với mini-timeout + resend có giới hạn (mirror vòng poll
         # đầu của browser_phase). started_at = send time → chỉ nhận code về SAU thời
         # điểm này, loại code cũ cùng inbox. Dùng 1 event loop xuyên suốt vòng poll
@@ -1817,38 +1909,65 @@ def _run_request_phase_sync(
 
             # K2c failed or skipped → page.evaluate(sdk) fallback for
             # sentinel-token (likely Xray-degraded but try anyway).
+            # Phase E: ưu tiên cache pre-mint (thread đã chạy song song poll
+            # OTP) khi device_id KHÔNG đổi giữa pre-mint và bây giờ. Tiết
+            # kiệm 1 vòng page.evaluate (~3-6s).
+            _device_id_unchanged = (device_id == _premint_ca_device_id)
             if not ca_sentinel:
-                try:
-                    ca_sentinel = sidecar.get_sentinel_token(
-                        device_id=device_id, flow="create_account",
-                    )
-                    if ca_sentinel:
-                        log("[sentinel] page-native OK (flow=create_account)")
-                except Exception as exc:
-                    log(
-                        f"[sentinel] sidecar create_account error "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-            # If K2c didn't give us so-token, try page.evaluate fallback
+                if (
+                    _premint_ca_thread is not None
+                    and _device_id_unchanged
+                ):
+                    _premint_ca_thread.join(timeout=5.0)
+                    if _premint_ca_cache["token"]:
+                        ca_sentinel = _premint_ca_cache["token"]
+                        log(
+                            "[sentinel] page-native cache HIT "
+                            "(pre-minted oauth_create_account)"
+                        )
+                if not ca_sentinel:
+                    try:
+                        ca_sentinel = sidecar.get_sentinel_token(
+                            device_id=device_id, flow="create_account",
+                        )
+                        if ca_sentinel:
+                            log("[sentinel] page-native OK (flow=create_account)")
+                    except Exception as exc:
+                        log(
+                            f"[sentinel] sidecar create_account error "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+            # If K2c didn't give us so-token, try cache then page.evaluate fallback
             # (also likely Xray-degraded but no harm trying).
             if not ca_so_token:
-                try:
-                    ca_so_token = sidecar.get_so_token(
-                        device_id=device_id, flow="create_account",
-                    )
-                    if ca_so_token:
-                        log("[sentinel] so-token from sidecar OK (page.evaluate)")
-                    else:
-                        log(
-                            "[sentinel] so-token NULL from sidecar "
-                            "(Observer chưa đủ events?) — gửi /create_account "
-                            "không có so-token (rủi ro flag)"
-                        )
-                except Exception as exc:
+                if (
+                    _premint_ca_thread is not None
+                    and _device_id_unchanged
+                    and _premint_ca_cache["so"]
+                ):
+                    ca_so_token = _premint_ca_cache["so"]
                     log(
-                        f"[sentinel] sidecar.get_so_token error "
-                        f"{type(exc).__name__}: {exc}"
+                        "[sentinel] so-token cache HIT "
+                        "(pre-minted oauth_create_account)"
                     )
+                if not ca_so_token:
+                    try:
+                        ca_so_token = sidecar.get_so_token(
+                            device_id=device_id, flow="create_account",
+                        )
+                        if ca_so_token:
+                            log("[sentinel] so-token from sidecar OK (page.evaluate)")
+                        else:
+                            log(
+                                "[sentinel] so-token NULL from sidecar "
+                                "(Observer chưa đủ events?) — gửi /create_account "
+                                "không có so-token (rủi ro flag)"
+                            )
+                    except Exception as exc:
+                        log(
+                            f"[sentinel] sidecar.get_so_token error "
+                            f"{type(exc).__name__}: {exc}"
+                        )
 
             # Refresh cookies từ sidecar (sentinel SDK có thể đã rotate oai-sc,
             # _dd_s sau khi gen token mới). Đảm bảo POST /create_account dùng

@@ -1108,9 +1108,9 @@
       applyMailMode(dom.mailModeSelect.value);
     });
 
-    // ── Reg Mode selector (browser / pure_request) ───────────────
+    // ── Reg Mode selector (browser / pure_request / hybrid) ─────
     const savedRegMode = Settings.get('reg_mode.current');
-    if (savedRegMode && ['browser', 'pure_request'].includes(savedRegMode)) {
+    if (savedRegMode && ['browser', 'pure_request', 'hybrid'].includes(savedRegMode)) {
       dom.regModeSelect.value = savedRegMode;
     }
     dom.regModeSelect.addEventListener('change', () => {

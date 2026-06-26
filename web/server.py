@@ -254,7 +254,7 @@ class AddJobsRequest(BaseModel):
     )
     reg_mode: str = Field(
         default="pure_request",
-        description="Registration mode: 'pure_request' (default, HTTP only) or 'browser' (anti-detect).",
+        description="Registration mode: 'pure_request' (default, HTTP only), 'browser' (anti-detect) hoặc 'hybrid' (curl_cffi Firefox + Camoufox sentinel).",
     )
     email_logs_url: str | None = Field(
         default=None,

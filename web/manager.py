@@ -372,7 +372,7 @@ class Job:
     email: str
     combo: str  # raw combo line
     mail_mode: str = "outlook"
-    reg_mode: str = "browser"  # "pure_request" or "browser"
+    reg_mode: str = "browser"  # "browser" | "pure_request" | "hybrid"
     status: JobStatus = "queued"
     log_lines: list[str] = field(default_factory=list)
     error: str | None = None
@@ -2252,7 +2252,7 @@ class SessionJob:
     email: str
     password: str
     secret: str | None = None
-    reg_mode: str = "browser"  # "pure_request" or "browser"
+    reg_mode: str = "browser"  # "browser" | "pure_request" | "hybrid"
     status: JobStatus = "queued"
     log_lines: list[str] = field(default_factory=list)
     error: str | None = None
@@ -3026,7 +3026,7 @@ class LinkJob:
     password: str
     secret: str | None = None
     mode: LinkMode = "combo"
-    reg_mode: str = "browser"  # "pure_request" or "browser"
+    reg_mode: str = "browser"  # "browser" | "pure_request" | "hybrid"
     # Pre-provided token (dùng cho mode session_json / access_token)
     _access_token: str | None = field(default=None, repr=False)
     status: JobStatus = "queued"

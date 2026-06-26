@@ -200,6 +200,12 @@ class WorkerMailProvider:
         deadline = time.monotonic() + max(timeout_seconds, 1.0)
         log(f"[otp:worker] polling {mailbox} (timeout {timeout_seconds:.0f}s)")
 
+        # Adaptive backoff: poll nhanh ngay khi vừa request OTP send (mail có
+        # thể về trong 5-15s), giãn dần đến ``poll_interval_seconds`` ổn định.
+        # Tiết kiệm 0-3s/signup so với fixed interval khi mail về sớm.
+        # Table: 1s → 2s → 3s → poll_interval (lặp). Cap = poll_interval.
+        _initial_backoff = (1.0, 2.0, 3.0)
+
         async with httpx.AsyncClient(verify=verify, timeout=20.0, follow_redirects=True) as client:
             attempt = 0
             consecutive_errors = 0  # fail-fast khi worker endpoint down liên tục
@@ -257,7 +263,13 @@ class WorkerMailProvider:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(f"OTP timeout after {timeout_seconds}s for {mailbox}")
-                await asyncio.sleep(min(poll_interval_seconds, remaining))
+                # Adaptive sleep: attempt 1→1s, 2→2s, 3→3s, 4+ → poll_interval.
+                sleep_s = (
+                    _initial_backoff[attempt - 1]
+                    if attempt <= len(_initial_backoff)
+                    else poll_interval_seconds
+                )
+                await asyncio.sleep(min(sleep_s, remaining))
 
     async def poll_all_codes(
         self,

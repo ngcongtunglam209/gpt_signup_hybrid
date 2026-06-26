@@ -253,18 +253,44 @@ async def run_signup(
                 )
 
         # ═══════════════════════════════════════════════════════════
+        # MODE: hybrid — chatgpt_camoufox pipeline (curl_cffi Firefox + Camoufox oracle)
+        # ═══════════════════════════════════════════════════════════
+        if request.reg_mode == "hybrid":
+            from reg_hybrid import run_hybrid_signup
+
+            log(f"[signup] mode=hybrid → curl_cffi Firefox + Camoufox sentinel oracle "
+                f"(email={request.email})")
+            result = await run_hybrid_signup(
+                request=request,
+                mail_provider=provider,
+                log=log,
+                on_checkpoint=on_checkpoint,
+            )
+            if not result.email:
+                result.email = request.email
+
+        # ═══════════════════════════════════════════════════════════
         # MODE: pure_request — full HTTP-only registration
         # ═══════════════════════════════════════════════════════════
-        if request.reg_mode == "pure_request":
+        elif request.reg_mode == "pure_request":
             log(f"[signup] mode=pure_request → HTTP-only registration (email={request.email})")
-            # Anti-ban Phase 10: sidecar Camoufox headless gen sentinel-token
-            # thật + so-token + JS cookies (oai-sc, _dd_s, oai-asli). Spawn
-            # tự động trong run_request_phase. Set REG_SIDECAR_DISABLED=1 để
-            # tắt (debug only — kéo về QuickJS path = ZERO-FINGERPRINT bot risk).
+            # Phase D recommend: pure_request có 3 path sentinel — sidecar Camoufox
+            # (full fingerprint), QuickJS Node (zero-fingerprint, deferred ban risk),
+            # Python PoW (last resort). Mode ``hybrid`` (reg_hybrid/) áp dụng pattern
+            # chatgpt_camoufox: sdk.js LIVE trong Camoufox + curl_cffi impersonate
+            # Firefox + header order verbatim. So với pure_request:
+            #   + Sentinel quality cao hơn (1 path: page-native Firefox thật)
+            #   + Header order Firefox golden (Cookie ở vị trí đúng — không bị curl shove top)
+            #   + Tests đầy đủ (chatgpt_camoufox.tests)
+            #   - KHÔNG support mfa_inline
+            # Anti-ban tốt nhất: dùng ``reg_mode="hybrid"``. Pure_request giữ làm
+            # debug fallback khi Camoufox không khả dụng.
             log(
-                "[signup] pure_request: sentinel sidecar (Camoufox headless) "
-                "sẽ spawn — đảm bảo sentinel-token + so-token real-browser. "
-                "Set REG_SIDECAR_DISABLED=1 để tắt (NGUY HIỂM, bypass anti-ban)."
+                "[signup] pure_request: consider switching to reg_mode='hybrid' "
+                "for stronger anti-ban (sdk.js trong Camoufox + Firefox impersonate). "
+                "Pure_request: sentinel sidecar (Camoufox headless) sẽ spawn — đảm bảo "
+                "sentinel-token + so-token real-browser. Set REG_SIDECAR_DISABLED=1 để "
+                "tắt (NGUY HIỂM, bypass anti-ban)."
             )
             result = await run_request_phase(
                 request=request,

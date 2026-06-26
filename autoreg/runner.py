@@ -27,7 +27,11 @@ LogCallback = Callable[[str, str, dict[str, Any]], Awaitable[None]]
 class AutoRegConfig:
     """Runtime config cho AutoRegRunner, build từ API request body."""
 
-    concurrency: int = 1
+    # Default concurrency = 3 (Phase C optimization): browser pool cho hybrid
+    # mode share Camoufox xuyên signup → 3 signup parallel chỉ tốn 1 browser
+    # process (vs 1 signup serial). Tăng throughput x3 với cùng tài nguyên.
+    # User có thể override qua API body hoặc giảm về 1 khi test/debug.
+    concurrency: int = 3
     poll_interval: int = 30
     default_password: str = ""
     logs_url: str = ""
@@ -38,6 +42,9 @@ class AutoRegConfig:
     auto_retry: bool = False
     auto_retry_max: int = 3
     auto_retry_delay: float = 30.0
+    # Reg pipeline mode (Settings ``reg_mode.current``) — default ``browser`` để
+    # backward compat. Hợp lệ: "browser" | "pure_request" | "hybrid".
+    reg_mode: str = "browser"
 
 
 @dataclass
@@ -290,6 +297,7 @@ class AutoRegRunner:
                     password=self._config.default_password or None,
                     headless=self._config.headless,
                     proxy=email_proxy,
+                    reg_mode=self._config.reg_mode,
                 )
 
                 # Run signup with job_timeout

@@ -548,7 +548,7 @@ def signup_cmd(
     birthdate: str = typer.Option("2000-01-01", "--birthdate", help="YYYY-MM-DD, tuổi >= 13."),
     reg_mode: str = typer.Option(
         "browser", "--reg-mode",
-        help="Registration mode: 'browser' (Camoufox anti-detect) hoặc 'pure_request' (HTTP-only, curl_cffi).",
+        help="Registration mode: 'browser' (Camoufox UI), 'pure_request' (HTTP-only curl_cffi), hoặc 'hybrid' (curl_cffi Firefox + Camoufox sentinel oracle).",
     ),
     source_email: str | None = typer.Option(
         None, "--smail",
@@ -620,6 +620,14 @@ def signup_cmd(
             "Override Settings Store ``reg.persona``."
         ),
     ),
+    mfa_inline: bool = typer.Option(
+        True, "--mfa/--no-mfa",
+        help=(
+            "Enroll + activate 2FA NGAY trong context vừa tạo account (CF-clean) "
+            "và xuất email|password|secret vào `runtime/sessions/accounts.txt`. "
+            "Default True. Tắt → bỏ qua 2FA, có thể chạy `enable-2fa` riêng sau."
+        ),
+    ),
     output: Path | None = typer.Option(None, "--output", "-o", help="Lưu SignupResult ra JSON file."),
     # SQLite persistence opts
     no_file_output: bool = typer.Option(
@@ -635,9 +643,9 @@ def signup_cmd(
     """Chạy 1 lần signup hybrid."""
     settings = load_settings()
 
-    if reg_mode not in ("browser", "pure_request"):
+    if reg_mode not in ("browser", "pure_request", "hybrid"):
         typer.echo(
-            f"Error: --reg-mode phải là 'browser' hoặc 'pure_request', got {reg_mode!r}.",
+            f"Error: --reg-mode phải là 'browser', 'pure_request' hoặc 'hybrid', got {reg_mode!r}.",
             err=True,
         )
         raise typer.Exit(2)
@@ -761,9 +769,11 @@ def signup_cmd(
         sentinel_cookie_timeout_seconds=sentinel_timeout,
         har_capture=har_capture,
         persona=persona,
-        # CLI signup không persist 2FA → tắt inline để giữ behavior cũ (account
-        # không bị bật 2FA mà mất secret). Dùng `enable-2fa` command riêng.
-        mfa_inline=False,
+        # MFA inline: hybrid + browser + pure_request đều enroll 2FA trong context
+        # vừa pass CF (page sống / curl session sống) → CF-clean, không bị 403.
+        # Default True. Tắt qua `--no-mfa` nếu muốn enroll riêng sau qua
+        # command `enable-2fa`.
+        mfa_inline=mfa_inline,
     )
 
     log = _emit_log()
@@ -926,10 +936,43 @@ def signup_cmd(
     summary["session_token_len"] = len(result.session_token or "")
     summary["access_token_len"] = len(result.access_token or "")
     summary["cookies_count"] = len(result.cookies or [])
+    # 2FA summary — KHÔNG leak secret/factor_id vào stdout (chỉ flag + len).
+    tf = result.two_factor or {}
+    summary["two_factor_activated"] = bool(tf.get("activated"))
+    summary["two_factor_secret_len"] = len(tf.get("secret") or "")
     if not no_file_output:
         summary["output"] = str(output)
 
     typer.echo(json.dumps(summary, indent=2, ensure_ascii=False))
+
+    # ── Append email|password|secret vào accounts.txt (combo file tổng hợp) ──
+    # Đồng nhất với `web/manager._append_account_log` (web UI dùng). Reg manual
+    # qua CLI cũng nên có 1 nguồn duy nhất để autoreg/import tools đọc lại.
+    # Chỉ append khi 2FA actually activated — `secret` rỗng coi như chưa enable.
+    if (
+        result.success
+        and result.two_factor
+        and result.two_factor.get("activated")
+        and result.two_factor.get("secret")
+        and result.password
+    ):
+        accounts_path = settings.runtime_dir / "sessions" / "accounts.txt"
+        accounts_path.parent.mkdir(parents=True, exist_ok=True)
+        line = f"{result.email}|{result.password}|{result.two_factor['secret']}\n"
+        with accounts_path.open("a", encoding="utf-8") as f:
+            f.write(line)
+        typer.echo(f"[combo] appended → {accounts_path}")
+    elif result.success and result.two_factor_partial:
+        # Enroll OK + activate fail → log để user retry activate-only.
+        typer.echo(
+            f"[combo] 2FA partial — secret persisted ở DB mfa_pending, "
+            f"chạy `enable-2fa --session-file <...>` để retry activate"
+        )
+    elif result.success and mfa_inline:
+        typer.echo(
+            "[combo] 2FA chưa active — accounts.txt skip "
+            f"(two_factor={bool(result.two_factor)} partial={bool(result.two_factor_partial)})"
+        )
 
     # ── HAR alignment post-validation (anti-ban Phase 5 Task 5.3) ──
     # Chỉ run nếu --har-validate + --har enabled + reg success.
