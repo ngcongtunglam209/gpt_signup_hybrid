@@ -51,6 +51,15 @@ _RELEASE_URL = "https://github.com/cloudflare/cloudflared/releases/latest/downlo
 
 TunnelStatus = Literal["stopped", "starting", "running", "failed"]
 
+# Env keys truyền local endpoint từ CLI → app. CLI import module này dưới tên
+# `web.cloudflare_tunnel`, còn uvicorn/app dùng `gpt_signup_hybrid.web.cloudflare_tunnel`
+# → HAI module + HAI singleton khác nhau. set_local_endpoint() ở phía CLI không
+# tới được singleton phía app, nên phải truyền qua os.environ (env kế thừa cả
+# subprocess khi --reload). Không có cái này → app giữ default 127.0.0.1:8083 →
+# cloudflared forward sai port → 502.
+_ENV_TUNNEL_HOST = "GSH_TUNNEL_LOCAL_HOST"
+_ENV_TUNNEL_PORT = "GSH_TUNNEL_LOCAL_PORT"
+
 
 class CloudflareTunnelError(Exception):
     """Tunnel lifecycle / binary download lỗi."""
@@ -236,6 +245,22 @@ class CloudflareTunnelManager:
         loopback = host in {"127.0.0.1", "localhost", "::1"}
         self._local_host = "127.0.0.1" if not loopback else host
         self._local_port = port
+        # Truyền qua env để vượt ranh giới module-identity (xem _ENV_TUNNEL_*).
+        os.environ[_ENV_TUNNEL_HOST] = self._local_host
+        os.environ[_ENV_TUNNEL_PORT] = str(self._local_port)
+
+    def _load_endpoint_from_env(self) -> None:
+        """Đồng bộ endpoint từ env (CLI set qua set_local_endpoint trên singleton
+        module khác). Gọi trước khi spawn cloudflared để forward đúng port."""
+        host = os.environ.get(_ENV_TUNNEL_HOST)
+        port = os.environ.get(_ENV_TUNNEL_PORT)
+        if host:
+            self._local_host = host
+        if port:
+            try:
+                self._local_port = int(port)
+            except ValueError:
+                _log.warning("tunnel: env %s không hợp lệ: %r", _ENV_TUNNEL_PORT, port)
 
     # ── Status getters ──────────────────────────────────────────────────
     @property
@@ -289,6 +314,9 @@ class CloudflareTunnelManager:
             self._started_at = None
             self._log_buffer.clear()
             self._stop_requested = False
+
+            # Sync endpoint từ env — CLI set ở singleton module khác (xem _ENV_TUNNEL_*).
+            self._load_endpoint_from_env()
 
             try:
                 binary = await _ensure_binary(self._log_buffer)
