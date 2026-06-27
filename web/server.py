@@ -56,6 +56,7 @@ _engine = None
 # (env kế thừa qua cả subprocess khi --reload). Biến module-level giữ làm cache.
 _ENV_LOOPBACK_BIND = "GSH_WEB_LOOPBACK_BIND"
 _ENV_HIDE_REG = "GSH_WEB_HIDE_REG"
+_ENV_DISABLE_AUTH = "GSH_WEB_DISABLE_AUTH"
 
 # Track whether server is bound to loopback (safe to embed token in HTML)
 _is_loopback_bind: bool = True
@@ -64,6 +65,11 @@ _is_loopback_bind: bool = True
 # Get Session / UPI QR / Settings). Dùng để giao máy cho người khác mà không
 # cho chạy Reg. Đây là launch flag (giống host/port), KHÔNG persist Settings Store.
 _hide_reg: bool = False
+
+# Track "disable auth" launch mode — khi True, BỎ QUA token check cho /api/*.
+# ⚠️ INSECURE: bất kỳ ai reach được server (kể cả qua tunnel public) đều xem
+# được credentials + điều khiển job. Chỉ bật khi hiểu rõ rủi ro (opt-in flag).
+_disable_auth: bool = False
 
 
 def set_loopback_bind(is_loopback: bool) -> None:
@@ -80,6 +86,13 @@ def set_hide_reg(hide_reg: bool) -> None:
     os.environ[_ENV_HIDE_REG] = "1" if hide_reg else "0"
 
 
+def set_disable_auth(disable_auth: bool) -> None:
+    """Gọi từ CLI trước khi start server để TẮT token auth (insecure, opt-in)."""
+    global _disable_auth  # noqa: PLW0603
+    _disable_auth = disable_auth
+    os.environ[_ENV_DISABLE_AUTH] = "1" if disable_auth else "0"
+
+
 def _is_loopback_bind_enabled() -> bool:
     """Env ưu tiên (vượt ranh giới module-identity), fallback biến module."""
     val = os.environ.get(_ENV_LOOPBACK_BIND)
@@ -94,6 +107,14 @@ def _hide_reg_enabled() -> bool:
     if val is not None:
         return val == "1"
     return _hide_reg
+
+
+def _disable_auth_enabled() -> bool:
+    """Env ưu tiên (vượt ranh giới module-identity), fallback biến module."""
+    val = os.environ.get(_ENV_DISABLE_AUTH)
+    if val is not None:
+        return val == "1"
+    return _disable_auth
 
 
 @app.on_event("startup")
@@ -263,7 +284,12 @@ async def auth_middleware(request: Request, call_next):
     """Gate /api/* routes bằng token. Static + index không cần token."""
     path = request.url.path
     # Skip auth cho gopay-check endpoint (extension gọi trực tiếp, không có token)
-    if path.startswith("/api") and not path.startswith("/api/gopay-check/"):
+    # và khi --no-auth được bật (opt-in insecure mode).
+    if (
+        not _disable_auth_enabled()
+        and path.startswith("/api")
+        and not path.startswith("/api/gopay-check/")
+    ):
         try:
             require_token(request)
         except HTTPException as exc:

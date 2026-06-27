@@ -465,6 +465,13 @@ def web_cmd(
              "cho người khác mà không cho chạy Reg. Lưu ý: chỉ ẩn UI — API tab "
              "Reg vẫn truy cập được nếu có token.",
     ),
+    no_auth: bool = typer.Option(
+        False,
+        "--no-auth",
+        help="TẮT token auth cho /api/* (INSECURE). Bất kỳ ai reach được server "
+             "đều xem được credentials + điều khiển job. Chỉ dùng khi bạn hiểu "
+             "rõ rủi ro (vd LAN tin cậy). KHÔNG nên bật khi public ra internet.",
+    ),
 ) -> None:
     """Start web UI server tại http://<host>:<port>/.
 
@@ -503,6 +510,10 @@ def web_cmd(
     from web.server import set_hide_reg
     set_hide_reg(hide_reg)
 
+    # Tắt token auth (insecure, opt-in). Truyền qua env trong set_disable_auth.
+    from web.server import set_disable_auth
+    set_disable_auth(no_auth)
+
     # Truyền local endpoint cho Cloudflare Tunnel manager — manager sẽ trỏ
     # tunnel về 127.0.0.1:<port> ngay cả khi uvicorn bind LAN.
     from web.cloudflare_tunnel import get_cloudflare_tunnel
@@ -515,6 +526,12 @@ def web_cmd(
     typer.echo(f"[web] starting at http://{host}:{port}/")
     if hide_reg:
         typer.echo("[web] HIDE-REG mode: ẩn tab Reg.")
+    if no_auth:
+        typer.echo(
+            "[web] ⚠️  NO-AUTH mode: token auth ĐÃ TẮT — mọi client reach được "
+            "server đều xem được credentials + điều khiển job. KHÔNG public ra "
+            "internet ở chế độ này trừ khi bạn chấp nhận rủi ro."
+        )
     if not is_loopback:
         typer.echo(
             f"[web] WARNING: bind {host!r} — UI reachable từ LAN."
