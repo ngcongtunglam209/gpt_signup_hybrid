@@ -97,7 +97,7 @@ def test_module_exports() -> tuple[bool, str]:
         DEFAULT_DELAY_MIN_MS,
         DEFAULT_DELAY_MAX_MS,
     )
-    if DEFAULT_DELAY_MIN_MS == 120 and DEFAULT_DELAY_MAX_MS == 260:
+    if DEFAULT_DELAY_MIN_MS == 45 and DEFAULT_DELAY_MAX_MS == 110:
         return True, "exports + defaults OK"
     return False, f"defaults wrong: {DEFAULT_DELAY_MIN_MS}/{DEFAULT_DELAY_MAX_MS}"
 

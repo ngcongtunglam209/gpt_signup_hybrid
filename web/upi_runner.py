@@ -1742,19 +1742,21 @@ async def run_upi_qr_probe(
     _safe_log(_fmt_step("1/6", "login", "start", "pure-HTTP request_phase"))
     session_data: dict[str, Any] | None = None
     last_login_error: str | None = None
-    # Khi from_step=1 → step 1 (login) cũng phải route qua proxy IN, đồng bộ
-    # với `pay_upi_http._ProxyPolicy` semantics. Step >= 2 → DIRECT (giữ
-    # behavior cũ — login pure-HTTP đến auth.openai.com thường chấp nhận IP
-    # host).
-    login_proxy = first_proxy if (proxy_from_step <= 1 and first_proxy) else None
+    # ── Login LUÔN DIRECT (bám golden Get Session) ────────────────────
+    # Get Session (golden, session_phase.get_session_pure_request) login
+    # pure-HTTP với proxy=None BẤT KỂ cấu hình → tránh Cloudflare captcha/403
+    # từ IP datacenter (proxy IN). UPI bám theo: bước login (Step 1) luôn
+    # direct; proxy IN chỉ áp từ bước payment (Stripe) trở đi theo
+    # ``proxy_from_step`` trong pay_upi_http. Session-token KHÔNG bind IP nên
+    # login direct rồi approve qua proxy IN vẫn hợp lệ.
+    login_proxy = None
     for login_attempt in range(1, LOGIN_MAX_ATTEMPTS + 1):
         try:
             if login_fn is not None:
                 # Cache-aware login (UPI only): reuse cookie cache (revalidate
                 # /api/auth/session) → bỏ qua login. force_fresh=True (cycle
                 # re-login đổi IP) → manager wrapper bỏ reuse, login mới.
-                # proxy=login_proxy: tôn trọng proxy_from_step (login direct
-                # khi proxy_from_step > 1).
+                # proxy=None: login direct như golden (revalidate cũng direct).
                 session_data = await login_fn(force_fresh=force_fresh, proxy=login_proxy)
             else:
                 session_data = await get_session_pure_request(

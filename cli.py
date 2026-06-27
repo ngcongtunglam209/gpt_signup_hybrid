@@ -458,6 +458,13 @@ def web_cmd(
         help="Cho phép bind non-loopback host (LAN/0.0.0.0). Yêu cầu vì web UI "
              "trả secret-bearing job state — phải ý thức rủi ro.",
     ),
+    only_upi: bool = typer.Option(
+        False,
+        "--only-upi",
+        help="Chỉ hiển thị tab UPI QR (ẩn Reg/Get Session/Settings). Dùng khi "
+             "giao máy cho người khác chỉ chạy UPI. Lưu ý: chỉ ẩn UI — API các "
+             "tab khác vẫn truy cập được nếu có token.",
+    ),
 ) -> None:
     """Start web UI server tại http://<host>:<port>/.
 
@@ -492,6 +499,10 @@ def web_cmd(
     from web.server import set_loopback_bind
     set_loopback_bind(is_loopback)
 
+    # Bật chế độ chỉ-hiển-thị-UPI (launch flag, không persist vào Settings Store)
+    from web.server import set_only_upi
+    set_only_upi(only_upi)
+
     # Truyền local endpoint cho Cloudflare Tunnel manager — manager sẽ trỏ
     # tunnel về 127.0.0.1:<port> ngay cả khi uvicorn bind LAN.
     from web.cloudflare_tunnel import get_cloudflare_tunnel
@@ -502,6 +513,8 @@ def web_cmd(
     _token = _get_web_token()
 
     typer.echo(f"[web] starting at http://{host}:{port}/")
+    if only_upi:
+        typer.echo("[web] ONLY-UPI mode: chỉ hiển thị tab UPI QR.")
     if not is_loopback:
         typer.echo(
             f"[web] WARNING: bind {host!r} — UI reachable từ LAN."
@@ -548,7 +561,7 @@ def signup_cmd(
     birthdate: str = typer.Option("2000-01-01", "--birthdate", help="YYYY-MM-DD, tuổi >= 13."),
     reg_mode: str = typer.Option(
         "browser", "--reg-mode",
-        help="Registration mode: 'browser' (Camoufox UI), 'pure_request' (HTTP-only curl_cffi), hoặc 'hybrid' (curl_cffi Firefox + Camoufox sentinel oracle).",
+        help="Registration mode: 'browser' (Camoufox UI) hoặc 'hybrid' (curl_cffi Firefox + Camoufox sentinel oracle).",
     ),
     source_email: str | None = typer.Option(
         None, "--smail",
@@ -655,9 +668,9 @@ def signup_cmd(
     """Chạy 1 lần signup hybrid."""
     settings = load_settings()
 
-    if reg_mode not in ("browser", "pure_request", "hybrid"):
+    if reg_mode not in ("browser", "hybrid"):
         typer.echo(
-            f"Error: --reg-mode phải là 'browser', 'pure_request' hoặc 'hybrid', got {reg_mode!r}.",
+            f"Error: --reg-mode phải là 'browser' hoặc 'hybrid', got {reg_mode!r}.",
             err=True,
         )
         raise typer.Exit(2)
@@ -819,7 +832,7 @@ def signup_cmd(
         sentinel_cookie_timeout_seconds=sentinel_timeout,
         har_capture=har_capture,
         persona=persona,
-        # MFA inline: hybrid + browser + pure_request đều enroll 2FA trong context
+        # MFA inline: hybrid + browser đều enroll 2FA trong context
         # vừa pass CF (page sống / curl session sống) → CF-clean, không bị 403.
         # Default True. Tắt qua `--no-mfa` nếu muốn enroll riêng sau qua
         # command `enable-2fa`.

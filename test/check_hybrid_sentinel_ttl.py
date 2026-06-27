@@ -4,7 +4,8 @@ Test cases:
     [1/4] cache fresh (< TTL) → mint_token HIT, không gọi original.
     [2/4] cache stale (> TTL) → invalidated + remint qua original.
     [3/4] mint_so cũng tuân thủ TTL.
-    [4/4] _create_account_with_retry log body + retry với fresh sentinel.
+    [4/4] run() gọi create_account golden ĐÚNG 1 lần — KHÔNG helper retry double-POST
+          (Task 4.1 xóa _create_account_with_retry; acceptance criteria 2.2).
 
 Chạy:
     .venv/bin/python test/check_hybrid_sentinel_ttl.py
@@ -121,42 +122,56 @@ def tc3_mint_so_ttl() -> bool:
     return _check("[3/4] mint_so cũng tuân thủ TTL", _run)
 
 
-def tc4_create_account_retry_shape() -> bool:
-    """Verify HybridChatGPTRelay._create_account_with_retry shape qua AST scan."""
+def tc4_create_account_single_post_shape() -> bool:
+    """Verify run() gọi create_account golden ĐÚNG 1 lần — KHÔNG helper retry double-POST.
+
+    UPDATED (Task 4.1): spec reg-hybrid-deactivated-after-signup xác định
+    ``_create_account_with_retry`` là dead-path drift (double-POST
+    ``/api/accounts/create_account`` trên cùng OAuth session — pattern golden
+    không bao giờ phát, tín hiệu deferred ban). Helper đã bị xóa hẳn; ``run()``
+    giờ gọi method golden kế thừa ``self.create_account()`` đúng 1 lần/session.
+
+    Acceptance criteria 2.2: createAccountPostCount(result) = 1 như golden.
+    Test cũ (assert helper TỒN TẠI) đã lỗi thời và được thay bằng assert
+    hành vi mới đúng — KHÔNG nới lỏng, phản ánh đúng spec.
+    """
     import ast
 
     def _run() -> None:
         src = (ROOT / "reg_hybrid" / "relay.py").read_text(encoding="utf-8")
-        assert "_create_account_with_retry" in src, (
-            "HybridChatGPTRelay thiếu _create_account_with_retry"
+        # 1. Helper retry double-POST phải bị xóa HẲN (dead-path).
+        assert "_create_account_with_retry" not in src, (
+            "_create_account_with_retry phải bị xóa (dead-path double-POST) "
+            "— vẫn còn trong relay.py"
         )
-        assert "self._create_account_with_retry()" in src, (
-            "run() phải gọi _create_account_with_retry, không phải create_account trực tiếp"
-        )
-        # Đảm bảo log response body khi retry.
-        assert "create_account retry HTTP" in src, (
-            "Retry path thiếu log response body — không debug được"
-        )
-        assert "create_account fail sau retry" in src, (
-            "Sau retry vẫn fail phải raise RuntimeError có body"
-        )
-        # Check rằng run() KHÔNG còn gọi self.create_account() trực tiếp.
+        # 2. run() phải gọi self.create_account() golden ĐÚNG 1 lần.
         tree = ast.parse(src)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef) and node.name == "run":
-                # Tìm trong body có Call(create_account) NHƯNG KHÔNG _with_retry
-                for sub in ast.walk(node):
-                    if (
-                        isinstance(sub, ast.Call)
-                        and isinstance(sub.func, ast.Attribute)
-                        and sub.func.attr == "create_account"
-                    ):
-                        raise AssertionError(
-                            "run() vẫn gọi create_account() trực tiếp — "
-                            "phải dùng _create_account_with_retry"
-                        )
+        run_node = next(
+            (
+                n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == "run"
+            ),
+            None,
+        )
+        assert run_node is not None, "relay.py thiếu method run()"
+        create_calls = [
+            sub for sub in ast.walk(run_node)
+            if isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Attribute)
+            and sub.func.attr == "create_account"
+        ]
+        assert len(create_calls) == 1, (
+            f"run() phải gọi self.create_account() ĐÚNG 1 lần (golden), "
+            f"got {len(create_calls)} call(s)"
+        )
+        # 3. Call phải qua self → method golden kế thừa, không re-POST.
+        call = create_calls[0]
+        assert (
+            isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "self"
+        ), "create_account phải gọi qua self.create_account() (golden kế thừa)"
 
-    return _check("[4/4] _create_account_with_retry override trong run()", _run)
+    return _check("[4/4] run() gọi create_account golden đúng 1 lần (no double-POST)", _run)
 
 
 def main() -> int:
@@ -164,7 +179,7 @@ def main() -> int:
         tc1_cache_fresh_hit(),
         tc2_cache_stale_remint(),
         tc3_mint_so_ttl(),
-        tc4_create_account_retry_shape(),
+        tc4_create_account_single_post_shape(),
     ]
     passed = sum(results)
     total = len(results)

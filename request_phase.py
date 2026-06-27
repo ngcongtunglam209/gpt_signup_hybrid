@@ -457,6 +457,24 @@ def _prime_chatgpt_session(session, log: Callable) -> None:
     except Exception as exc:  # noqa: BLE001 — best-effort
         log(f"[request] _dd_s inject failed (continue): {exc}")
 
+    # ── Truy cập ban đầu: promo landing (gắn campaign plus-1-month-free) ──
+    # Mọi mode reg vào link promo TRƯỚC (khớp user thật click từ ad promo).
+    # GET top-level no-referer (Sec-Fetch-Site=none) — cũng warm __cf_bm như
+    # /auth/login. Best-effort: lỗi KHÔNG chặn flow (/auth/login vẫn prime CF).
+    from config import PROMO_LANDING_URL
+    promo_headers = _navigate_headers("https://chatgpt.com/")
+    promo_headers.pop("Referer", None)  # đến từ ngoài → không có referer
+    promo_headers["Sec-Fetch-Site"] = "none"
+    promo_headers["Connection"] = "keep-alive"
+    try:
+        session.get(
+            PROMO_LANDING_URL, headers=promo_headers, timeout=30,
+            allow_redirects=True,
+        )
+        log("[request] [0/9] promo landing visited (plus-1-month-free)")
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        log(f"[request] promo landing visit failed (continue): {exc}")
+
     # Headers persona-aware (Task 7.5) — page navigate kèm Connection.
     headers = _navigate_headers("https://chatgpt.com/")
     headers["Connection"] = "keep-alive"

@@ -4,8 +4,8 @@ Test cases:
     [1/5] HybridBrowserPool.warm_up + _get_or_create_runner tồn tại, idempotent.
     [2/5] warm_up gọi runner._ensure_browser_in_thread qua dedicated thread.
     [3/5] WorkerMailProvider OTP adaptive backoff: 1s/2s/3s rồi poll_interval.
-    [4/5] runner._fire_and_forget_cleanup spawn task, không block caller.
-    [5/5] wait_pending_cleanups đợi xong tất cả task.
+    [4/5] runner._await_cleanup_bounded đồng bộ-có-timeout, chạy off main thread.
+    [5/5] wait_pending_cleanups đợi xong task đã đăng ký (no-op khi rỗng).
 
 Chạy:
     .venv/bin/python test/check_hybrid_opt_quickwins.py
@@ -146,91 +146,83 @@ def tc3_otp_adaptive_backoff() -> bool:
     return _check("[3/5] OTP adaptive backoff 1s→2s→3s→poll_interval", _go)
 
 
-def tc4_fire_and_forget_cleanup() -> bool:
-    """_fire_and_forget_cleanup spawn task, không block caller."""
-    from reg_hybrid.runner import (
-        _BACKGROUND_CLEANUP_TASKS,
-        _fire_and_forget_cleanup,
-    )
+def tc4_await_cleanup_bounded() -> bool:
+    """_await_cleanup_bounded ĐỒNG BỘ-có-timeout: caller chỉ tiếp tục SAU khi
+    cleanup xong (fix orphan accumulation), cleanup chạy off main thread."""
+    from reg_hybrid.runner import _await_cleanup_bounded
 
-    captured = {"called_tid": None, "main_tid": None}
+    captured = {"called_tid": None, "main_tid": None, "done": False}
 
     def _stub_cleanup(session, tokens, log) -> None:
         captured["called_tid"] = threading.get_ident()
-        time.sleep(0.05)  # mô phỏng I/O blocking
+        time.sleep(0.05)  # mô phỏng I/O blocking (close browser/curl)
+        captured["done"] = True
 
     async def _run() -> None:
         captured["main_tid"] = threading.get_ident()
         with patch("reg_hybrid.runner._cleanup", _stub_cleanup):
             t0 = time.monotonic()
-            _fire_and_forget_cleanup(
-                session=object(), tokens=object(),
-                log=lambda _m: None, name="test-cleanup",
+            await _await_cleanup_bounded(
+                object(), object(), lambda _m: None, timeout=5.0,
             )
             elapsed = time.monotonic() - t0
-            # Phải return ngay (< 50ms cleanup), không block.
-            assert elapsed < 0.020, (
-                f"_fire_and_forget_cleanup BLOCK caller {elapsed*1000:.1f}ms — "
-                f"phải return ngay (task chạy nền)"
+            # ĐỒNG BỘ: caller phải đợi cleanup xong (>= ~50ms) → ngược với
+            # fire-and-forget cũ. Đây là cốt lõi fix multi-signup launch-hang.
+            assert elapsed >= 0.04, (
+                f"_await_cleanup_bounded KHÔNG đồng bộ (return sau "
+                f"{elapsed*1000:.1f}ms) — phải đợi cleanup xong"
             )
-            # Task đã add vào set tracking.
-            assert len(_BACKGROUND_CLEANUP_TASKS) >= 1, (
-                f"Task chưa add vào _BACKGROUND_CLEANUP_TASKS: "
-                f"{len(_BACKGROUND_CLEANUP_TASKS)}"
-            )
-            # Đợi cleanup xong.
-            await asyncio.sleep(0.15)
+            assert captured["done"], "cleanup chưa chạy xong khi caller tiếp tục"
             assert captured["called_tid"] is not None, "cleanup chưa được gọi"
             assert captured["called_tid"] != captured["main_tid"], (
-                "cleanup chạy ở main thread thay vì worker thread"
+                "cleanup phải chạy off main thread (asyncio.to_thread)"
             )
 
     def _go() -> None:
         asyncio.run(_run())
 
-    return _check("[4/5] _fire_and_forget_cleanup non-blocking + chạy off main", _go)
+    return _check("[4/5] _await_cleanup_bounded đồng bộ + chạy off main thread", _go)
 
 
 def tc5_wait_pending_cleanups() -> bool:
-    """wait_pending_cleanups đợi tất cả background task xong."""
+    """wait_pending_cleanups: no-op khi rỗng + đợi xong task đã đăng ký."""
     from reg_hybrid.runner import (
         _BACKGROUND_CLEANUP_TASKS,
-        _fire_and_forget_cleanup,
         wait_pending_cleanups,
     )
 
     counter = {"n": 0}
 
-    def _slow_cleanup(session, tokens, log) -> None:
-        time.sleep(0.05)
+    async def _slow_task() -> None:
+        await asyncio.sleep(0.05)
         counter["n"] += 1
 
     async def _run() -> None:
-        with patch("reg_hybrid.runner._cleanup", _slow_cleanup):
-            # Spawn 3 task song song.
-            for i in range(3):
-                _fire_and_forget_cleanup(
-                    session=object(), tokens=object(),
-                    log=lambda _m: None, name=f"test-{i}",
-                )
-            assert len(_BACKGROUND_CLEANUP_TASKS) == 3, (
-                f"Số task không đúng: {len(_BACKGROUND_CLEANUP_TASKS)}"
-            )
-            t0 = time.monotonic()
-            await wait_pending_cleanups(timeout=2.0)
-            elapsed = time.monotonic() - t0
-            assert counter["n"] == 3, (
-                f"Chỉ {counter['n']}/3 cleanup chạy xong sau wait"
-            )
-            assert elapsed >= 0.04, (
-                f"wait_pending_cleanups return quá nhanh ({elapsed:.3f}s) — "
-                f"có vẻ không thực sự đợi"
-            )
+        # 1. Rỗng → return ngay (không treo).
+        t0 = time.monotonic()
+        await wait_pending_cleanups(timeout=1.0)
+        assert time.monotonic() - t0 < 0.2, "wait_pending_cleanups treo khi rỗng"
+
+        # 2. Có task đăng ký → đợi xong.
+        for _ in range(3):
+            task = asyncio.create_task(_slow_task())
+            _BACKGROUND_CLEANUP_TASKS.add(task)
+            task.add_done_callback(_BACKGROUND_CLEANUP_TASKS.discard)
+        assert len(_BACKGROUND_CLEANUP_TASKS) == 3, (
+            f"Số task không đúng: {len(_BACKGROUND_CLEANUP_TASKS)}"
+        )
+        t1 = time.monotonic()
+        await wait_pending_cleanups(timeout=2.0)
+        elapsed = time.monotonic() - t1
+        assert counter["n"] == 3, f"Chỉ {counter['n']}/3 task xong sau wait"
+        assert elapsed >= 0.04, (
+            f"wait_pending_cleanups return quá nhanh ({elapsed:.3f}s)"
+        )
 
     def _go() -> None:
         asyncio.run(_run())
 
-    return _check("[5/5] wait_pending_cleanups đợi xong tất cả task", _go)
+    return _check("[5/5] wait_pending_cleanups no-op khi rỗng + đợi task đăng ký", _go)
 
 
 def main() -> int:
@@ -238,7 +230,7 @@ def main() -> int:
         tc1_pool_warm_up_methods(),
         tc2_warm_up_calls_ensure_browser(),
         tc3_otp_adaptive_backoff(),
-        tc4_fire_and_forget_cleanup(),
+        tc4_await_cleanup_bounded(),
         tc5_wait_pending_cleanups(),
     ]
     passed = sum(results)

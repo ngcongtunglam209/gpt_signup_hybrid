@@ -22,9 +22,9 @@ Caller pattern:
     ```python
     from _human_input import human_type, human_click, dwell
 
-    await dwell(0.8, 1.5)  # đọc trang
+    await dwell(0.4, 0.8)  # đọc trang (tối đa 1s)
     await human_type(page.locator('input[name="password"]'), pw,
-                     delay_min_ms=120, delay_max_ms=260)
+                     delay_min_ms=45, delay_max_ms=110)
     await dwell(0.3, 0.8)  # tab/move
     await human_click(page, 'button[type="submit"]')
     ```
@@ -43,11 +43,13 @@ logger = logging.getLogger(__name__)
 # Defaults — đồng bộ với Settings Store ``reg.human_typing_delay_ms_min/max``
 # ─────────────────────────────────────────────────────────────────────
 
-DEFAULT_DELAY_MIN_MS = 120
-DEFAULT_DELAY_MAX_MS = 260
-DEFAULT_PAUSE_PROBABILITY = 0.08  # 8% ký tự sẽ pause 0.2-0.5s sau khi gõ
-DEFAULT_PAUSE_MIN_S = 0.2
-DEFAULT_PAUSE_MAX_S = 0.5
+# Giảm fake human action (yêu cầu user): gõ nhanh hơn, ít pause hơn — vẫn giữ
+# jitter Gaussian để sentinel SDK thấy biến thiên (không phải delay cố định).
+DEFAULT_DELAY_MIN_MS = 45
+DEFAULT_DELAY_MAX_MS = 110
+DEFAULT_PAUSE_PROBABILITY = 0.03  # 3% ký tự sẽ pause ngắn sau khi gõ
+DEFAULT_PAUSE_MIN_S = 0.1
+DEFAULT_PAUSE_MAX_S = 0.3
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -75,14 +77,18 @@ def _sample_delay_ms(min_ms: int, max_ms: int) -> int:
 # ─────────────────────────────────────────────────────────────────────
 
 
-async def dwell(min_s: float = 0.5, max_s: float = 1.5) -> None:
-    """Async sleep với jitter uniform [min_s, max_s].
+async def dwell(min_s: float = 0.2, max_s: float = 0.6) -> None:
+    """Async sleep với jitter uniform [min_s, max_s], HARD CAP 1.0s.
 
     Dùng giữa các state transition để page settle + sentinel SDK observe
     'idle reading time'. Tránh bot pattern click-click liên tục.
+
+    Hard cap 1s (yêu cầu user): mọi dwell không bao giờ kéo dài quá 1 giây —
+    dù caller truyền max_s lớn hơn — để không làm chậm flow đăng ký.
     """
-    delay = random.uniform(max(0.0, min_s), max(min_s, max_s))
-    await asyncio.sleep(delay)
+    lo = max(0.0, min(min_s, 1.0))
+    hi = max(lo, min(max_s, 1.0))
+    await asyncio.sleep(random.uniform(lo, hi))
 
 
 async def human_type(
@@ -133,13 +139,33 @@ async def human_type(
         except Exception as exc:  # noqa: BLE001
             _log(f"[human_type] fill('') before type failed (continue): {exc}")
 
-    # Small pre-type pause — người thật click rồi suy nghĩ ~100ms
-    await asyncio.sleep(random.uniform(0.05, 0.20))
+    # Small pre-type pause — người thật click rồi suy nghĩ (giảm cho nhanh)
+    await asyncio.sleep(random.uniform(0.02, 0.08))
+
+    # PERF: gõ qua ``page.keyboard`` (focus 1 lần) thay vì ``locator.type(ch)``
+    # mỗi ký tự. ``locator.type`` chạy actionability/stability check cho element
+    # MỖI lần gọi — trên trang nặng (sentinel SDK + Turnstile mutate DOM liên
+    # tục) mỗi check có thể chờ vài giây → gõ 12 ký tự mất 20-30s. Keyboard-level
+    # type chỉ check 1 lần (lúc focus) rồi bắn keydown/keyup trực tiếp vào element
+    # đang focus → nhanh, vẫn đủ event cho sentinel observer.
+    #
+    # ``locator.page`` là property của Playwright Locator (bản mới). Nếu không có
+    # (locator giả trong test / Playwright cũ) → fallback ``locator.type`` giữ
+    # nguyên hành vi cũ (không regression).
+    page = getattr(locator, "page", None)
+    if page is not None:
+        try:
+            await locator.focus(timeout=3000)
+        except Exception as exc:  # noqa: BLE001
+            _log(f"[human_type] focus before keyboard type failed (continue): {exc}")
 
     for idx, ch in enumerate(text):
         delay_ms = _sample_delay_ms(delay_min_ms, delay_max_ms)
         try:
-            await locator.type(ch, delay=delay_ms)
+            if page is not None:
+                await page.keyboard.type(ch, delay=delay_ms)
+            else:
+                await locator.type(ch, delay=delay_ms)
         except Exception as exc:  # noqa: BLE001
             _log(f"[human_type] type idx={idx} char={ch!r} failed: {exc}")
             raise
@@ -147,35 +173,29 @@ async def human_type(
         if random.random() < pause_probability:
             await asyncio.sleep(random.uniform(pause_min_s, pause_max_s))
 
-    # Post-type settle
-    await asyncio.sleep(random.uniform(0.1, 0.3))
+    # Post-type settle (giảm cho nhanh)
+    await asyncio.sleep(random.uniform(0.03, 0.10))
 
 
 async def human_click(
     page: Any,
     target: Any,
     *,
-    move_steps_min: int = 10,
-    move_steps_max: int = 22,
-    pre_click_jitter_s: float = 0.15,
     timeout_ms: int = 3000,
     log: Optional[Callable[[str], None]] = None,
 ) -> None:
-    """Click ``target`` mô phỏng cursor di chuyển tới rồi click.
+    """Click ``target`` — để Camoufox humanize tự animate cursor tới element.
 
-    Strategy:
-        1. Lấy bounding box của target.
-        2. Pick điểm random trong box (không center cứng — center → bot signature).
-        3. ``page.mouse.move(x, y, steps=random)`` để generate mousemove events.
-        4. Pause ngắn ``pre_click_jitter_s`` (con người không click ngay khi cursor đến).
-        5. Click với delay nhỏ (Playwright sẽ tự gen mousedown/up).
+    TRƯỚC đây hàm này tự ``page.mouse.move(steps=N)`` rồi mới click → THÀNH 2
+    lần di chuột (move thủ công + move tự động của click), mỗi lần Camoufox
+    humanize animate tới ~1.5s → "di chuột rất lâu". Bỏ explicit move: chỉ gọi
+    ``locator.click`` — Camoufox humanize (đã cap ~0.4s ở launch) tự sinh
+    mousemove path realistic cho sentinel observer. Nhanh hơn nhiều.
 
     Args:
-        page: Playwright Page instance.
+        page: Playwright Page (giữ để tương thích chữ ký caller).
         target: selector string HOẶC Locator object.
-        move_steps_min / move_steps_max: số bước mousemove (sentinel xem path).
-        pre_click_jitter_s: pause trước khi click (jitter ±50%).
-        timeout_ms: timeout cho bounding_box + click.
+        timeout_ms: timeout cho click.
     """
     _log = log or (lambda m: logger.debug(m))
 
@@ -184,37 +204,17 @@ async def human_click(
     else:
         locator = target  # đã là locator
 
-    # 1. Bounding box
-    box = None
-    try:
-        box = await locator.bounding_box(timeout=timeout_ms)
-    except Exception as exc:  # noqa: BLE001
-        _log(f"[human_click] bounding_box failed: {exc}")
-
-    if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
-        # 2. Pick random point trong box (margin 30-70% để tránh edge)
-        x = box["x"] + box["width"] * random.uniform(0.3, 0.7)
-        y = box["y"] + box["height"] * random.uniform(0.3, 0.7)
-        # 3. Move with random steps
-        steps = random.randint(move_steps_min, move_steps_max)
-        try:
-            await page.mouse.move(x, y, steps=steps)
-        except Exception as exc:  # noqa: BLE001
-            _log(f"[human_click] mouse.move failed (fallback to direct click): {exc}")
-        # 4. Pre-click jitter (±50% deviation)
-        jitter = pre_click_jitter_s * random.uniform(0.5, 1.5)
-        await asyncio.sleep(jitter)
-
-    # 5. Click — Playwright tự gen mousedown/mouseup với short delay.
-    await locator.click(timeout=timeout_ms, delay=random.randint(40, 120))
+    # Click trực tiếp — Camoufox humanize tự lo cursor movement. delay nhỏ cho
+    # mousedown→mouseup giống người (không phải 0ms như bot).
+    await locator.click(timeout=timeout_ms, delay=random.randint(10, 35))
 
 
 async def random_mouse_wander(
     page: Any,
     *,
-    count: int = 3,
+    count: int = 2,
     settle_min_s: float = 0.1,
-    settle_max_s: float = 0.6,
+    settle_max_s: float = 0.4,
     log: Optional[Callable[[str], None]] = None,
 ) -> None:
     """Di chuột ``count`` lần tới điểm random trong viewport.

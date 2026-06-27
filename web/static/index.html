@@ -7,7 +7,7 @@
 <meta name="auth-token" content="__AUTH_TOKEN__" />
 <link rel="stylesheet" href="/static/style.css?v=__ASSET_VERSION__" />
 </head>
-<body>
+<body data-only-upi="__ONLY_UPI__">
 <header class="topbar">
   <div class="brand">
     <span class="brand-dot"></span>
@@ -70,7 +70,6 @@
         <span class="input-label">Reg Mode</span>
         <select id="reg-mode-select">
           <option value="browser">Browser (anti-detect)</option>
-          <option value="pure_request">Pure Request (HTTP only)</option>
           <option value="hybrid">Hybrid (Firefox HTTP + Camoufox sentinel)</option>
         </select>
       </label>
@@ -618,7 +617,7 @@
       </header>
 
       <div class="settings-section-body">
-        <label class="input-group" id="login-flow-field" title="Flow login pure-HTTP (TOÀN CỤC — áp cho UPI + Get Session + Reg pure_request + CLI). anti409 = warm + pre-set oai-did + auth_session_logging_id + sentinel password_verify, chống HTTP 409 invalid_state (tốt cho batch password combo). legacy = authorize/continue fallback (dò được passwordless/OTP khi landing không rõ).">
+        <label class="input-group" id="login-flow-field" title="Flow login pure-HTTP (TOÀN CỤC — áp cho UPI + Get Session + Link login + CLI). anti409 = warm + pre-set oai-did + auth_session_logging_id + sentinel password_verify, chống HTTP 409 invalid_state (tốt cho batch password combo). legacy = authorize/continue fallback (dò được passwordless/OTP khi landing không rõ).">
           <span class="input-label">Login flow (toàn cục)</span>
           <select id="login-flow-select" class="hme-select-sm">
             <option value="anti409">anti409 — chống HTTP 409 (mặc định)</option>

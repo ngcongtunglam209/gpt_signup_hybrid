@@ -50,11 +50,23 @@ _engine = None
 # Track whether server is bound to loopback (safe to embed token in HTML)
 _is_loopback_bind: bool = True
 
+# Track "only UPI" launch mode — khi True, frontend chỉ hiển thị tab UPI QR
+# (ẩn Reg/Get Session/Settings). Dùng để giao máy cho người khác chạy UPI mà
+# không lộ các tab khác. Đây là launch flag (giống host/port), KHÔNG persist
+# vào Settings Store.
+_only_upi: bool = False
+
 
 def set_loopback_bind(is_loopback: bool) -> None:
     """Gọi từ CLI trước khi start server để set bind mode."""
     global _is_loopback_bind  # noqa: PLW0603
     _is_loopback_bind = is_loopback
+
+
+def set_only_upi(only_upi: bool) -> None:
+    """Gọi từ CLI trước khi start server để bật chế độ chỉ-hiển-thị-UPI."""
+    global _only_upi  # noqa: PLW0603
+    _only_upi = only_upi
 
 
 @app.on_event("startup")
@@ -256,8 +268,8 @@ class AddJobsRequest(BaseModel):
         ),
     )
     reg_mode: str = Field(
-        default="pure_request",
-        description="Registration mode: 'pure_request' (default, HTTP only), 'browser' (anti-detect) hoặc 'hybrid' (curl_cffi Firefox + Camoufox sentinel).",
+        default="browser",
+        description="Registration mode: 'browser' (anti-detect, default) hoặc 'hybrid' (curl_cffi Firefox + Camoufox sentinel, recommended).",
     )
     email_logs_url: str | None = Field(
         default=None,
@@ -778,9 +790,15 @@ async def test_all_proxy(payload: TestAllProxyRequest) -> JSONResponse:
 # ─────────────────────────────────────────────────────────────────────
 
 
-@app.get("/api/sse")
+@app.api_route("/api/sse", methods=["GET", "POST"])
 async def unified_sse(request: Request) -> StreamingResponse:
-    """Single unified SSE endpoint for all channels."""
+    """Single unified SSE endpoint for all channels.
+
+    Hỗ trợ cả GET (EventSource) lẫn POST. POST bắt buộc khi chạy sau Cloudflare
+    Quick Tunnel: cloudflared buffer SSE qua GET và chỉ flush khi server đóng
+    connection (cloudflare/cloudflared#1449); POST thì stream real-time. FE
+    dùng fetch(POST)+ReadableStream, gửi token qua header X-API-Token.
+    """
     sub_id, queue = _sse_mux.subscribe()
 
     async def gen():
@@ -810,7 +828,9 @@ async def unified_sse(request: Request) -> StreamingResponse:
         gen(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            # no-transform chặn Cloudflare nén/transform response — compression
+            # layer ở edge là nguyên nhân gom buffer SSE (cloudflared#1496).
+            "Cache-Control": "no-cache, no-transform",
             "X-Accel-Buffering": "no",
             "Connection": "keep-alive",
         },
@@ -1628,6 +1648,7 @@ async def index() -> HTMLResponse:
         html_path.read_text(encoding="utf-8")
         .replace("__ASSET_VERSION__", _asset_version())
         .replace("__AUTH_TOKEN__", embedded_token)
+        .replace("__ONLY_UPI__", "1" if _only_upi else "0")
     )
     return HTMLResponse(html)
 

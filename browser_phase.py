@@ -21,8 +21,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import shutil
+import signal
+import subprocess
 import time
 import uuid
 from datetime import datetime, timezone
@@ -30,7 +33,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from config import Settings, ensure_runtime_dirs, prepare_profile_dir
+from config import PROMO_LANDING_URL, Settings, ensure_runtime_dirs, prepare_profile_dir
 from mail_providers import MailProvider, OutlookComboError
 from models import BrowserHandoff, SignupRequest
 from _nextauth_bootstrap import bootstrap_authorize_url
@@ -102,6 +105,73 @@ _REQUIRED_AUTH_COOKIES = (
 # ─────────────────────────────────────────────────────────────────────
 
 
+def _browser_descendant_pids(root_pid: int) -> set[int]:
+    """PID con cháu của ``root_pid`` mà command là browser (camoufox / firefox /
+    playwright node driver).
+
+    Dùng để force-kill chống leak khi ``cf.__aexit__`` không reap hết tiến trình
+    con (firefox/persistent-context đôi khi sống sót sau close). Best-effort qua
+    ``ps`` (macOS/Linux); trả set rỗng nếu lỗi. Lọc theo command để KHÔNG bao giờ
+    kill nhầm tiến trình con không phải browser.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,command="],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except Exception:  # noqa: BLE001 — best-effort
+        return set()
+    children: dict[int, list[int]] = {}
+    cmd_of: dict[int, str] = {}
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append(pid)
+        cmd_of[pid] = parts[2] if len(parts) > 2 else ""
+    # BFS xuống toàn bộ cây con của root_pid.
+    seen: set[int] = set()
+    stack = [root_pid]
+    while stack:
+        cur = stack.pop()
+        for ch in children.get(cur, []):
+            if ch not in seen:
+                seen.add(ch)
+                stack.append(ch)
+    markers = ("camoufox", "/firefox", "playwright", "geckodriver")
+    return {
+        pid for pid in seen
+        if any(m in cmd_of.get(pid, "").lower() for m in markers)
+    }
+
+
+def _pid_alive(pid: int) -> bool:
+    """True nếu tiến trình ``pid`` còn sống (signal 0 = chỉ kiểm tra)."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _force_kill_pids(pids, *, log) -> None:
+    """SIGKILL từng PID (best-effort). Log số lượng đã kill."""
+    killed = 0
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed += 1
+        except OSError:
+            pass
+    if killed:
+        log(f"[browser] anti-leak: force-killed {killed} tiến trình browser còn sót")
+
+
 def _browser_health(ctx, page) -> str:
     """Non-blocking snapshot trạng thái browser/context/page để log debug.
 
@@ -141,6 +211,36 @@ def _safe_is_closed(p) -> bool:
         return bool(p.is_closed())
     except Exception:
         return True
+
+
+async def _dump_debug_artifacts(page, out_dir, job_id, *, reason: str, log) -> None:
+    """Dump full HTML + screenshot + URL của page hiện tại để debug khi lỗi/stuck.
+
+    Dùng kèm HAR + Playwright trace (bật qua --har) để có đủ context tối ưu khi
+    flow lỗi hoặc treo. Best-effort — không raise.
+    """
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    base = out_dir / f"debug-{ts}-{job_id}-{reason}"
+    try:
+        url = page.url
+        log(f"[browser] debug dump (reason={reason}) URL={url}")
+    except Exception:
+        pass
+    try:
+        html = await page.content()
+        base.with_suffix(".html").write_text(html, encoding="utf-8")
+        log(f"[browser] dumped HTML → {base.with_suffix('.html')}")
+    except Exception as exc:  # noqa: BLE001
+        log(f"[browser] dump HTML failed: {exc}")
+    try:
+        await page.screenshot(path=str(base.with_suffix(".png")), full_page=True)
+        log(f"[browser] dumped screenshot → {base.with_suffix('.png')}")
+    except Exception as exc:  # noqa: BLE001
+        log(f"[browser] dump screenshot failed: {exc}")
 
 
 _GEOIP_CACHE_MAX_AGE = 86400  # 24h
@@ -257,7 +357,7 @@ async def _submit_otp(ctx, page, *, otp_code: str, otp_selector: str, log) -> tu
             try:
                 await human_type(
                     otp_input, otp_code,
-                    delay_min_ms=80, delay_max_ms=180, log=log,
+                    delay_min_ms=50, delay_max_ms=120, log=log,
                 )
             except Exception as exc:
                 if _is_driver_dead_error(exc):
@@ -670,6 +770,9 @@ async def _drive_signup_flow(
     overall_timeout: float = 240.0,
     on_checkpoint=None,
     post_otp_grace: float = _POST_OTP_GRACE_SECONDS,
+    debug_capture: bool = False,
+    debug_dir=None,
+    job_id: str = "",
 ) -> tuple[str, float]:
     """State machine: check URL/DOM hiện tại, dispatch handler tương ứng.
     Lặp đến khi đến được chatgpt.com (có session) hoặc gặp lỗi không phục hồi.
@@ -691,7 +794,6 @@ async def _drive_signup_flow(
     _otp_js_submit_done = False
     _otp_api_done = False
     _otp_last_code: str | None = None  # code đang chờ confirm (cho API fallback)
-    one_time_code_mode = False  # True sau khi click "Log in with a one-time code"
     tried_codes: set[str] = set()  # codes đã submit + bị reject
     pending_codes: list[str] = []  # codes chưa submit (mail delay catch)
     last_screen = None
@@ -700,17 +802,20 @@ async def _drive_signup_flow(
     while time.monotonic() < deadline:
         screen = await _detect_screen(page)
 
-        # Trong one-time code login flow, /email-verification hiển thị "Continue with password"
-        # nhưng ta muốn lấy OTP, không quay lại password
-        if one_time_code_mode and screen == "continue":
-            screen = "otp"
-
         if screen != last_screen:
             log(f"[flow] screen={screen} url={page.url.split('?')[0]}")
             last_screen = screen
             same_screen_count = 0
         else:
             same_screen_count += 1
+
+        # Stuck detector: 1 màn hình lặp quá lâu (~25 vòng) → dump HTML+screenshot
+        # 1 lần để debug mà không phải đợi hết overall_timeout. Trace (nếu bật)
+        # vẫn ghi liên tục toàn bộ.
+        if debug_capture and debug_dir is not None and same_screen_count == 25:
+            await _dump_debug_artifacts(
+                page, debug_dir, job_id, reason=f"stuck_{screen}", log=log,
+            )
 
         if screen == "chatgpt":
             await _wait_chatgpt_session(ctx, page, timeout_seconds=30.0, log=log)
@@ -747,14 +852,37 @@ async def _drive_signup_flow(
                 'button:has-text("password"), a:has-text("password"), '
                 '[role="button"]:has-text("password")'
             )
+            pwd_btn = page.locator(_pwd_sel).first
             try:
-                pwd_btn = page.locator(_pwd_sel).first
                 btn_text = await pwd_btn.text_content(timeout=1000)
+            except Exception:
+                btn_text = ""
+            # Click thường → nếu bị chặn (overlay/Turnstile gây "performing click
+            # action" timeout, từng làm KẸT account mới ở run test 08:53) →
+            # thử force=True (bỏ qua pointer-intercept) → fallback đọc href rồi
+            # goto. Nút này là <a href="/create-account/password" | "/log-in/password">.
+            clicked = False
+            try:
                 await pwd_btn.click(timeout=3000)
+                clicked = True
+            except Exception as exc:
+                log(f"[flow] click password button (normal) failed: {exc} — thử force")
+                try:
+                    await pwd_btn.click(timeout=2000, force=True)
+                    clicked = True
+                except Exception as exc2:
+                    log(f"[flow] click password button (force) failed: {exc2} — thử goto href")
+                    try:
+                        href = await pwd_btn.get_attribute("href")
+                        if href:
+                            full = href if href.startswith("http") else f"https://auth.openai.com{href}"
+                            await page.goto(full, wait_until="domcontentloaded", timeout=15000)
+                            clicked = True
+                    except Exception as exc3:
+                        log(f"[flow] goto password href failed: {exc3}")
+            if clicked:
                 log(f"[flow] clicked password button: {(btn_text or '').strip()[:60]}")
                 continue_clicked = True
-            except Exception as exc:
-                log(f"[flow] click password button failed: {exc}")
             # Dwell jitter (anti-ban Task 2.3) thay sleep cố định — sentinel
             # observer thấy reading time realistic giữa state transitions.
             from _human_input import dwell as _dwell_t
@@ -819,8 +947,8 @@ async def _drive_signup_flow(
             except BrowserPhaseError as exc:
                 log(f"[flow] oai-sc wait timeout (continue anyway): {exc}")
 
-            # 3. Pre-typing dwell — user-like (đọc form rồi gõ)
-            await dwell(0.5, 1.2)
+            # 3. Pre-typing dwell — user-like (đọc form rồi gõ), đã giảm
+            await dwell(0.3, 0.7)
 
             # 4. Human-type password (Task 2.2)
             from _human_input import DEFAULT_DELAY_MIN_MS, DEFAULT_DELAY_MAX_MS
@@ -832,7 +960,7 @@ async def _drive_signup_flow(
                 delay_min_ms=delay_min, delay_max_ms=delay_max,
                 log=log,
             )
-            await dwell(0.4, 1.2)  # cursor pause sau khi gõ — tab/look at button
+            await dwell(0.3, 0.7)  # cursor pause sau khi gõ — tab/look at button
 
             # 5. Submit form + capture response
             register_attempted = True
@@ -907,29 +1035,21 @@ async def _drive_signup_flow(
             raise BrowserPhaseError(f"register failed HTTP {status}: {body_str[:200]}")
 
         if screen == "password_login":
+            # User yêu cầu (2026-06-27): CẤM 'Log in with a one-time code'.
+            # Tài khoản MỚI đi nhánh password_create (điền password + Continue).
+            # Vào được /log-in/password = account ĐÃ tồn tại → điền password +
+            # Continue 1 lần; password random của signup không khớp account cũ
+            # → sẽ sai → KHÔNG dùng OTC, bỏ account (không phải tài khoản mới).
             if login_attempted:
-                # Detect sai password → click "Log in with a one-time code" để dùng OTP thay thế
-                if same_screen_count >= 3:
-                    try:
-                        err_el = page.locator('[role="alert"], [class*="error"]').first
-                        err_text = await err_el.text_content(timeout=300)
-                        if err_text and any(k in err_text.lower() for k in ("incorrect", "wrong", "invalid")):
-                            log(f"[flow] login password wrong ({err_text.strip()[:60]}) — trying one-time code fallback")
-                            otc_btn = page.locator(
-                                'button:has-text("Log in with a one-time code"), '
-                                'a:has-text("Log in with a one-time code")'
-                            ).first
-                            await otc_btn.click(timeout=5000)
-                            log("[flow] clicked 'Log in with a one-time code' — waiting for OTP screen")
-                            one_time_code_mode = True
-                            login_attempted = False  # reset để không loop vào đây nữa
-                            await asyncio.sleep(2.0)
-                            continue
-                    except Exception:
-                        pass
+                if same_screen_count >= 2:
+                    raise BrowserPhaseError(
+                        "account đã tồn tại — password không khớp, CẤM one-time "
+                        f"code → bỏ (không phải tài khoản mới). URL: {page.url}"
+                    )
                 await asyncio.sleep(1.0)
                 continue
-            log("[flow] login with password")
+
+            log("[flow] login: điền password + Continue (account đã tồn tại?)")
             pwd_input = None
             for sel in ('input[type="password"]', 'input[name="password"]'):
                 try:
@@ -942,31 +1062,29 @@ async def _drive_signup_flow(
             if not pwd_input:
                 raise BrowserPhaseError(f"login page but no password input. URL: {page.url}")
 
-            # Human-type password (anti-ban Task 2.2) thay delay cố định 50ms.
-            from _human_input import (
-                human_type as _hp_login_type,
-                human_click as _hc_login,
-                dwell as _dl_login,
-                DEFAULT_DELAY_MIN_MS,
-                DEFAULT_DELAY_MAX_MS,
-            )
-            delay_min = DEFAULT_DELAY_MIN_MS
-            delay_max = DEFAULT_DELAY_MAX_MS
-            await _hp_login_type(
-                pwd_input, request.password,
-                delay_min_ms=delay_min, delay_max_ms=delay_max,
-                log=log,
-            )
-            await _dl_login(0.3, 0.8)
-            for btn in ('button[type="submit"]', 'button:has-text("Continue")'):
+            from _human_input import human_type as _hp_login, dwell as _dw_login
+            await _hp_login(pwd_input, request.password, delay_min_ms=40, delay_max_ms=100, log=log)
+            await _dw_login(0.1, 0.3)
+            submitted = False
+            for btn in (
+                'button[type="submit"]',
+                'button:has-text("Continue")',
+                'button:has-text("Log in")',
+            ):
                 try:
                     btn_loc = page.locator(btn).first
-                    if await btn_loc.is_visible(timeout=1000):
-                        await _hc_login(page, btn_loc, log=log)
+                    if await btn_loc.is_visible(timeout=1500):
+                        await btn_loc.click(timeout=5000)
+                        submitted = True
                         break
                 except Exception:
                     continue
-            log("[flow] submitted login password (human-typed)")
+            if not submitted:
+                try:
+                    await pwd_input.press("Enter")
+                except Exception:
+                    pass
+            log("[flow] submitted login password (Continue, no OTC)")
             login_attempted = True
             await asyncio.sleep(1.5)
             continue
@@ -1155,7 +1273,10 @@ async def _drive_signup_flow(
             # Nếu đợi >resend_after_seconds chưa có code mới → click Resend rồi poll tiếp.
             # iCloud có thể gửi mail mới trước, mail cũ delay → lấy nhiều codes
             # rồi thử lần lượt trước khi resend.
-            resend_after_seconds = float(request.otp_resend_after_seconds)
+            # Ngưỡng resend cap 60s (yêu cầu user): icloud_v3 mail đôi khi không
+            # về / delay; chờ 90s mới resend là quá lâu → 1 phút không có mail
+            # thì resend 1 phát.
+            resend_after_seconds = min(float(request.otp_resend_after_seconds), 60.0)
             resend_count = 0
             # Resend tối đa 1 lần: HME delay cao, resend nhiều chỉ vô hiệu mã đang
             # bay + spam → OpenAI rate-limit. Chỉ resend khi mail HOÀN TOÀN chưa về
@@ -1302,35 +1423,6 @@ async def _drive_signup_flow(
             continue
 
         if screen == "about_you":
-            # Set password TRƯỚC khi fill about_you — khi login bằng one-time code,
-            # account chưa có password. Gọi register endpoint set password mới
-            # trong session context đã verify OTP.
-            if one_time_code_mode:
-                # NOTE (Task 2.1 edge case): /about-you KHÔNG có password input
-                # → không thể UI form thật. Dùng ctx.request (Camoufox) để giữ
-                # cookies + persona consistency thay vì page.evaluate(fetch).
-                # Đây là edge case hiếm (chỉ khi password sai → OTC fallback).
-                try:
-                    resp_setpw = await ctx.request.post(
-                        "https://auth.openai.com/api/accounts/user/register",
-                        data={
-                            "username": request.email,
-                            "password": request.password,
-                        },
-                        headers={
-                            "Accept": "application/json",
-                            "Content-Type": "application/json",
-                            "Origin": "https://auth.openai.com",
-                            "Referer": "https://auth.openai.com/about-you",
-                        },
-                    )
-                    body_setpw = await resp_setpw.text()
-                    log(
-                        f"[flow] set password (about_you ctx, OTC fallback): "
-                        f"HTTP {resp_setpw.status}: {body_setpw[:100]}"
-                    )
-                except Exception as exc:
-                    log(f"[flow] set password (about_you ctx) failed: {exc}")
             try:
                 await _wait_oai_sc(ctx, timeout_seconds=15, log=log)
             except BrowserPhaseError:
@@ -1543,6 +1635,8 @@ async def _check_about_you_extras(page, *, log) -> None:
 async def _click_submit_about_you(page, *, log) -> None:
     """Click submit button trên /about-you form."""
     for btn in (
+        'button:has-text("Finish creating account")',
+        'button:has-text("Finish")',
         'button[type="submit"]',
         'button:has-text("Continue")',
         'button:has-text("Agree")',
@@ -1571,6 +1665,34 @@ async def _click_submit_about_you(page, *, log) -> None:
                     return
     except Exception:
         pass
+
+
+async def _confirm_birthday_dialog(page, *, log) -> bool:
+    """Bấm "OK" trên dialog confirm ngày sinh nếu nó đang hiển thị.
+
+    Flow /about-you (variant date-picker): sau khi submit, OpenAI bật dialog
+    "You're setting your birthday to <ngày> … it won't be shared" với 2 nút
+    "OK" và "Cancel". Phải bấm OK để xác nhận, KHÔNG được bấm Cancel.
+
+    Dùng ``:text-is`` (exact match) để chỉ bắt đúng nút "OK" — tránh
+    ``:has-text`` vì nó match substring (vd "Okay"/"Cancel" lẫn lộn).
+
+    Tối ưu: gộp 4 selector vào 1 locator + chỉ 1 lần ``is_visible`` ngắn
+    (~120ms) thay vì 4 probe × 200ms — hàm này được gọi mỗi vòng lặp chờ
+    callback nên phải rẻ. Trả True khi đã bấm, False khi không có dialog.
+    """
+    ok_btn = page.locator(
+        'button:text-is("OK"), button:text-is("Ok"), '
+        '[role="button"]:text-is("OK"), button:has-text("Confirm")'
+    ).first
+    try:
+        if await ok_btn.is_visible(timeout=120):
+            await ok_btn.click(timeout=2000)
+            log("[browser] /about-you confirm birthday: clicked OK")
+            return True
+    except Exception:
+        pass
+    return False
 
 
 async def _detect_about_you_form_error(page) -> str | None:
@@ -1682,10 +1804,10 @@ async def _fill_about_you(page, *, name: str, birthdate: str, timeout_seconds: f
         if not name_input:
             raise BrowserPhaseError("không tìm thấy name input trên /about-you")
 
-        # Human-type name (Gaussian delay + occasional pause)
+        # Human-type name (Gaussian delay, đã giảm tốc độ — gõ nhanh)
         name_loc = page.locator(name_input).first
-        await _human_type(name_loc, name, log=log)
-        await _dwell(0.3, 0.8)  # tab/look at next field
+        await _human_type(name_loc, name, delay_min_ms=40, delay_max_ms=100, log=log)
+        await _dwell(0.2, 0.5)  # tab/look at next field
 
         # Age (parse from birthdate)
         try:
@@ -1695,10 +1817,11 @@ async def _fill_about_you(page, *, name: str, birthdate: str, timeout_seconds: f
         except ValueError as exc:
             raise BrowserPhaseError(f"birthdate format sai: {birthdate}") from exc
 
-        # Try date input first, fallback to age number input
+        # Try date input first, fallback to age number input. Probe ngắn 600ms:
+        # khi đã gõ xong name thì form render xong rồi, không cần chờ 1.5s.
         date_input = None
         try:
-            date_input = await page.wait_for_selector('input[type="date"]', state="visible", timeout=1500)
+            date_input = await page.wait_for_selector('input[type="date"]', state="visible", timeout=600)
         except Exception:
             pass
 
@@ -1717,36 +1840,35 @@ async def _fill_about_you(page, *, name: str, birthdate: str, timeout_seconds: f
                     continue
             if age_input:
                 age_loc = page.locator(age_input).first
-                await _human_type(age_loc, str(age), log=log)
+                await _human_type(age_loc, str(age), delay_min_ms=40, delay_max_ms=100, log=log)
                 log(f"[browser] human-typed age={age}")
             else:
                 # Fallback: Tab + keyboard type
                 await page.keyboard.press("Tab")
-                await _dwell(0.3, 0.6)
-                # Keyboard type with random delay per char
+                await _dwell(0.2, 0.5)
+                # Keyboard type with random delay per char (giảm tốc độ)
                 import random as _rand
                 for ch in str(age):
                     await page.keyboard.type(
-                        ch, delay=_rand.randint(120, 260),
+                        ch, delay=_rand.randint(40, 100),
                     )
                 log(f"[browser] Tab + human-typed age={age}")
-
-        await asyncio.sleep(0.3)
 
         # Handle unchecked checkboxes/TOS trước submit — OpenAI có thể thêm field mới
         await _check_about_you_extras(page, log=log)
 
-        # Mouse wander + dwell trước submit (anti-ban Task 2.5 + 2.3) — sentinel
-        # observer cần thấy cursor activity + reading time trước action critical.
-        try:
-            from _human_input import random_mouse_wander as _wander, dwell as _dwell
-            await _wander(page, count=2, log=log)
-            await _dwell(0.5, 1.4)
-        except Exception as exc:
-            log(f"[browser] /about-you mouse wander/dwell failed (continue): {exc}")
+        # Dwell ngắn trước submit (giảm fake human action — bỏ mouse wander,
+        # max 1s). Sentinel observer đã có đủ keydown events từ human_type.
+        await asyncio.sleep(0.3)
 
-        # Submit
+        # Submit ("Finish creating account")
         await _click_submit_about_you(page, log=log)
+
+        # Sau submit, OpenAI bật dialog confirm ngày sinh ("You're setting your
+        # birthday to …") → bấm OK để xác nhận tuổi.
+        await _dwell(0.2, 0.5)
+        if await _confirm_birthday_dialog(page, log=log):
+            await _dwell(0.2, 0.4)
 
         # Đợi callback URL hoặc navigate đến chatgpt.com
         deadline = time.monotonic() + timeout_seconds
@@ -1765,7 +1887,7 @@ async def _fill_about_you(page, *, name: str, birthdate: str, timeout_seconds: f
             if "url" in callback_holder:
                 # Sleep ngắn để cookie jar commit (response → cookie store ghi)
                 # trước khi return cho caller poll cookies.
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(0.4)
                 log(
                     f"[browser] callback URL captured "
                     f"(HTTP {callback_holder.get('status', '?')})"
@@ -1778,22 +1900,25 @@ async def _fill_about_you(page, *, name: str, birthdate: str, timeout_seconds: f
             if "chatgpt.com" in cur:
                 log("[browser] navigated to chatgpt.com (no explicit callback)")
                 return callback_holder.get("url") or cur
-            # Detect consent/modal buttons mới
-            for accept_btn in (
-                'button:has-text("Okay")',
-                'button:has-text("I agree")',
-                'button:has-text("Accept")',
-                'button:has-text("Got it")',
-                'button:has-text("Let")',
-            ):
-                try:
-                    btn_el = page.locator(accept_btn).first
-                    if await btn_el.is_visible(timeout=200):
-                        await btn_el.click(timeout=2000)
-                        log(f"[browser] clicked modal button: {accept_btn}")
-                        break
-                except Exception:
-                    continue
+            # Birthday confirm dialog ("You're setting your birthday to …") → OK.
+            # Dialog có thể render trễ sau submit nên check mỗi vòng lặp.
+            if await _confirm_birthday_dialog(page, log=log):
+                await asyncio.sleep(0.4)
+                continue
+            # Detect consent/modal buttons mới — 1 probe gộp (trước đây 5 probe
+            # × is_visible 200ms = ~1s/vòng, trong lúc page điều hướng OAuth làm
+            # chậm phát hiện callback ~7s). Gộp + timeout ngắn.
+            try:
+                modal_btn = page.locator(
+                    'button:has-text("Okay"), button:has-text("I agree"), '
+                    'button:has-text("Accept"), button:has-text("Got it"), '
+                    'button:has-text("Let")'
+                ).first
+                if await modal_btn.is_visible(timeout=150):
+                    await modal_btn.click(timeout=2000)
+                    log("[browser] clicked modal button (consent)")
+            except Exception:
+                pass
             # Passkey enrollment — skip
             if "passkey" in cur.lower():
                 if not passkey_skip_attempted:
@@ -1832,6 +1957,9 @@ async def _fill_about_you(page, *, name: str, birthdate: str, timeout_seconds: f
                     # Thử submit lại với chiến thuật escalating
                     if submit_attempts <= 3:
                         await _click_submit_about_you(page, log=log)
+                        # Confirm dialog ngày sinh nếu nó bật sau submit
+                        await asyncio.sleep(0.4)
+                        await _confirm_birthday_dialog(page, log=log)
                     else:
                         # Escalate: Enter key + JS dispatch
                         log(f"[browser] /about-you submit attempt {submit_attempts} — trying Enter + JS")
@@ -1860,7 +1988,7 @@ async def _fill_about_you(page, *, name: str, birthdate: str, timeout_seconds: f
                     # Hết retry — log DOM snapshot 1 lần để debug
                     dom_logged = True
                     await _log_about_you_dom(page, log=log)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)
 
         # Fallback: page.url nếu đã navigate qua callback hoặc chatgpt.com
         if "chatgpt.com" in page.url:
@@ -2027,16 +2155,22 @@ async def run_browser_phase(
         use_template=request.profile_template,
     )
 
-    # HAR capture
+    # HAR capture + debug artifacts (Playwright trace = actions + DOM snapshots +
+    # screenshots; HTML/screenshot dump khi lỗi/stuck). Bật cùng --har để mỗi lần
+    # test có đủ artifact tối ưu khi flow lỗi/treo.
     har_kwargs: dict[str, Any] = {}
+    debug_capture = bool(request.har_capture)
+    debug_dir = settings.runtime_dir / "har_hybrid"
+    trace_path = debug_dir / f"trace-{datetime.now():%Y%m%d-%H%M%S}-{job_id}.zip"
     if request.har_capture:
-        har_dir = settings.runtime_dir / "har_hybrid"
+        har_dir = debug_dir
         har_dir.mkdir(parents=True, exist_ok=True)
         har_path = har_dir / f"hybrid-{datetime.now():%Y%m%d-%H%M%S}-{job_id}.har"
         har_kwargs["record_har_path"] = str(har_path)
         har_kwargs["record_har_content"] = "embed"
         har_kwargs["record_har_mode"] = "full"
         log(f"[browser] HAR capture → {har_path}")
+        log(f"[browser] trace + HTML dump → {debug_dir} (on stuck/error)")
 
     device_id = str(uuid.uuid4())
     # auth_session_logging_id: KHÔNG gen ở đây nữa — defer tới sau khi load
@@ -2181,6 +2315,7 @@ async def run_browser_phase(
             )
             screen_kwargs["i_know_what_im_doing"] = True
 
+        _pids_before = _browser_descendant_pids(os.getpid())
         cf = AsyncCamoufox(
             headless=request.headless,
             persistent_context=True,
@@ -2196,11 +2331,10 @@ async def run_browser_phase(
             # WebRTC stun servers → server (sentinel) detect mismatch IP proxy
             # vs WebRTC IP → flag bot.
             block_webrtc=True,
-            # humanize=True: Camoufox tự jitter mouse movement natively
-            # (smoother than Python-level random_mouse_wander). Vẫn giữ
-            # random_mouse_wander Python ở Phase 2 vì wander control timing
-            # giữa actions còn humanize chỉ jitter trong 1 mouse.move call.
-            humanize=True,
+            # humanize=0.4: Camoufox animate cursor mượt (anti-ban) NHƯNG cap tối
+            # đa 0.4s/lần di. Mặc định humanize=True = 1.5s/lần → "di chuột rất
+            # lâu" (mỗi click tốn tới 1.5s). 0.4s đủ realistic, nhanh hơn nhiều.
+            humanize=0.4,
             # main_world_eval=True (Phase 11.2): cho phép page.evaluate chạy
             # main world, tránh Xray wrapper reject TypedArray của sdk.js.
             main_world_eval=True,
@@ -2218,6 +2352,16 @@ async def run_browser_phase(
             **har_kwargs,
         )
         ctx = await cf.__aenter__()
+        # Anti-leak: PID tiến trình browser của RUN NÀY (diff trước/sau launch).
+        # Dùng để force-kill nếu cf.__aexit__ không reap hết (firefox sống sót).
+        _my_browser_pids = _browser_descendant_pids(os.getpid()) - _pids_before
+
+        if debug_capture:
+            try:
+                await ctx.tracing.start(screenshots=True, snapshots=True, sources=True)
+                log("[browser] Playwright tracing started (actions + snapshots + screenshots)")
+            except Exception as exc:  # noqa: BLE001 — best-effort debug
+                log(f"[browser] tracing start failed (continue): {exc}")
 
         callback_holder: dict[str, str] = {}
 
@@ -2231,7 +2375,7 @@ async def run_browser_phase(
         try:
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
 
-            await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
+            await page.goto(PROMO_LANDING_URL, wait_until="domcontentloaded")
             log("[browser] chatgpt.com loaded")
             # Fingerprint health probe (Phase 9 — anti-ban headless hardening):
             # Confirm Camoufox produced real WebGL/canvas/audio/plugins. Empty
@@ -2262,6 +2406,9 @@ async def run_browser_phase(
                 log=log,
                 overall_timeout=request.otp_timeout_seconds + _PRE_OTP_MARGIN_SECONDS,
                 on_checkpoint=on_checkpoint,
+                debug_capture=debug_capture,
+                debug_dir=debug_dir if debug_capture else None,
+                job_id=job_id,
             )
 
             _state = (
@@ -2283,19 +2430,43 @@ async def run_browser_phase(
                 f"[browser] camoufox runner exception: "
                 f"{type(exc).__name__}: {exc} ({health})"
             )
+            if debug_capture and page is not None:
+                await _dump_debug_artifacts(page, debug_dir, job_id, reason="error", log=log)
             raise
         finally:
             try:
                 ctx.remove_listener("request", _capture_callback)
             except Exception:
                 pass
+            if debug_capture:
+                try:
+                    await ctx.tracing.stop(path=str(trace_path))
+                    log(f"[browser] trace saved → {trace_path}")
+                except Exception as exc:  # noqa: BLE001
+                    log(f"[browser] tracing stop failed: {exc}")
             if request.keep_browser_open and not request.headless:
                 log("[browser] debug: giữ browser mở — cancel job để đóng")
             else:
+                # Đóng browser có TIMEOUT (cf.__aexit__ = context.close +
+                # playwright.stop) — tránh treo vô hạn nếu browser wedged.
                 try:
-                    await cf.__aexit__(None, None, None)
-                except Exception:
-                    pass
+                    await asyncio.wait_for(
+                        cf.__aexit__(None, None, None), timeout=20.0,
+                    )
+                except Exception as exc:  # noqa: BLE001 — timeout/close lỗi
+                    log(
+                        f"[browser] cf.__aexit__ timeout/lỗi "
+                        f"({type(exc).__name__}: {exc})"
+                    )
+                # Anti-leak: firefox/persistent-context đôi khi sống sót sau
+                # close → force-kill PID browser của RUN NÀY còn sống. Chỉ kill
+                # PID đã capture của run này (an toàn khi concurrent).
+                try:
+                    leftover = {p for p in _my_browser_pids if _pid_alive(p)}
+                    if leftover:
+                        _force_kill_pids(leftover, log=log)
+                except Exception as exc:  # noqa: BLE001
+                    log(f"[browser] anti-leak kill lỗi (bỏ qua): {exc}")
 
     async def _run_chromium_once() -> tuple[str, float, str, list[dict[str, Any]]]:
         from playwright.async_api import async_playwright
@@ -2337,7 +2508,7 @@ async def run_browser_phase(
             ctx.on("request", _capture_callback)
 
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-            await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
+            await page.goto(PROMO_LANDING_URL, wait_until="domcontentloaded")
             log("[browser] chatgpt.com loaded")
             # Fingerprint health probe (Phase 9 — anti-ban headless hardening).
             try:
@@ -2363,6 +2534,9 @@ async def run_browser_phase(
                 log=log,
                 overall_timeout=request.otp_timeout_seconds + _PRE_OTP_MARGIN_SECONDS,
                 on_checkpoint=on_checkpoint,
+                debug_capture=debug_capture,
+                debug_dir=debug_dir if debug_capture else None,
+                job_id=job_id,
             )
 
             _state = (

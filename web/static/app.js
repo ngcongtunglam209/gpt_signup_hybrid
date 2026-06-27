@@ -20,48 +20,88 @@
     // 3. localStorage (previously entered)
     return localStorage.getItem(_LS_TOKEN) || '';
   }
-  function withTokenQuery(url) {
-    const t = getAuthToken();
-    if (!t) return url;
-    const sep = url.includes('?') ? '&' : '?';
-    return url + sep + 'token=' + encodeURIComponent(t);
-  }
 
   // ── SseBus — unified SSE multiplexer (frontend) ─────────────────
+  // Dùng fetch(POST)+ReadableStream thay EventSource: Cloudflare Quick Tunnel
+  // buffer SSE qua GET và chỉ flush khi đóng connection
+  // (cloudflare/cloudflared#1449) → POST stream real-time. Token đi qua header
+  // X-API-Token (không lộ ở query log như EventSource ?token=).
   const SseBus = (() => {
-    let _es = null;
+    let _active = false;
+    let _abort = null;
     let _reconnectTimer = null;
     const _handlers = new Map(); // channel -> [callback, ...]
 
+    function _dispatchEvent(raw) {
+      // 1 SSE event (đã tách bằng "\n\n"); gộp các dòng "data:" theo spec.
+      const dataLines = [];
+      for (const line of raw.split('\n')) {
+        if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
+        // dòng bắt đầu ':' là comment/heartbeat (": ping") → bỏ qua
+      }
+      if (dataLines.length === 0) return;
+      let data;
+      try { data = JSON.parse(dataLines.join('\n')); } catch (_) { return; }
+      const channel = data.channel;
+      if (!channel) return;
+      const cbs = _handlers.get(channel);
+      if (cbs) cbs.forEach(cb => cb(data));
+    }
+
+    async function _stream() {
+      const token = getAuthToken();
+      const headers = { 'Accept': 'text/event-stream' };
+      if (token) headers['X-API-Token'] = token;
+      _abort = new AbortController();
+      const resp = await fetch('/api/sse', {
+        method: 'POST',
+        headers,
+        cache: 'no-store',
+        signal: _abort.signal,
+      });
+      if (!resp.ok || !resp.body) throw new Error('SSE HTTP ' + resp.status);
+
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf('\n\n')) !== -1) {
+          _dispatchEvent(buf.slice(0, idx));
+          buf = buf.slice(idx + 2);
+        }
+      }
+    }
+
+    function _scheduleReconnect() {
+      if (!_active || _reconnectTimer) return;
+      _reconnectTimer = setTimeout(() => {
+        _reconnectTimer = null;
+        _run();
+      }, 3000);
+    }
+
+    function _run() {
+      if (!_active) return;
+      // Stream vô hạn: resolve (done) nghĩa là connection rớt → reconnect.
+      _stream().catch(() => {}).finally(() => {
+        _abort = null;
+        _scheduleReconnect();
+      });
+    }
+
     function connect() {
-      if (_es && _es.readyState !== 2) return;
-      _disconnect();
-      const url = withTokenQuery('/api/sse');
-      _es = new EventSource(url);
-
-      _es.onmessage = (e) => {
-        let data;
-        try { data = JSON.parse(e.data); } catch (_) { return; }
-        const channel = data.channel;
-        if (!channel) return;
-        const cbs = _handlers.get(channel);
-        if (cbs) cbs.forEach(cb => cb(data));
-      };
-
-      _es.onerror = () => {
-        _disconnect();
-        _reconnectTimer = setTimeout(connect, 3000);
-      };
+      if (_active) return;
+      _active = true;
+      _run();
     }
 
     function on(channel, callback) {
       if (!_handlers.has(channel)) _handlers.set(channel, []);
       _handlers.get(channel).push(callback);
-    }
-
-    function _disconnect() {
-      if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
-      if (_es) { try { _es.close(); } catch (_) {} _es = null; }
     }
 
     return { connect, on };
@@ -378,6 +418,11 @@
   }
 
   let _activeTabId = null;
+  // Only-UPI launch mode: server inject body[data-only-upi="1"] khi chạy
+  // `web --only-upi`. Frontend chỉ hiển thị tab UPI QR (CSS ẩn nav khác).
+  function _isOnlyUpiMode() {
+    return document.body.dataset.onlyUpi === '1';
+  }
   function activateTab(tabId) {
     const prevTab = _activeTabId;
     _activeTabId = tabId;
@@ -387,7 +432,9 @@
     document.querySelectorAll('.tab-content').forEach((tab) => {
       tab.classList.toggle('active', tab.id === `tab-${tabId}`);
     });
-    Settings.save('ui.active_tab', tabId, getAuthToken());
+    // Only-UPI mode: KHÔNG ghi đè ui.active_tab — giữ nguyên preference của user
+    // cho lần chạy bản đầy đủ sau này.
+    if (!_isOnlyUpiMode()) Settings.save('ui.active_tab', tabId, getAuthToken());
     document.dispatchEvent(new CustomEvent('gpt:tab', { detail: { tab: tabId, prev: prevTab } }));
   }
 
@@ -397,6 +444,11 @@
     document.querySelectorAll('.tab-btn').forEach((btn) => {
       btn.addEventListener('click', () => activateTab(btn.dataset.tab));
     });
+    // Only-UPI mode: ép tab UPI, bỏ qua saved preference + hidden list.
+    if (_isOnlyUpiMode()) {
+      activateTab('upi');
+      return;
+    }
     // Tab tạm ẩn (chưa dùng được). Mở lại: bỏ khỏi danh sách + bỏ comment nút nav trong index.html.
     const hiddenTabs = ['link', 'hme'];
     let initialTab = Settings.get('ui.active_tab') || document.querySelector('.tab-btn.active')?.dataset.tab || 'reg';
@@ -1152,9 +1204,9 @@
       applyMailMode(dom.mailModeSelect.value);
     });
 
-    // ── Reg Mode selector (browser / pure_request / hybrid) ─────
+    // ── Reg Mode selector (browser / hybrid) ─────
     const savedRegMode = Settings.get('reg_mode.current');
-    if (savedRegMode && ['browser', 'pure_request', 'hybrid'].includes(savedRegMode)) {
+    if (savedRegMode && ['browser', 'hybrid'].includes(savedRegMode)) {
       dom.regModeSelect.value = savedRegMode;
     }
     dom.regModeSelect.addEventListener('change', () => {

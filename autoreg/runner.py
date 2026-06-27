@@ -43,7 +43,7 @@ class AutoRegConfig:
     auto_retry_max: int = 3
     auto_retry_delay: float = 30.0
     # Reg pipeline mode (Settings ``reg_mode.current``) — default ``browser`` để
-    # backward compat. Hợp lệ: "browser" | "pure_request" | "hybrid".
+    # backward compat. Hợp lệ: "browser" | "hybrid" (pure_request đã gỡ khỏi reg).
     reg_mode: str = "browser"
 
 

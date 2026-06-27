@@ -47,10 +47,13 @@ import concurrent.futures
 import json
 import logging
 import os
+import queue
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
+
+from ._proc_reaper import BrowserProcessReaper
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +189,24 @@ _OBSERVER_BURST_JS = r"""
 # tự shutdown. Đặt 5 min để cover gap giữa các signup trong cùng AutoReg cycle.
 _BROWSER_IDLE_TTL_SECONDS = 300.0
 
+# Cap thời gian chờ cho các op TEARDOWN (close context / shutdown browser). Op
+# teardown có thể treo nếu browser/page wedged; cap để caller (cleanup async /
+# atexit) KHÔNG block vô hạn. Op vẫn chạy nốt trên daemon worker — không leak block.
+_TEARDOWN_TIMEOUT_SECONDS = 30.0
+
+# ── Bound timeout cho op KHÔNG-teardown (fix bug "multi-signup launch-hang") ──
+# Trước fix: launch/acquire/mint chạy ``_PlaywrightThread.run(timeout=None)`` →
+# treo VÔ HẠN nếu Camoufox launch/sentinel mint wedged → outer watchdog 420s mới
+# cắt. Fix: cap thời gian từng op để fail-fast, raise ``HybridBrowserPoolError``
+# cho ``run_hybrid_signup`` classify + retry/dừng, KHÔNG nuốt lỗi.
+#   - LAUNCH/ACQUIRE: cold-launch Camoufox + goto frame.html + bridge ready
+#     thường ~2-10s; cho 90s buffer cho proxy chậm / CF challenge.
+#   - MINT: page.evaluate sentinel sdk (token/so) thường ~1-3s; cho 45s buffer.
+_LAUNCH_TIMEOUT_SECONDS = 90.0
+_MINT_TIMEOUT_SECONDS = 45.0
+# Grace giữa SIGTERM → SIGKILL khi reaper force-kill browser wedged.
+_KILL_GRACE_SECONDS = 3.0
+
 
 class HybridBrowserPoolError(RuntimeError):
     """Lỗi runtime pool (browser launch / context fail)."""
@@ -197,47 +218,84 @@ class HybridBrowserPoolError(RuntimeError):
 
 
 class _PlaywrightThread:
-    """Single-worker executor để route Playwright sync API.
+    """Single DAEMON worker thread + FIFO queue để route Playwright sync API.
 
     Lý do tồn tại:
       1. **Asyncio safety**: Playwright sync_api raise NotImplementedError khi
          được gọi từ thread có asyncio loop đang chạy. Caller của pool là
          ``run_hybrid_signup`` (async coroutine, chạy trong asyncio thread cha).
-         Submit qua executor → chạy trên dedicated thread KHÔNG có event loop.
+         Enqueue → chạy trên dedicated worker thread KHÔNG có event loop.
 
       2. **Thread-affinity**: Playwright Python sync_api dùng greenlet per
          (process, thread). Browser/Context/Page tạo ở thread T1 chỉ dùng được
-         ở T1 — gọi từ T2 sẽ raise/treo. ``max_workers=1`` đảm bảo mọi op
-         chạy ở CÙNG MỘT thread cố định.
+         ở T1 — gọi từ T2 sẽ raise/treo. 1 worker thread cố định đảm bảo mọi op
+         chạy ở CÙNG MỘT thread.
 
-      3. **Re-entrancy guard**: Nếu method A chạy trong executor thread T_exec
-         và gọi method B (cũng submit qua executor) — submit() sẽ block chờ
-         T_exec rảnh, mà T_exec đang đợi B → DEADLOCK. Guard qua
-         ``threading.local()`` để detect re-entry và gọi inline.
+      3. **Re-entrancy guard**: Nếu method A chạy trong worker thread và gọi
+         method B (cũng route qua queue) — sẽ tự deadlock (worker chờ chính nó).
+         Guard qua so khớp identity ``threading.current_thread() is self._worker``
+         để detect re-entry và gọi inline.
+
+      4. **Không treo process exit**: worker là DAEMON + ``shutdown()``
+         non-blocking + ``run(timeout=...)`` cho close path → 1 op Playwright
+         treo (browser wedged) KHÔNG block caller vô hạn, cũng KHÔNG bị join ở
+         interpreter shutdown (khác ThreadPoolExecutor non-daemon → hang).
     """
 
     def __init__(self, name: str = "camoufox-pool") -> None:
-        self._executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix=name,
-        )
-        self._tls = threading.local()
+        # 1 worker thread DAEMON cố định + FIFO queue. Daemon = process exit
+        # KHÔNG bị block khi 1 op Playwright treo (browser wedged) — đây là
+        # khác biệt cốt lõi so với ThreadPoolExecutor (worker non-daemon, bị
+        # join ở interpreter shutdown → hang). Mọi op vẫn chạy trên CÙNG 1
+        # thread → giữ thread-affinity Playwright sync_api.
+        self._queue: "queue.SimpleQueue[Any]" = queue.SimpleQueue()
         self._shutdown = False
         self._shutdown_lock = threading.Lock()
+        self._worker = threading.Thread(
+            target=self._loop, name=name, daemon=True,
+        )
+        self._worker.start()
+
+    _SHUTDOWN = object()  # sentinel để worker thoát vòng lặp
+
+    def _loop(self) -> None:
+        """Vòng lặp worker — drain queue, chạy từng fn, set kết quả vào future."""
+        while True:
+            item = self._queue.get()
+            if item is self._SHUTDOWN:
+                return
+            fn, args, kwargs, future = item
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                future.set_result(fn(*args, **kwargs))
+            except BaseException as exc:  # noqa: BLE001 — propagate lên caller
+                future.set_exception(exc)
 
     def _in_executor(self) -> bool:
-        return bool(getattr(self._tls, "in_executor", False))
+        return threading.current_thread() is self._worker
 
-    def run(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        """Chạy ``fn(*args, **kwargs)`` ở dedicated thread.
+    def run(
+        self, fn: Callable[..., Any], *args: Any,
+        timeout: float | None = None, **kwargs: Any,
+    ) -> Any:
+        """Chạy ``fn(*args, **kwargs)`` ở dedicated worker thread.
 
-        Khi caller ĐÃ ở trong executor thread (re-entrant case), gọi inline để
-        tránh deadlock. Khi caller ở thread khác (asyncio thread / pre-mint
-        thread / atexit thread), submit + block-wait result.
+        Khi caller ĐÃ ở worker thread (re-entrant case), gọi inline để tránh
+        deadlock (worker chờ chính nó). Khi caller ở thread khác (asyncio thread
+        / pre-mint thread / atexit thread), enqueue + block-wait result.
 
-        Raises: re-raise nguyên gốc exception từ ``fn``. Nếu executor đã shutdown
-        và caller submit task mới, raise ``HybridBrowserPoolError``.
+        Args:
+            timeout: None = chờ vô hạn (giữ behavior cũ cho op thường). Số giây
+                = cap thời gian chờ — dùng cho close/shutdown để KHÔNG treo vô
+                hạn nếu browser wedged. Hết timeout → raise
+                ``concurrent.futures.TimeoutError`` (task vẫn chạy nốt trên
+                daemon worker, không leak block).
+
+        Raises: re-raise nguyên gốc exception từ ``fn``. Nếu đã shutdown và caller
+        submit task mới từ thread ngoài, raise ``HybridBrowserPoolError``.
         """
-        # Re-entrant: caller đang ở executor thread → gọi inline.
+        # Re-entrant: caller đang ở worker thread → gọi inline.
         if self._in_executor():
             return fn(*args, **kwargs)
 
@@ -246,30 +304,22 @@ class _PlaywrightThread:
                 "_PlaywrightThread đã shutdown — không thể submit task mới"
             )
 
-        def _wrapped() -> Any:
-            self._tls.in_executor = True
-            try:
-                return fn(*args, **kwargs)
-            finally:
-                self._tls.in_executor = False
-
-        future = self._executor.submit(_wrapped)
-        return future.result()
+        future: concurrent.futures.Future = concurrent.futures.Future()
+        self._queue.put((fn, args, kwargs, future))
+        return future.result(timeout=timeout)
 
     def shutdown(self) -> None:
-        """Đóng executor. Idempotent + best-effort.
+        """Báo worker thoát. Idempotent + non-blocking.
 
-        Sau khi shutdown, mọi ``run()`` từ thread ngoài raise. ``run()`` từ
-        chính executor thread (đang chạy task cuối) vẫn pass qua inline path.
+        Không join worker (daemon — tự chết khi process exit). Task đang chạy /
+        đã enqueue trước sentinel vẫn drain xong theo FIFO. Sau shutdown, mọi
+        ``run()`` từ thread ngoài raise; ``run()`` từ chính worker (inline) vẫn pass.
         """
         with self._shutdown_lock:
             if self._shutdown:
                 return
             self._shutdown = True
-        try:
-            self._executor.shutdown(wait=False)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("_PlaywrightThread shutdown executor failed: %s", exc)
+        self._queue.put(self._SHUTDOWN)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -308,6 +358,10 @@ class _CamoufoxRunner:
         self._thread = _PlaywrightThread(
             name=f"camoufox-runner-{id(self):x}",
         )
+        # Reaper force-kill browser wedged (chốt baseline TRƯỚC khi launch để
+        # chỉ kill process browser do CHÍNH runner này spawn).
+        self._reaper = BrowserProcessReaper(log)
+        self._reaper.mark_baseline()
         # _state_lock bảo vệ counter + last_used khỏi đọc/ghi cross-thread.
         # KHÔNG bảo vệ Playwright ops (đã serialize ở _thread).
         self._state_lock = threading.Lock()
@@ -448,9 +502,30 @@ class _CamoufoxRunner:
 
         Block đến khi page load + bridge ready. Raise ``HybridBrowserPoolError``
         nếu Camoufox launch fail hoặc bridge không init.
+
+        Bound timeout ``_LAUNCH_TIMEOUT_SECONDS``: nếu cold-launch Camoufox treo
+        (proxy chết / CF challenge wedged) → KHÔNG block vô hạn, force-kill
+        browser orphan + raise để outer-loop classify.
         """
         try:
-            handle = self._thread.run(self._acquire_context_in_thread)
+            handle = self._thread.run(
+                self._acquire_context_in_thread,
+                timeout=_LAUNCH_TIMEOUT_SECONDS,
+            )
+        except concurrent.futures.TimeoutError as exc:
+            # Op treo trên daemon worker → kill browser vừa spawn (nếu có) để
+            # không thành orphan, rồi fail-fast.
+            self._reaper.kill_new(
+                "acquire_context-timeout", grace_seconds=_KILL_GRACE_SECONDS,
+            )
+            self._log(
+                f"[hybrid-pool] acquire_context TIMEOUT "
+                f">{_LAUNCH_TIMEOUT_SECONDS:.0f}s — force-killed browser orphan"
+            )
+            raise HybridBrowserPoolError(
+                f"camoufox op timeout (acquire_context > "
+                f"{_LAUNCH_TIMEOUT_SECONDS:.0f}s)"
+            ) from exc
         except Exception as exc:
             self._log(
                 f"[hybrid-pool] acquire_context failed: "
@@ -465,7 +540,10 @@ class _CamoufoxRunner:
     def release_context(self, handle: "HybridContextHandle") -> None:
         """Close context (browser stays alive cho signup kế tiếp)."""
         try:
-            self._thread.run(self._release_context_in_thread, handle)
+            self._thread.run(
+                self._release_context_in_thread, handle,
+                timeout=_TEARDOWN_TIMEOUT_SECONDS,
+            )
         except Exception as exc:  # noqa: BLE001 — release best-effort
             self._log(f"[hybrid-pool] release_context warn: {exc}")
         with self._state_lock:
@@ -485,12 +563,33 @@ class _CamoufoxRunner:
             return time.monotonic() - self._last_used
 
     def shutdown(self) -> None:
-        """Đóng browser + dedicated thread. Idempotent + best-effort."""
+        """Đóng browser + dedicated thread. Idempotent + best-effort.
+
+        Sau khi gọi ``_shutdown_in_thread`` (có thể treo nếu browser wedged →
+        cap teardown timeout), SWEEP reaper force-kill mọi process browser còn
+        sót do runner này spawn → tránh orphan tích lũy.
+        """
+        timed_out = False
         try:
-            self._thread.run(self._shutdown_in_thread)
+            self._thread.run(
+                self._shutdown_in_thread, timeout=_TEARDOWN_TIMEOUT_SECONDS,
+            )
+        except concurrent.futures.TimeoutError:
+            timed_out = True
+            self._log(
+                f"[hybrid-pool] shutdown TIMEOUT >{_TEARDOWN_TIMEOUT_SECONDS:.0f}s "
+                f"— sẽ force-kill browser"
+            )
         except Exception as exc:  # noqa: BLE001
             self._log(f"[hybrid-pool] shutdown warn: {exc}")
         finally:
+            # Sweep: kill browser còn sống (close treo HOẶC close "thành công"
+            # nhưng Firefox không thực sự chết). Reaper chỉ chạm process delta
+            # baseline của runner này.
+            self._reaper.kill_new(
+                "shutdown-sweep" if not timed_out else "shutdown-timeout",
+                grace_seconds=_KILL_GRACE_SECONDS,
+            )
             self._thread.shutdown()
 
 
@@ -614,13 +713,18 @@ class HybridContextHandle:
         """Seed ``oai-did`` cookie vào context để sdk.js dùng cùng id với curl."""
         if self._closed:
             return
-        self.runner.thread.run(self._set_device_id_in_thread, device_id)
+        self.runner.thread.run(
+            self._set_device_id_in_thread, device_id,
+            timeout=_MINT_TIMEOUT_SECONDS,
+        )
 
     def export_cookies(self) -> list[dict]:
         """Return cookies trong ``_SHARED_COOKIE_NAMES`` từ Camoufox context."""
         if self._closed:
             return []
-        return self.runner.thread.run(self._export_cookies_in_thread)
+        return self.runner.thread.run(
+            self._export_cookies_in_thread, timeout=_MINT_TIMEOUT_SECONDS,
+        )
 
     def mint_token(self, flow: str) -> "SentinelToken":
         """Page bridge → sdk.js ``token(flow)`` → SentinelToken dataclass."""
@@ -628,7 +732,14 @@ class HybridContextHandle:
 
         if self._closed:
             raise EnforcementError("context closed")
-        return self.runner.thread.run(self._mint_token_in_thread, flow)
+        try:
+            return self.runner.thread.run(
+                self._mint_token_in_thread, flow, timeout=_MINT_TIMEOUT_SECONDS,
+            )
+        except concurrent.futures.TimeoutError as exc:
+            raise HybridBrowserPoolError(
+                f"camoufox op timeout (mint_token > {_MINT_TIMEOUT_SECONDS:.0f}s)"
+            ) from exc
 
     def mint_so(self, flow: str) -> str:
         """Page bridge → sdk.js ``sessionObserverToken(flow)`` → ``so`` string."""
@@ -636,7 +747,14 @@ class HybridContextHandle:
 
         if self._closed:
             raise EnforcementError("context closed")
-        return self.runner.thread.run(self._mint_so_in_thread, flow)
+        try:
+            return self.runner.thread.run(
+                self._mint_so_in_thread, flow, timeout=_MINT_TIMEOUT_SECONDS,
+            )
+        except concurrent.futures.TimeoutError as exc:
+            raise HybridBrowserPoolError(
+                f"camoufox op timeout (mint_so > {_MINT_TIMEOUT_SECONDS:.0f}s)"
+            ) from exc
 
     def close(self) -> None:
         """Release context về pool. Idempotent."""
@@ -725,12 +843,26 @@ class HybridBrowserPool:
             proxy=proxy, headless=headless, insecure=insecure, log=log,
         )
         try:
-            runner.thread.run(runner._ensure_browser_in_thread)
+            runner.thread.run(
+                runner._ensure_browser_in_thread,
+                timeout=_LAUNCH_TIMEOUT_SECONDS,
+            )
             log(
                 f"[hybrid-pool] warm_up OK "
                 f"(proxy={'***' if proxy else 'direct'} "
                 f"headless={headless} insecure={insecure})"
             )
+        except concurrent.futures.TimeoutError as exc:
+            runner._reaper.kill_new(
+                "warm_up-timeout", grace_seconds=_KILL_GRACE_SECONDS,
+            )
+            log(
+                f"[hybrid-pool] warm_up TIMEOUT >{_LAUNCH_TIMEOUT_SECONDS:.0f}s "
+                f"— force-killed browser orphan"
+            )
+            raise HybridBrowserPoolError(
+                f"camoufox op timeout (warm_up > {_LAUNCH_TIMEOUT_SECONDS:.0f}s)"
+            ) from exc
         except Exception as exc:  # noqa: BLE001
             log(f"[hybrid-pool] warm_up failed: {type(exc).__name__}: {exc}")
             raise
@@ -789,6 +921,37 @@ def pool_disabled() -> bool:
     return os.getenv("HYBRID_POOL_DISABLED", "0").lower() in ("1", "true", "yes")
 
 
+def pool_enabled() -> bool:
+    """Quyết định hybrid có dùng shared Camoufox pool hay không.
+
+    Pool là **OPT-IN**. Default = no-pool: mỗi signup launch
+    ``CamoufoxTokenGenerator`` golden riêng (khớp lifecycle golden — launch mới
+    mỗi account, close trong finally), vừa tránh cluster fingerprint vừa hết
+    hang do single-thread serialization của pool (1 op treo → mọi signup khác
+    block vô hạn).
+
+    Precedence (cao → thấp):
+      1. Env ``HYBRID_POOL_DISABLED=1`` → luôn no-pool (override cứng cho
+         debug/safety, bất chấp setting).
+      2. Settings Store key ``reg.hybrid_pool_enabled`` (bool) — single source
+         of truth. True → bật pool. False/None/vắng → no-pool.
+      3. Default ``False`` (no-pool) khi DB chưa mở / lỗi đọc.
+
+    KHÔNG dùng env làm default bật/tắt (chỉ override). KHÔNG file config riêng.
+    """
+    # Override cứng qua env: tắt pool bất chấp setting.
+    if pool_disabled():
+        return False
+    # Settings Store (DB) — opt-in. Đọc qua thread-local read connection
+    # (WAL, check_same_thread=False) nên an toàn khi gọi từ to_thread worker.
+    try:
+        from db import get_engine, get_settings_repo
+
+        return get_settings_repo(get_engine()).get("reg.hybrid_pool_enabled") is True
+    except Exception:  # noqa: BLE001 — DB chưa mở (live test/CLI) → no-pool
+        return False
+
+
 # ─────────────────────────────────────────────────────────────────────
 # No-pool path adapter — thread-affinity cho CamoufoxTokenGenerator
 # ─────────────────────────────────────────────────────────────────────
@@ -809,23 +972,87 @@ class _NoPoolThreadAffinityWrapper:
     def __init__(self, inner: Any) -> None:
         self._inner = inner
         self._thread = _PlaywrightThread(name=f"camoufox-nopool-{id(self):x}")
+        # Reaper: chốt baseline NGAY (chưa launch) → mọi browser process spawn
+        # sau đây bởi inner (CamoufoxTokenGenerator) thuộc về wrapper này và là
+        # ứng viên force-kill khi launch/op treo hoặc close không kill được.
+        self._reaper = BrowserProcessReaper(
+            getattr(inner, "_log", None) or logger.warning
+        )
+        self._reaper.mark_baseline()
+
+    def _run_bounded(self, fn: Callable[..., Any], *args: Any,
+                     timeout: float, op: str, kill_on_timeout: bool) -> Any:
+        """Route op qua dedicated thread với BOUND timeout (fail-fast).
+
+        Hết timeout → op vẫn kẹt trên daemon worker (không cancel được) →
+        ``kill_on_timeout`` để reaper force-kill browser orphan, rồi raise
+        ``HybridBrowserPoolError`` cho ``run_hybrid_signup`` classify.
+        """
+        try:
+            return self._thread.run(fn, *args, timeout=timeout)
+        except concurrent.futures.TimeoutError as exc:
+            if kill_on_timeout:
+                self._reaper.kill_new(
+                    f"timeout:{op}", grace_seconds=_KILL_GRACE_SECONDS,
+                )
+            logger.warning(
+                "no-pool camoufox op TIMEOUT (%s > %.0fs) — kill=%s",
+                op, timeout, kill_on_timeout,
+            )
+            raise HybridBrowserPoolError(
+                f"camoufox op timeout ({op} > {timeout:.0f}s)"
+            ) from exc
 
     def set_device_id(self, device_id: str) -> None:
-        return self._thread.run(self._inner.set_device_id, device_id)
+        # set_device_id TRIGGER lazy launch (_ensure_page → Camoufox launch).
+        # Đây là khâu cold-launch nghi treo → bound LAUNCH timeout + kill orphan.
+        return self._run_bounded(
+            self._inner.set_device_id, device_id,
+            timeout=_LAUNCH_TIMEOUT_SECONDS, op="set_device_id/launch",
+            kill_on_timeout=True,
+        )
 
     def export_cookies(self) -> list[dict]:
-        return self._thread.run(self._inner.export_cookies)
+        return self._run_bounded(
+            self._inner.export_cookies,
+            timeout=_MINT_TIMEOUT_SECONDS, op="export_cookies",
+            kill_on_timeout=False,
+        )
 
     def mint_token(self, flow: str):
-        return self._thread.run(self._inner.mint_token, flow)
+        return self._run_bounded(
+            self._inner.mint_token, flow,
+            timeout=_MINT_TIMEOUT_SECONDS, op="mint_token",
+            kill_on_timeout=True,
+        )
 
     def mint_so(self, flow: str) -> str:
-        return self._thread.run(self._inner.mint_so, flow)
+        return self._run_bounded(
+            self._inner.mint_so, flow,
+            timeout=_MINT_TIMEOUT_SECONDS, op="mint_so",
+            kill_on_timeout=True,
+        )
 
     def close(self) -> None:
+        timed_out = False
         try:
-            self._thread.run(self._inner.close)
+            self._thread.run(
+                self._inner.close, timeout=_TEARDOWN_TIMEOUT_SECONDS,
+            )
+        except concurrent.futures.TimeoutError:
+            timed_out = True
+            logger.warning(
+                "no-pool close TIMEOUT >%.0fs — sẽ force-kill browser",
+                _TEARDOWN_TIMEOUT_SECONDS,
+            )
         except Exception as exc:  # noqa: BLE001 — close best-effort
             logger.warning("no-pool close failed: %s", exc)
         finally:
+            # Sweep: kill Firefox/Camoufox còn sống dù close treo HAY close
+            # "thành công" nhưng process không thực sự chết (orphan tích lũy là
+            # gốc bug multi-signup launch-hang). Chỉ chạm delta baseline.
+            self._reaper.kill_new(
+                "no-pool-close-timeout" if timed_out else "no-pool-close-sweep",
+                grace_seconds=_KILL_GRACE_SECONDS,
+            )
             self._thread.shutdown()

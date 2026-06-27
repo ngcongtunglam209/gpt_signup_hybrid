@@ -82,25 +82,32 @@ def build_token_generator(
             fallback no-pool path — pool tự handle launch options).
 
     Returns:
-        HybridContextHandle (default, pool enabled) hoặc CamoufoxTokenGenerator
-        (env ``HYBRID_POOL_DISABLED=1``). Cả 2 implement cùng interface, caller
+        CamoufoxTokenGenerator golden bọc ``_NoPoolThreadAffinityWrapper``
+        (**default** — no-pool, mỗi signup browser riêng) hoặc
+        HybridContextHandle (khi pool được OPT-IN qua Settings Store
+        ``reg.hybrid_pool_enabled=True``). Cả 2 implement cùng interface, caller
         không cần phân biệt.
 
-    Pool tradeoff:
-        - **Enabled (default)**: launch Camoufox 1 lần xuyên N signup cùng config,
+    Pool tradeoff (OPT-IN, KHÔNG còn là default):
+        - **No-pool (default)**: mỗi signup launch ``CamoufoxTokenGenerator``
+          golden riêng + close trong finally — KHỚP lifecycle golden
+          (``__main__.run_line``), tránh cluster fingerprint giữa account và
+          tránh hang do single-thread serialization của pool. Đánh đổi: cold
+          launch ~5-10s/signup.
+        - **Pool (opt-in)**: launch Camoufox 1 lần xuyên N signup cùng config,
           mỗi signup chỉ trả phí new_context() + page.goto(frame.html) + sdk.js
-          load ~2-3s thay vì cold launch 5-10s. Anti-cluster: mỗi context
-          isolated cookies/storage.
-        - **Disabled**: behavior cũ — mỗi signup launch Camoufox riêng. Dùng cho
-          debug khi muốn isolate state hoặc verify pool overhead.
+          load ~2-3s. CHỈ bật khi đã xác nhận fingerprint per-context đủ khác
+          và pool ổn định (không hang). Bật qua Settings Store key
+          ``reg.hybrid_pool_enabled``; env ``HYBRID_POOL_DISABLED=1`` override
+          cứng về no-pool.
     """
     from .browser_pool import (
-        _NoPoolThreadAffinityWrapper, get_pool, pool_disabled,
+        _NoPoolThreadAffinityWrapper, get_pool, pool_enabled,
     )
 
-    if pool_disabled():
-        # Fallback no-pool: launch Camoufox riêng mỗi signup. Bọc qua
-        # ``_NoPoolThreadAffinityWrapper`` để route mọi sync Playwright op
+    if not pool_enabled():
+        # DEFAULT no-pool: launch Camoufox riêng mỗi signup (khớp golden). Bọc
+        # qua ``_NoPoolThreadAffinityWrapper`` để route mọi sync Playwright op
         # qua 1 dedicated thread — bắt buộc vì caller (run_hybrid_signup) là
         # async coroutine + pre-mint thread chạy song song (cả 2 phải share
         # cùng 1 thread Camoufox, không thì Playwright sync API fail).
@@ -113,7 +120,7 @@ def build_token_generator(
         )
         return _NoPoolThreadAffinityWrapper(inner)
 
-    # Pool path: acquire BrowserContext isolated từ shared Camoufox.
+    # Pool path (OPT-IN): acquire BrowserContext isolated từ shared Camoufox.
     pool = get_pool()
     return pool.acquire(
         proxy=request.proxy,

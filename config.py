@@ -10,6 +10,13 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 
+# ─── Promo landing (link truy cập ban đầu — 3 mode reg) ───────────────
+# Mọi mode reg (browser / pure_request / hybrid) PHẢI truy cập link này đầu
+# tiên để gắn campaign "plus-1-month-free" vào session đăng ký (khớp user thật
+# click từ promo + đồng bộ với referer promo của payment flow).
+PROMO_LANDING_URL = "https://chatgpt.com/?promo_campaign=plus-1-month-free#pricing"
+
+
 # ─── Env parsing helpers ──────────────────────────────────────────────
 
 

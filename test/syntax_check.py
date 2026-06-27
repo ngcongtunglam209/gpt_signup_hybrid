@@ -23,6 +23,8 @@ _TARGETS: tuple[Path, ...] = (
     ROOT / "reg_hybrid" / "mail_adapter.py",
     ROOT / "reg_hybrid" / "camoufox_factory.py",
     ROOT / "reg_hybrid" / "browser_pool.py",
+    ROOT / "reg_hybrid" / "relay.py",
+    ROOT / "reg_hybrid" / "otp_loop.py",
     ROOT / "models.py",
     ROOT / "signup.py",
     ROOT / "cli.py",
@@ -33,6 +35,7 @@ _TARGETS: tuple[Path, ...] = (
     ROOT / "autoreg" / "runner.py",
     ROOT / "autoreg" / "schemas.py",
     ROOT / "request_phase.py",
+    ROOT / "test" / "run_hybrid_live_regdata.py",
 )
 
 

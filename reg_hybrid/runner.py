@@ -100,47 +100,50 @@ _SENTINEL_OBSERVER_MARKERS: tuple[str, ...] = (
 _SENTINEL_CACHE_TTL_SECONDS = 90.0
 
 
-# Module-level set giữ reference task background cleanup. Tránh ``asyncio`` GC
-# task chưa xong (cleanup chạy ~1-2s, caller có thể return trước đó). Done
-# callback tự gỡ task ra khỏi set khi xong.
+# Module-level set giữ reference task background cleanup (giữ cho public API
+# ``wait_pending_cleanups`` — caller live test/autoreg có thể dùng làm safety
+# net). Success path hiện cleanup ĐỒNG BỘ-có-timeout (xem ``_await_cleanup_bounded``)
+# nên set này thường rỗng; vẫn giữ API để không phá caller hiện có.
 _BACKGROUND_CLEANUP_TASKS: set[asyncio.Task] = set()
 
+# Cap thời gian chờ cleanup ĐỒNG BỘ ở success path. ``tokens.close()`` đã bound
+# nội bộ (teardown timeout + reaper force-kill) nên giá trị này chỉ là safety
+# net ngoài cùng: đủ rộng để close + SIGTERM→SIGKILL hoàn tất, không treo caller.
+_CLEANUP_WAIT_TIMEOUT_SECONDS = 45.0
 
-def _fire_and_forget_cleanup(
-    session: Any, tokens: Any, log: Callable[[str], None], *, name: str,
+
+async def _await_cleanup_bounded(
+    session: Any, tokens: Any, log: Callable[[str], None], *, timeout: float,
 ) -> None:
-    """Spawn background task cleanup KHÔNG block caller.
+    """Cleanup ĐỒNG BỘ-có-timeout: đợi browser/curl đóng (hoặc bị reaper kill)
+    XONG trước khi caller tiếp tục.
 
-    Dùng ở success path (caller đã có result, không cần đợi browser/curl close).
-    Pool runner đang giữ context tới khi task xong → race nhỏ với signup kế
-    tiếp acquire có thể tạo NEW context (browser shared, OK). atexit của pool
-    cover edge case process exit trước khi task hoàn thành.
+    Fix bug "multi-signup launch-hang": trước đây success path fire-and-forget
+    cleanup → signup N+1 launch Camoufox khi browser signup N CHƯA đóng →
+    orphan Firefox tích lũy → cạn tài nguyên → launch sau treo. Đợi đồng bộ
+    đảm bảo lifecycle browser tuần tự (đóng N → mới launch N+1). ``tokens.close()``
+    đã bound + force-kill nội bộ nên chờ này luôn kết thúc.
     """
     if session is None and tokens is None:
         return
     try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        # Không có loop → fallback chạy sync (cảnh báo nhưng không fail).
-        log(f"[hybrid] cleanup fallback sync (no running loop)")
-        try:
-            _cleanup(session, tokens, log)
-        except Exception as exc:  # noqa: BLE001
-            log(f"[hybrid] cleanup fallback raised (ignored): {exc}")
-        return
-    task = loop.create_task(
-        asyncio.to_thread(_cleanup, session, tokens, log),
-        name=name,
-    )
-    _BACKGROUND_CLEANUP_TASKS.add(task)
-    task.add_done_callback(_BACKGROUND_CLEANUP_TASKS.discard)
+        await asyncio.wait_for(
+            asyncio.to_thread(_cleanup, session, tokens, log), timeout,
+        )
+    except asyncio.TimeoutError:
+        # _cleanup tự bound (reaper đã force-kill browser) — không treo vô hạn.
+        log(
+            f"[hybrid] cleanup vượt {timeout:.0f}s — reaper đã xử lý kill browser, "
+            f"tiếp tục (không block signup kế tiếp)"
+        )
 
 
 async def wait_pending_cleanups(timeout: float = 5.0) -> None:
-    """Đợi mọi background cleanup task hoàn thành (best-effort).
+    """Đợi mọi background cleanup task hoàn thành (best-effort, public API).
 
     Use case: live test script / autoreg muốn đảm bảo browser/context đã đóng
-    sạch trước khi process exit. Pool atexit là safety net nhưng có lag.
+    sạch trước khi process exit. Success path nay cleanup đồng bộ nên set
+    thường rỗng → hàm này trả ngay; giữ để caller cũ không vỡ.
     """
     if not _BACKGROUND_CLEANUP_TASKS:
         return
@@ -551,11 +554,11 @@ async def run_hybrid_signup(
                     except Exception as exc:  # noqa: BLE001
                         log(f"[hybrid] on_checkpoint raised (ignored): {exc}")
 
-            # Pre-mint sentinel cache: patch tokens.mint_token/mint_so trả cache
-            # khi flow=oauth_create_account. Thread mint nền được spawn TRỄ qua
-            # ``on_otp_poll_start`` callback của HybridChatGPTRelay — đúng
-            # thời điểm OTP loop bắt đầu (sau register/otp_send xong).
-            premint_cache = _patch_tokens_cache(tokens, log)
+            # NOTE: pre-mint sentinel cache ĐÃ BỎ (anti-ban deferred ban fix).
+            # Lý do: pre-mint gọi sentinel/req flow="oauth_create_account"
+            # TRƯỚC OTP validate → server detect automation pattern → ban 1-24h.
+            # Golden flow: mint sentinel ngay tại create_account() call (SAU
+            # OTP validate OK). Không cần cache — mint ~2s là chấp nhận được.
 
             # ── HybridChatGPTRelay: subclass với smart OTP loop khớp pure_request ──
             # Phải import ở đây (không top-level) vì chatgpt_camoufox là optional
@@ -583,7 +586,7 @@ async def run_hybrid_signup(
                     int(request.otp_timeout_seconds // 120) + 2,
                 ),
                 timing_callback=_timing_cb,
-                on_otp_poll_start=lambda: _spawn_premint_thread(premint_cache, log),
+                on_otp_poll_start=None,  # BỎ pre-mint — anti-ban
                 log=log,
             )
 
@@ -721,12 +724,18 @@ async def run_hybrid_signup(
                 raise
         finally:
             # Cleanup chỉ khi result chưa return (artefact attempt cuối cùng) —
-            # case success đã return ở trên không vào đây nữa. Idempotent với
-            # cleanup ở except branch (session=None sau khi đóng). Fire-and-
-            # forget vì caller (signup.run_signup) đã có result, không cần đợi
-            # close ~1-2s. Background task vẫn được track qua module-level set.
-            _fire_and_forget_cleanup(
-                session, tokens, log, name=f"hybrid-cleanup-{request.email[:30]}",
+            # case success đã return ở trên VẪN chạy finally này (return trong
+            # try kích hoạt finally). Idempotent với cleanup ở except branch
+            # (session=None sau khi đóng → _await_cleanup_bounded no-op).
+            #
+            # Fix "multi-signup launch-hang": đợi ĐỒNG BỘ-có-timeout thay vì
+            # fire-and-forget. Đảm bảo browser signup này đóng (hoặc bị reaper
+            # kill) XONG trước khi caller (autoreg loop) launch signup kế tiếp →
+            # không tích lũy orphan Firefox. tokens.close() đã bound nội bộ nên
+            # chờ này không treo.
+            await _await_cleanup_bounded(
+                session, tokens, log,
+                timeout=_CLEANUP_WAIT_TIMEOUT_SECONDS,
             )
 
     # Không reachable lý thuyết — outer-loop luôn return trong cả success/fail.

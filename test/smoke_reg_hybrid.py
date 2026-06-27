@@ -102,7 +102,14 @@ def tc3_settings_validate() -> bool:
 
     def _existing_still_ok() -> None:
         _validate_type_constraint("reg_mode.current", "browser")
-        _validate_type_constraint("reg_mode.current", "pure_request")
+
+    def _pure_request_rejected() -> None:
+        # pure_request đã bị gỡ khỏi reg (2026) → validation phải reject.
+        try:
+            _validate_type_constraint("reg_mode.current", "pure_request")
+        except RepositoryError:
+            return
+        raise AssertionError("validate accept 'pure_request' (đã gỡ — phải reject)")
 
     def _bogus_rejected() -> None:
         try:
@@ -113,9 +120,10 @@ def tc3_settings_validate() -> bool:
 
     a = _check("[3.1] reg_mode.current trong _EXACT_KEYS", _key_in_whitelist)
     b = _check("[3.2] validate accept 'hybrid'", _hybrid_accepted)
-    c = _check("[3.3] validate accept 'browser' + 'pure_request' (backward compat)", _existing_still_ok)
+    c = _check("[3.3] validate accept 'browser'", _existing_still_ok)
     d = _check("[3.4] validate reject 'bogus'", _bogus_rejected)
-    return a and b and c and d
+    e = _check("[3.5] validate reject 'pure_request' (đã gỡ khỏi reg)", _pure_request_rejected)
+    return a and b and c and d and e
 
 
 def tc4_signup_routing() -> bool:
@@ -173,9 +181,11 @@ def tc5_cli_pattern() -> bool:
 
         assert _has("hybrid"), "cli.signup_cmd không validate 'hybrid'"
         assert _has("browser"), "cli.signup_cmd không validate 'browser'"
-        assert _has("pure_request"), "cli.signup_cmd không validate 'pure_request'"
+        assert not _has("pure_request"), (
+            "cli.signup_cmd vẫn còn 'pure_request' (đã gỡ khỏi reg)"
+        )
 
-    return _check("[5] cli.signup_cmd validate reg_mode bao gồm 'hybrid'", _scan)
+    return _check("[5] cli.signup_cmd validate reg_mode = browser+hybrid (pure_request đã gỡ)", _scan)
 
 
 def tc7_autoreg_wire() -> bool:

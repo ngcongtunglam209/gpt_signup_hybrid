@@ -22,15 +22,13 @@ class SignupRequest(BaseModel):
     )
 
     # Registration mode:
-    #   - "browser"      : full Camoufox/Playwright UI navigation (anti-detect, heavy).
-    #   - "pure_request" : HTTP-only via curl_cffi + QuickJS sentinel (fast, weaker FP).
-    #   - "hybrid"       : pure-HTTP curl_cffi impersonate Firefox + Camoufox chỉ mint
-    #                      sentinel sdk.js tokens (cân bằng giữa 2 mode trên).
+    #   - "browser" : full Camoufox/Playwright UI navigation (anti-detect, heavy).
+    #   - "hybrid"  : pure-HTTP curl_cffi impersonate Firefox + Camoufox chỉ mint
+    #                 sentinel sdk.js tokens (recommended — nhanh + session đầy đủ).
     reg_mode: str = Field(
         default="browser",
         description=(
-            "Registration mode: 'browser' (anti-detect Camoufox UI), "
-            "'pure_request' (HTTP-only QuickJS sentinel) hoặc "
+            "Registration mode: 'browser' (anti-detect Camoufox UI) hoặc "
             "'hybrid' (HTTP Firefox + Camoufox oracle, recommended)."
         ),
         pattern="^(browser|pure_request|hybrid)$",

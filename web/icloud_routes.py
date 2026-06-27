@@ -1181,7 +1181,7 @@ def build_icloud_router() -> APIRouter:
         # giữ pipeline mode đồng nhất per-process). Default "browser" để backward
         # compat khi key chưa từng set.
         reg_mode = str(all_settings.get("reg_mode.current") or "browser")
-        if reg_mode not in ("browser", "pure_request", "hybrid"):
+        if reg_mode not in ("browser", "hybrid"):
             reg_mode = "browser"
 
         config = AutoRegConfig(

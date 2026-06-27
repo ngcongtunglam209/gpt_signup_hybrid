@@ -10,8 +10,8 @@ Mục tiêu:
             settings_writes.
     [TC-07] Module-level ``PROXY_FROM_STEP`` constant vẫn = 3 (giữ
             backward-compat cho test cũ).
-    [TC-08] Step 1 login: ``proxy_from_step==1`` → login_proxy = first_proxy
-            (đồng bộ ``pay_upi_http._ProxyPolicy`` semantics).
+    [TC-08] Login UPI luôn direct (bám golden Get Session): ``login_proxy =
+            None`` bất kể proxy_from_step (proxy IN chỉ áp từ payment step).
 
 Mỗi TC log [PASS]/[FAIL] ngay, không gom cuối.
 """
@@ -146,25 +146,22 @@ def t07_const_unchanged():
 
 
 def t08_login_proxy_logic_source():
-    """Source-level check: step 1 login dùng login_proxy = first_proxy
-    when proxy_from_step <= 1.
+    """Source check: login UPI LUÔN direct (bám golden Get Session).
 
-    Đây là static check vì login flow chạy network — không thể smoke-test
-    end-to-end ở đây. Verify code đã đổi từ ``proxy=None`` cứng sang
-    conditional.
+    Golden ``get_session_pure_request`` login với proxy=None bất kể cấu hình.
+    UPI bám theo: ``login_proxy = None`` (proxy IN chỉ áp từ payment step theo
+    ``proxy_from_step``). Trước đây login qua proxy khi proxy_from_step<=1 → dễ
+    bị Cloudflare 403/captcha từ IP datacenter.
     """
     src = (ROOT / "web" / "upi_runner.py").read_text(encoding="utf-8")
-    assert "login_proxy = first_proxy if (proxy_from_step <= 1 and first_proxy) else None" in src, (
-        "login_proxy expression chưa cập nhật theo proxy_from_step"
+    assert "login_proxy = None" in src, (
+        "login_proxy phải = None (login luôn direct theo golden Get Session)"
+    )
+    assert "login_proxy = first_proxy if" not in src, (
+        "vẫn còn login_proxy conditional theo proxy_from_step (chưa bám golden)"
     )
     assert "proxy=login_proxy," in src, (
-        "get_session_pure_request chưa nhận proxy=login_proxy"
-    )
-    # Đảm bảo không còn `proxy=None,` cứng cho login (search vùng login).
-    login_block_start = src.index("get_session_pure_request(")
-    login_block = src[login_block_start:login_block_start + 500]
-    assert "proxy=None," not in login_block, (
-        "vẫn còn proxy=None cứng trong login block"
+        "login (login_fn / get_session_pure_request) chưa nhận proxy=login_proxy"
     )
 
 

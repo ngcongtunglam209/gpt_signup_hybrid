@@ -67,6 +67,7 @@ _EXACT_KEYS: frozenset[str] = frozenset([
     "reg.human_typing_delay_ms_min",    # int [40, 500]: min delay khi gõ form
     "reg.human_typing_delay_ms_max",    # int [60, 800]: max delay khi gõ form
     "reg.locale_auto_geo",              # bool: tự chọn locale theo proxy country
+    "reg.hybrid_pool_enabled",          # bool: OPT-IN share Camoufox pool cho hybrid (default no-pool)
     "proxy.pool", "proxy.rotation_mode",
     "proxy.probe_endpoint", "proxy.probe_timeout", "proxy.max_tries",
     "proxy.sid_len", "proxy.sid_retry_per_line", "proxy.probe_concurrency",
@@ -122,9 +123,9 @@ def _validate_type_constraint(key: str, value: Any) -> None:
         return
 
     if key == "reg_mode.current":
-        if not isinstance(value, str) or value not in ("browser", "pure_request", "hybrid"):
+        if not isinstance(value, str) or value not in ("browser", "hybrid"):
             raise RepositoryError(
-                "set", ValueError(f"{key}: must be str in {{\"browser\",\"pure_request\",\"hybrid\"}}, got {value!r}")
+                "set", ValueError(f"{key}: must be str in {{\"browser\",\"hybrid\"}}, got {value!r}")
             )
         return
 
@@ -138,7 +139,12 @@ def _validate_type_constraint(key: str, value: Any) -> None:
         return
 
     # --- Anti-ban hardening (journal 260625-1224) — bool group ---
-    if key in ("reg.fresh_profile", "reg.har_validate", "reg.locale_auto_geo"):
+    # ``reg.hybrid_pool_enabled``: OPT-IN bật shared Camoufox pool cho hybrid.
+    # Default (key vắng/None) = no-pool — mỗi signup launch CamoufoxTokenGenerator
+    # golden riêng (khớp lifecycle golden, tránh cluster fingerprint + hang do
+    # single-thread serialization của pool).
+    if key in ("reg.fresh_profile", "reg.har_validate", "reg.locale_auto_geo",
+               "reg.hybrid_pool_enabled"):
         if not isinstance(value, bool):
             raise RepositoryError(
                 "set", TypeError(f"{key}: must be bool, got {type(value).__name__}")

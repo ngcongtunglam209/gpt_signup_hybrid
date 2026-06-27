@@ -98,24 +98,60 @@ class HybridChatGPTRelay(ChatGPTRelay):
     # ── Override run() ────────────────────────────────────────────────
 
     def run(self) -> RelayResult:
-        # ── Phase 1: csrf → signin → authorize → register → otp_send ──
+        """Skeleton golden ``ChatGPTRelay.run()`` + đúng 2 điểm khác có chủ đích.
+
+        Mọi bước NGOÀI OTP gọi NGUYÊN method golden kế thừa (get_csrf/signin/
+        authorize/register/otp_send/create_account/callback/get_session) —
+        không thêm side-effect. Delta hybrid vs golden chỉ còn:
+            (1) Phase 0 ``_visit_promo_landing()`` — intentional, gắn campaign.
+            (2) Block OTP ``_acquire_and_validate_otp()`` — smart OTP loop thay
+                cho golden ``otp_reader.get_code() + otp_validate(code)``.
+        """
+        # ── Δ#1: promo landing (intentional) — khớp user thật click từ ad ──
+        self._visit_promo_landing()
+
+        # ── golden: csrf → signin → authorize → register → otp_send ──
         csrf = self.get_csrf()
         authorize_url = self.signin(csrf)
         self.authorize(authorize_url)
         self.register()
         self.otp_send()
 
-        # Báo runner spawn pre-mint thread (parallel với OTP poll). Đây là
-        # thay thế cho pattern cũ ``_setup_premint_cache`` patch
-        # ``otp_reader.get_code`` (subclass này không dùng otp_reader).
-        if self._on_otp_poll_start is not None:
-            try:
-                self._on_otp_poll_start()
-            except Exception as exc:  # noqa: BLE001
-                self._hybrid_log(
-                    f"[hybrid-relay] on_otp_poll_start raised (ignored): {exc}"
-                )
+        # ── Δ#2: smart OTP acquisition/verify loop (thay get_code+validate) ──
+        self._acquire_and_validate_otp()
 
+        # ── golden: create_account → callback → get_session ──
+        # create_account gọi method golden kế thừa ĐÚNG 1 LẦN/session. Nếu raise
+        # (sentinel reject / age / rate-limit) → để propagate lên
+        # run_hybrid_signup outer-loop classify như golden, KHÔNG re-POST.
+        callback_url = self.create_account()
+        self.callback(callback_url)
+        session_json = self.get_session()
+        cookies = self._dump_cookies()
+        return RelayResult(
+            session_json=session_json,
+            device_id=self.device_id,
+            cookies=cookies,
+            steps=list(self.steps),
+        )
+
+    # ── OTP block (delta có chủ đích duy nhất so với golden) ──────────
+
+    def _acquire_and_validate_otp(self) -> None:
+        """Smart OTP loop khớp pure_request — thay golden 1-shot get_code+validate.
+
+        Gồm: timing_callback otp_start/otp_end, acquire mã đầu (prefer_second_code),
+        verify-retry (pop pending / resend), human-like delay 2-4s mỗi verify,
+        refresh inbox lần cuối (prefer_newest_untried). Side-effect HTTP duy nhất:
+        ``/email-otp/send`` (resend) + ``/email-otp/validate`` (verify) — đúng
+        endpoint golden, chỉ khác ở SỐ LẦN gọi (resend/retry).
+
+        KHÔNG pre-mint sentinel cho create_account (anti-ban): pre-mint gọi
+        sentinel/req flow="oauth_create_account" TRƯỚC khi OTP validate → server
+        thấy client prep create_account trước lifecycle → deferred ban signal.
+        Golden mint sentinel CHỈ khi create_account được gọi (SAU OTP validate
+        OK). on_otp_poll_start callback bị skip — không spawn pre-mint thread.
+        """
         otp_started_at = datetime.now(timezone.utc).replace(microsecond=0)
         t_otp_start = time.monotonic()
         if self._timing_callback is not None:
@@ -221,73 +257,46 @@ class HybridChatGPTRelay(ChatGPTRelay):
                     f"[hybrid-relay] timing_callback otp_end raised: {exc}"
                 )
 
-        # ── Phase 2: create_account → callback → get_session ──
-        callback_url = self._create_account_with_retry()
-        self.callback(callback_url)
-        session_json = self.get_session()
-        cookies = self._dump_cookies()
-        return RelayResult(
-            session_json=session_json,
-            device_id=self.device_id,
-            cookies=cookies,
-            steps=list(self.steps),
-        )
-
     # ── Helpers ───────────────────────────────────────────────────────
 
-    def _create_account_with_retry(self) -> str:
-        """Wrap ``create_account`` với log response + retry fresh sentinel.
+    def _visit_promo_landing(self) -> None:
+        """GET promo landing đầu flow — gắn campaign plus-1-month-free + warm CF.
 
-        Lý do: pre-mint sentinel cache có TTL ~90s; nếu OTP poll kéo dài, mint
-        sentinel #2 đã stale → server trả response không có ``continue_url`` →
-        ``parse_callback_from_create_account`` raise ``ValueError``. Sửa bằng
-        cách bắt lỗi đó, mint sentinel FRESH (cache đã bị invalidate trong
-        ``_patched_mint_token`` khi stale), gọi lại 1 lần. Đồng thời log
-        response body để diagnose root cause nếu retry vẫn fail.
+        Navigation header (Sec-Fetch-Site=none, no referer) tự build TẠI ĐÂY —
+        KHÔNG gọi golden ``chatgpt_camoufox`` (package bất biến theo spec
+        reg-hybrid-deactivated-after-signup). Thứ tự field bám Firefox golden nav.
 
-        Idempotent với cache invalidate ở runner — nếu cache đã stale tại lần
-        đầu, ``_patched_mint_token`` đã mint mới rồi nên retry chỉ cần thiết
-        khi response bất thường khác (vd sentinel rejection, age restriction,
-        rate-limit).
+        LƯU Ý anti-ban: golden ``ChatGPTRelay.run()`` KHÔNG có bước GET home; đây
+        là request CỘNG THÊM (drift khỏi golden) theo yêu cầu gắn promo cho mọi
+        mode. Best-effort: lỗi KHÔNG fail flow — get_csrf vẫn chạy.
         """
+        from config import PROMO_LANDING_URL
+
+        h: dict = {
+            "User-Agent": self.profile.user_agent,
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            ),
+            "Accept-Language": self.profile.accept_language,
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Cookie": None,  # slot — _request fill từ jar đúng vị trí Firefox
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",  # vào từ ngoài (gõ/click link promo)
+            "Sec-Fetch-User": "?1",
+            "priority": "u=0, i",
+            "te": "trailers",
+        }
         try:
-            return self.create_account()
-        except ValueError as exc:
-            # Log payload thực tế để diagnose.
-            from chatgpt_camoufox.chatgpt_camoufox import (
-                fields as _ccx_fields, headers as _ccx_headers,
-            )
-            # Re-fire request 1 lần để lấy body log. KHÔNG dùng cache (đã invalidate).
+            self._get(PROMO_LANDING_URL, headers=h, allow_redirects=True)
             self._hybrid_log(
-                f"[hybrid-relay] create_account parse fail ({exc}) → fresh remint + retry"
+                "[hybrid-relay] promo landing visited (plus-1-month-free)"
             )
-            h = _ccx_headers.create_account(self.profile)
-            sentinel_token, so_token = self.build_sentinel_and_so_headers(
-                "oauth_create_account",
-            )
-            h["openai-sentinel-token"] = sentinel_token
-            if so_token:
-                h["openai-sentinel-so-token"] = so_token
-            r = self._post(
-                "https://auth.openai.com/api/accounts/create_account",
-                json={
-                    "name": self.account.resolved_name(),
-                    "birthdate": self.account.resolved_birthdate(),
-                },
-                headers=h,
-            )
-            body_text = getattr(r, "text", "") or ""
+        except Exception as exc:  # noqa: BLE001 — best-effort
             self._hybrid_log(
-                f"[hybrid-relay] create_account retry HTTP {r.status_code}: "
-                f"{body_text[:500]}"
+                f"[hybrid-relay] promo landing visit failed (continue): {exc}"
             )
-            try:
-                return _ccx_fields.parse_callback_from_create_account(r.json())
-            except Exception as exc_retry:
-                raise RuntimeError(
-                    f"create_account fail sau retry — HTTP {r.status_code} "
-                    f"body={body_text[:300]}"
-                ) from exc_retry
 
     def _otp_validate_soft(self, code: str) -> tuple[bool, int, str]:
         """Validate OTP — KHÔNG raise. Trả ``(ok, status, body)``.
