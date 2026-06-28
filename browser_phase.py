@@ -1073,6 +1073,46 @@ async def _drive_signup_flow(
                 continue
 
             body_str = json.dumps(body) if isinstance(body, dict) else (body_text or "")
+
+            # ── Detailed debug log khi register fail (status != 200) ──────
+            # Capture đầy đủ: URL, status, body, request headers, page state
+            # để post-mortem analysis khi invalid_auth_step/4xx xảy ra.
+            try:
+                _req = resp.request
+                _req_url = getattr(_req, "url", "?")
+                _req_method = getattr(_req, "method", "?")
+            except Exception:
+                _req_url = "?"
+                _req_method = "?"
+            try:
+                _resp_headers = dict(getattr(resp, "headers", {}))
+            except Exception:
+                _resp_headers = {}
+            log(
+                f"[flow] REGISTER FAIL DEBUG: status={status} "
+                f"req={_req_method} {_req_url} "
+                f"page_url={page.url} "
+                f"set_cookie={'Set-Cookie' in _resp_headers or 'set-cookie' in _resp_headers}"
+            )
+            log(f"[flow] REGISTER FAIL body: {body_str[:400]}")
+
+            # ── Detect "invalid_auth_step" (400) ──────────────────────────
+            # OpenAI trả code "invalid_auth_step" khi:
+            #   - Email đã có account (đã hoàn tất signup từ trước) → server từ
+            #     chối /register vì auth state machine không cho phép
+            #   - State machine bị out-of-sync (rare: session expired giữa load
+            #     và submit, force goto bypass step)
+            #
+            # request_phase.py line 1625 đã treat case này là "email đã đăng ký"
+            # cho HTTP flow. Browser flow mirror: fail-fast với message rõ ràng
+            # để autoreg mark email disabled (KHÔNG retry vô ích).
+            if status == 400 and "invalid_auth_step" in body_str.lower():
+                raise BrowserPhaseError(
+                    f"email {request.email} đã được đăng ký "
+                    f"(invalid_auth_step) — server từ chối /register vì auth "
+                    f"state không cho phép. Cần email mới để reg. URL: {page.url}"
+                )
+
             if "already" in body_str.lower() or "exists" in body_str.lower() or status == 409:
                 log(f"[flow] account already exists (HTTP {status}) — page sẽ chuyển login")
                 from _human_input import dwell as _dwell_exists
@@ -1146,7 +1186,13 @@ async def _drive_signup_flow(
             # → Force goto /create-account/password để buộc OpenAI render form
             # password input. Giới hạn 3 lần để tránh loop (server có thể
             # redirect ngược nếu screen_hint chỉ định OTP-only).
-            if not register_attempted and "auth.openai.com" in page.url:
+            #
+            # CRITICAL: KHÔNG fire khi login_attempted=True. Account ĐÃ tồn tại
+            # đi qua nhánh password_login → server ở state "login OTP verify",
+            # force goto /create-account/password sẽ làm server trả HTTP 400
+            # invalid_auth_step (state machine không cho phép signup từ login).
+            # Trong scenario này, OTP screen là HỢP LỆ — đây là login OTP.
+            if not register_attempted and not login_attempted and "auth.openai.com" in page.url:
                 if force_pwd_goto_count < _FORCE_PWD_GOTO_MAX:
                     # Thử đợi thêm 4s xem password button có render trễ không
                     # (race rare: SPA chunk JS late) trước khi force goto.
@@ -1354,11 +1400,15 @@ async def _drive_signup_flow(
             # thì resend 1 phát.
             resend_after_seconds = min(float(request.otp_resend_after_seconds), 60.0)
             resend_count = 0
-            # Resend tối đa 1 lần: HME delay cao, resend nhiều chỉ vô hiệu mã đang
-            # bay + spam → OpenAI rate-limit. Chỉ resend khi mail HOÀN TOÀN chưa về
-            # sau resend_after_seconds, KHÔNG resend chỉ vì code cũ lặp lại.
-            max_resends = 1
-            stale_poll_count = 0  # đếm lần poll chỉ nhận code cũ (chỉ để log)
+            # Resend tối đa 2 lần (tăng từ 1): scenario Step A đã click Resend
+            # trước khi vào re-poll, mailbox HME có thể stuck stale → cần force
+            # Resend lần 2 sau ~30s stale. Spam >2 Resend trigger OpenAI rate limit.
+            max_resends = 2
+            # Cap stale_poll_count: sau N polls chỉ thấy code cũ → force Resend.
+            # Mailbox HME đôi khi cache stale; force Resend reset trạng thái server.
+            _STALE_RESEND_THRESHOLD = 6  # ~30s với poll_interval=5s
+            _STALE_FATAL_THRESHOLD = 18  # ~90s — 3x threshold safety net, raise
+            stale_poll_count = 0  # đếm lần poll chỉ nhận code cũ
             while True:
                 # Nếu có codes pending chưa submit → thử từng cái
                 if pending_codes:
@@ -1402,11 +1452,41 @@ async def _drive_signup_flow(
                     pending_codes = new_codes
                     continue  # loop lại → pop từ pending_codes
                 if otp_code and otp_code in tried_codes:
-                    # Code cũ nằm lại mailbox là bình thường khi mail mới còn delay —
-                    # KHÔNG resend (resend chỉ vô hiệu mã mới đang bay). Cứ poll tiếp
-                    # cho tới khi code mới về hoặc hết otp_timeout.
                     stale_poll_count += 1
                     log(f"[flow] OTP={otp_code} đã thử rồi, chờ code mới... (lần {stale_poll_count})")
+
+                    # Safety net: stale quá lâu (~90s) → mailbox/server stuck,
+                    # raise để autoreg/manager pick email kế thay vì kẹt 5 phút.
+                    if stale_poll_count >= _STALE_FATAL_THRESHOLD:
+                        raise BrowserPhaseError(
+                            f"mailbox stuck với code cũ {otp_code} sau "
+                            f"{stale_poll_count} polls ({stale_poll_count * request.otp_poll_interval_seconds:.0f}s) — "
+                            f"server không gửi code mới hoặc HME relay hỏng. "
+                            f"Đã resend {resend_count}/{max_resends} lần."
+                        )
+
+                    # Trigger Resend khi stale lâu (force server gửi code mới).
+                    # Quota max_resends áp dụng — nếu hết, chỉ wait + retry timeout.
+                    if stale_poll_count >= _STALE_RESEND_THRESHOLD and resend_count < max_resends:
+                        resend_count += 1
+                        log(
+                            f"[flow] {stale_poll_count} polls liên tục chỉ thấy "
+                            f"code cũ — force Resend ({resend_count}/{max_resends})"
+                        )
+                        try:
+                            resend_btn = page.locator(
+                                'button:has-text("Resend"), a:has-text("Resend")'
+                            ).first
+                            await resend_btn.click(timeout=3000)
+                            log("[flow] clicked 'Resend email' (force sau stale)")
+                        except Exception as exc:
+                            log(f"[flow] resend button not found: {type(exc).__name__}: {exc}")
+                        # Reset stale counter + poll_started để chỉ nhận code mới
+                        stale_poll_count = 0
+                        poll_started = datetime.now(timezone.utc).replace(microsecond=0)
+                        await asyncio.sleep(2.0)
+                        continue
+
                     await asyncio.sleep(request.otp_poll_interval_seconds)
                     continue
                 # otp_code is None → hết resend_after_seconds mà KHÔNG có mail nào về

@@ -55,6 +55,19 @@ _NO_RETRY_ERROR_KEYS = (
     "AADSTS50034",
     "AADSTS50057",
     "combo dead",
+    # ── Permanent: email/account đã tồn tại — retry vô ích ─────────────
+    # OpenAI server signals dùng để identify account đã đăng ký từ trước.
+    # iCloud HME `+alias` được dedupe về base email → khi base đã reg,
+    # mọi alias mới đều bị từ chối. Retry không recover được.
+    #
+    # invalid_auth_step: server từ chối /register vì auth state không cho
+    #   phép (browser_phase raise "email X đã được đăng ký (invalid_auth_step)")
+    # user_already_exists: /about-you trả error_code này
+    # accountalreadyexistserror: exception class browser_phase raise
+    "invalid_auth_step",
+    "đã được đăng ký",
+    "user_already_exists",
+    "AccountAlreadyExistsError",
 )
 
 
@@ -4189,6 +4202,10 @@ _UPI_INTER_CYCLE_COOLDOWN = 10.0
 # sớm → re-login (chỉ áp dụng khi max_outer_cycles>1). 0 = off (chạy hết
 # approve_retries mới re-login). Default 12 ≈ 1 batch + buffer.
 _DEFAULT_UPI_RELOGIN_BLOCK_STREAK = 12
+# Login proxy URL RIÊNG cho Step 1 + 2 (geo-eligible cho promo plus) — empty
+# string = không override (luồng cũ: login DIRECT, Step 2 theo proxy_from_step).
+# User set qua Settings (UI input). Runtime fallback DIRECT nếu proxy dead.
+_DEFAULT_UPI_LOGIN_PROXY_URL = ""
 
 
 @dataclass
@@ -4295,6 +4312,7 @@ class UpiJobManager:
         self._proxy_from_step = _DEFAULT_UPI_PROXY_FROM_STEP
         self._max_outer_cycles = _DEFAULT_UPI_MAX_OUTER_CYCLES
         self._relogin_block_streak = _DEFAULT_UPI_RELOGIN_BLOCK_STREAK
+        self._login_proxy_url = _DEFAULT_UPI_LOGIN_PROXY_URL
         self._tasks: dict[str, asyncio.Task] = {}
         self._job_queue: asyncio.Queue[str] = asyncio.Queue()
         self._workers: list[asyncio.Task] = []
@@ -4392,6 +4410,42 @@ class UpiJobManager:
             raise ValueError("relogin_block_streak phải trong [0, 1000]")
         self._relogin_block_streak = n
 
+    @property
+    def login_proxy_url(self) -> str:
+        """Proxy URL áp riêng cho Step 1 (login) + Step 2 (checkout).
+
+        Empty string = không override (luồng cũ: login DIRECT, Step 2 theo
+        ``proxy_from_step``). Runtime tự fallback DIRECT nếu proxy dead.
+        """
+        return self._login_proxy_url
+
+    def set_login_proxy_url(self, value: str | None) -> None:
+        """Set login proxy URL. ``None``/empty/whitespace = clear (luồng cũ).
+
+        Validate format đồng bộ với ``db/repositories._is_valid_proxy_url`` —
+        scheme ∈ {http, https, socks5, socks5h}, host + port bắt buộc.
+        """
+        if value is None:
+            self._login_proxy_url = ""
+            return
+        if not isinstance(value, str):
+            raise ValueError(
+                f"login_proxy_url phải là str hoặc None, nhận {type(value).__name__}"
+            )
+        stripped = value.strip()
+        if stripped == "":
+            self._login_proxy_url = ""
+            return
+        if len(stripped) > 500:
+            raise ValueError("login_proxy_url quá dài (>500 ký tự)")
+        from db.repositories import _is_valid_proxy_url  # local import tránh cycle
+        if not _is_valid_proxy_url(stripped):
+            raise ValueError(
+                "login_proxy_url format sai, cần 'scheme://[user:pass@]host:port' "
+                "với scheme ∈ http/https/socks5/socks5h"
+            )
+        self._login_proxy_url = stripped
+
     def apply_settings(self, settings: dict) -> None:
         """Hydrate fields từ settings dict (startup boot)."""
         _hydrate_proxy_pool_from_settings(settings)
@@ -4431,6 +4485,18 @@ class UpiJobManager:
             val = int(settings["upi.relogin_block_streak"])
             if 0 <= val <= 1000:
                 self._relogin_block_streak = val
+        if "upi.login_proxy_url" in settings:
+            raw = settings["upi.login_proxy_url"]
+            # apply_settings best-effort hydrate — invalid value (sai format,
+            # quá dài, non-str) → bỏ qua, giữ default. Không raise vì startup
+            # path không nên break vì 1 setting xấu.
+            try:
+                self.set_login_proxy_url(raw if isinstance(raw, str) else None)
+            except ValueError as exc:
+                _log.warning(
+                    "UpiMgr: upi.login_proxy_url hydrate fail (%s) — giữ default empty",
+                    exc,
+                )
 
     # ── SSE broadcast ───────────────────────────────────────────────────
     def _broadcast(self, event: dict[str, Any]) -> None:
@@ -5066,6 +5132,7 @@ class UpiJobManager:
                 auth_sink=auth_sink,
                 login_fn=login_fn,
                 force_fresh=(cycle > 1),  # cycle re-login đổi IP → bỏ reuse cache
+                login_proxy_url=self._login_proxy_url or None,
             )
             job.cycle_count = cycle
             # Gộp attempts (tag cycle) — multi-cycle giữ full history.
