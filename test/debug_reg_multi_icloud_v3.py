@@ -40,6 +40,16 @@ _ACCOUNTS: list[str] = [
     "seemly.kettles_6v+27g5lz@icloud.com|https://icloud-cf-mail-v2.n5pskgzs9g.workers.dev/readmail/7OAPSM59ot6IoVx4QYphXwHKVD2buaka/data",
     "did.sirens_9a+8t8ka8o@icloud.com|https://icloud-cf-mail-v2.n5pskgzs9g.workers.dev/readmail/-yx068UnpcKdeokIqZ8cutlRokA-p0mH/data",
     "freest.woolens.50+92m7wd@icloud.com|https://icloud-cf-mail-v2.n5pskgzs9g.workers.dev/readmail/Ks5h4inAEGvE4OiiNGuPsY-va36yKKNV/data",
+    "splits-malt2j+xlx0r@icloud.com|https://icloud-cf-mail-v2.n5pskgzs9g.workers.dev/readmail/hJQVK6BKW1tM3CtptiUOjlgXH7M3cQAy/data",
+    "spar.octant4o+sy0p5q4@icloud.com|https://icloud-cf-mail-v2.n5pskgzs9g.workers.dev/readmail/9lolZPQ_aNP-LxW-R3vKoTHIr1b_-DRJ/data",
+    "seemly.kettles_6v+hrmc5@icloud.com|https://icloud-cf-mail-v2.n5pskgzs9g.workers.dev/readmail/RW37dHkmgF8LxEV47tt_a177pcQjw7aA/data",
+    "did.sirens_9a+5r4tc7h@icloud.com|https://icloud-cf-mail-v2.n5pskgzs9g.workers.dev/readmail/TMY4CBTwhFwrQ-s-trsezkpeB-3HTf3O/data",
+    "freest.woolens.50+eewqyt@icloud.com|https://icloud-cf-mail-v2.n5pskgzs9g.workers.dev/readmail/NW6IQBRSdTffjP3yYBYp46jFcYt_lj5s/data",
+    "splits-malt2j+m47kzm@icloud.com|https://icloud-cf-mail-v2.n5pskgzs9g.workers.dev/readmail/gQ6xkzHQjm-wn9F6KaRKysNP8lJkHR2b/data",
+    "spar.octant4o+fafp4dk@icloud.com|https://icloud-cf-mail-v2.n5pskgzs9g.workers.dev/readmail/dTASlMYrvcJ7QslYHAKE1vT2InlayEiB/data",
+    "seemly.kettles_6v+dzh7xl@icloud.com|https://icloud-cf-mail-v2.n5pskgzs9g.workers.dev/readmail/Dzc8BX86_63df4QWRVoDb2OO-PqMLF63/data",
+    "did.sirens_9a+o5b4g@icloud.com|https://icloud-cf-mail-v2.n5pskgzs9g.workers.dev/readmail/p53hBxm01wOkY9qy3dt5IX11trSgmG_6/data",
+    "freest.woolens.50+1zcq6s@icloud.com|https://icloud-cf-mail-v2.n5pskgzs9g.workers.dev/readmail/6RLjqQk5z7hBWsg999JkiUBGchWjbOfA/data",
 ]
 
 
