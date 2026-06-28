@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+from datetime import date, datetime
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -209,6 +210,99 @@ async def human_click(
     await locator.click(timeout=timeout_ms, delay=random.randint(10, 35))
 
 
+# ─────────────────────────────────────────────────────────────────────
+# /about-you birth field — year-of-birth vs age resolver
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _to_int(value: Any) -> Optional[int]:
+    """Parse str/number sang int, trả None nếu rỗng/không hợp lệ."""
+    try:
+        s = str(value).strip()
+        return int(s) if s else None
+    except (TypeError, ValueError):
+        return None
+
+
+def age_from_birthdate(birthdate: str, today: Optional[date] = None) -> int:
+    """Tính tuổi tròn từ birthdate ISO ``YYYY-MM-DD`` (UI rule: year diff, đã
+    qua sinh nhật năm nay chưa)."""
+    today = today or datetime.utcnow().date()
+    y, m, d = (int(x) for x in birthdate.split("-"))
+    return today.year - y - ((today.month, today.day) < (m, d))
+
+
+async def resolve_birth_field_value(
+    locator: Any,
+    birthdate: str,
+    *,
+    today: Optional[date] = None,
+    log: Optional[Callable[[str], None]] = None,
+) -> tuple[str, str]:
+    """Quyết định giá trị điền cho input number trên ``/about-you``.
+
+    OpenAI A/B test field này giữa 2 dạng (cùng ``name="age"``):
+      - **YEAR OF BIRTH**: ``min`` ≈ 1896, ``max`` ≈ (năm hiện tại − 13).
+        Validation: "Enter a valid year of birth" → phải điền NĂM SINH (vd
+        "1999"), KHÔNG phải tuổi.
+      - **AGE (tuổi)**: ``min`` ≈ 1, ``max`` ≈ 100/120 → điền TUỔI (vd "27").
+
+    Phân biệt bằng cách đọc ``min``/``max``/``name``/``placeholder`` thật của
+    element (fail-fast, không hardcode năm). Trả ``(value_str, kind)`` với
+    ``kind`` ∈ {"year", "age"}.
+
+    Args:
+        locator: Playwright Locator trỏ tới input number.
+        birthdate: chuỗi ISO ``YYYY-MM-DD``.
+        today: override ngày hôm nay (cho test).
+        log: optional logger.
+    """
+    _log = log or (lambda m: logger.debug(m))
+
+    parts = birthdate.split("-")
+    if len(parts) != 3:
+        raise ValueError(f"birthdate format sai (cần YYYY-MM-DD): {birthdate!r}")
+    year = parts[0]
+    age = age_from_birthdate(birthdate, today=today)
+
+    meta: dict[str, Any] = {}
+    try:
+        meta = await locator.evaluate(
+            "(el) => ({min: el.min || '', max: el.max || '', "
+            "name: el.name || '', placeholder: el.placeholder || '', "
+            "ariaLabel: el.getAttribute('aria-label') || ''})"
+        )
+    except Exception as exc:  # noqa: BLE001 — best-effort, fallback dưới
+        _log(f"[birth] đọc min/max input thất bại ({exc}) — đoán theo birthdate")
+
+    min_v = _to_int(meta.get("min"))
+    max_v = _to_int(meta.get("max"))
+    hints = " ".join(
+        str(meta.get(k, "")) for k in ("name", "placeholder", "ariaLabel")
+    ).lower()
+
+    # OpenAI đặt ``name="age"`` cho cả 2 dạng field → KHÔNG tin được tên field.
+    # Chỉ ``min``/``max`` dạng số mới phân biệt chắc chắn:
+    #   - YEAR OF BIRTH: max ≈ 2013 (>=1900) hoặc min ≈ 1896 (>=1000).
+    #   - AGE: max ≈ 100/120 (< 1900), hoặc chỉ có min nhỏ (< 1000).
+    # Mặc định YEAR (UI /about-you hiện tại) khi không có ràng buộc số rõ ràng —
+    # an toàn hơn vì điền tuổi vào field năm sinh là root cause của bug.
+    is_year = True
+    if max_v is not None and max_v < 1900:
+        is_year = False
+    elif max_v is None and min_v is not None and min_v < 1000:
+        is_year = False
+    # Nhãn nhắc tới năm sinh → ép year (override mọi suy đoán số phía trên).
+    if "year" in hints or "birth" in hints or "dob" in hints:
+        is_year = True
+    if is_year:
+        return year, "year"
+    return str(age), "age"
+
+
+# ─────────────────────────────────────────────────────────────────────
+
+
 async def random_mouse_wander(
     page: Any,
     *,
@@ -251,6 +345,7 @@ __all__ = [
     "human_click",
     "random_mouse_wander",
     "dwell",
+    "resolve_birth_field_value",
     "DEFAULT_DELAY_MIN_MS",
     "DEFAULT_DELAY_MAX_MS",
 ]

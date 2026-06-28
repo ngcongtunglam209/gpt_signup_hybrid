@@ -93,97 +93,10 @@ async ([kind, flow]) => {
 }
 """
 
-# Observer feeder script — fire synthetic DOM events liên tục để sentinel SDK
-# Observer (capture mousemove/scroll/click/focus/visibilitychange) có DATA khi
-# ``sessionObserverToken()`` được gọi.
-#
-# Tại sao cần: ``sentinel.openai.com/backend-api/sentinel/frame.html`` là page
-# TĨNH (iframe-only, no UI). Headless Camoufox không có user interaction nào
-# fire qua → Observer cache empty → SDK trả ``so`` rỗng → upstream raise
-# ``EnforcementError("sessionObserverToken() returned nothing")`` →
-# ``create_account`` thiếu ``openai-sentinel-so-token`` header (HAR golden
-# luôn có) → sentinel score thấp / bị anti-ban flag.
-#
-# Solution: ``setInterval`` synthetic events qua ``dispatchEvent``. Observer
-# subscribes thông qua ``addEventListener`` nên nhận synthetic events bình
-# thường (KHÔNG cần ``isTrusted=true`` — sdk OpenAI không check field này
-# theo HAR analysis).
-#
-# Side-effect khi page close: feeder không tự clear interval → KHÔNG leak vì
-# page close stops JS execution (Playwright BrowserContext lifecycle).
-_OBSERVER_FEEDER_JS = r"""
-(function() {
-  if (window.__hybrid_feeder_active) return;
-  window.__hybrid_feeder_active = true;
-  let counter = 0;
-  let x = 200, y = 200;
-  window.__hybrid_feeder_handle = setInterval(function() {
-    try {
-      counter++;
-      // Mouse jitter — Observer track mousemove qua document level.
-      const dx = (Math.random() - 0.5) * 30;
-      const dy = (Math.random() - 0.5) * 30;
-      x = Math.max(40, Math.min(1280, x + dx));
-      y = Math.max(40, Math.min(720, y + dy));
-      const mm = new MouseEvent('mousemove', {
-        clientX: x, clientY: y, screenX: x, screenY: y,
-        bubbles: true, cancelable: true, view: window,
-      });
-      (document.body || document).dispatchEvent(mm);
-      // Scroll mỗi 4 tick.
-      if (counter % 4 === 0) {
-        try { window.scrollBy(0, (Math.random() - 0.5) * 40); } catch (e) {}
-      }
-      // Focus/blur cycle mỗi 10 tick (Observer track visibility shifts).
-      if (counter % 10 === 0) {
-        try {
-          window.dispatchEvent(new Event('focus'));
-          document.dispatchEvent(new Event('visibilitychange'));
-        } catch (e) {}
-      }
-      // Click event mỗi 15 tick (Observer track click count).
-      if (counter % 15 === 0) {
-        try {
-          const click = new MouseEvent('click', {
-            clientX: x, clientY: y, bubbles: true, cancelable: true,
-            button: 0, view: window,
-          });
-          (document.body || document).dispatchEvent(click);
-        } catch (e) {}
-      }
-    } catch (e) {}
-  }, 200);
-})();
-"""
-
-# Prime burst — fire 1 burst events đầu để Observer warm-up trước khi feeder
-# interval kick in. Dùng khi cần mint_so ngay (vd retry empty).
-_OBSERVER_BURST_JS = r"""
-(function() {
-  let x = 150, y = 150;
-  for (let i = 0; i < 25; i++) {
-    try {
-      x = Math.max(40, Math.min(1280, x + (Math.random() - 0.5) * 50));
-      y = Math.max(40, Math.min(720, y + (Math.random() - 0.5) * 50));
-      const mm = new MouseEvent('mousemove', {
-        clientX: x, clientY: y, screenX: x, screenY: y,
-        bubbles: true, cancelable: true, view: window,
-      });
-      (document.body || document).dispatchEvent(mm);
-    } catch (e) {}
-  }
-  try {
-    window.scrollBy(0, 50);
-    window.dispatchEvent(new Event('focus'));
-    document.dispatchEvent(new Event('visibilitychange'));
-    const click = new MouseEvent('click', {
-      clientX: x, clientY: y, bubbles: true, cancelable: true,
-      button: 0, view: window,
-    });
-    (document.body || document).dispatchEvent(click);
-  } catch (e) {}
-})();
-"""
+# NOTE: Observer feeder/burst (synthetic DOM events) đã được GỠ BỎ — golden
+# ``CamoufoxTokenGenerator`` mint ``so`` trên page TĨNH headless KHÔNG feed event
+# nào và vẫn ra token hợp lệ. Feeder cũ chỉ tạo signature máy móc lệch golden
+# (drift nhánh B / soTokenFromSyntheticEvents). Pool path nay bám golden.
 
 # Idle TTL — browser stay alive sau khi context cuối close. Sau TTL idle, browser
 # tự shutdown. Đặt 5 min để cover gap giữa các signup trong cùng AutoReg cycle.
@@ -454,23 +367,11 @@ class _CamoufoxRunner:
             raise HybridBrowserPoolError(
                 f"sentinel bridge init failed: {err_text or exc}"
             ) from exc
-        # ── Prime sentinel SDK Observer với feeder DOM events ────────
-        # SDK ``sessionObserverToken`` cần Observer cache có data (mousemove,
-        # scroll, click, focus, visibilitychange). Page sentinel.openai.com
-        # /frame.html là tĩnh + headless → 0 user interaction → cache empty
-        # → mint_so trả empty → upstream raise.
-        #
-        # Inject feeder script (xem _OBSERVER_FEEDER_JS) — setInterval 200ms
-        # fire synthetic events qua dispatchEvent. Observer track qua
-        # addEventListener nên nhận synthetic events bình thường (verified
-        # qua HAR — sdk không check isTrusted).
-        try:
-            page.evaluate(_OBSERVER_FEEDER_JS)
-            # Wait 1.5s để feeder fire ~7 ticks events đầu → Observer cache
-            # có data trước khi caller mint_so (pre-mint thread).
-            page.wait_for_timeout(1500)
-        except Exception as exc:  # noqa: BLE001 — best-effort prime
-            logger.warning("Observer feeder inject non-fatal: %s", exc)
+        # Setup page KHỚP golden ``CamoufoxTokenGenerator._ensure_page``: goto
+        # frame.html → add sdk.js + harness → wait ``#__sentinel_bridge_ready``.
+        # KHÔNG inject synthetic DOM events — golden mint ``so`` trên page TĨNH
+        # headless và vẫn ra token hợp lệ, nên Observer feeder cũ chỉ tạo signature
+        # máy móc lệch golden (drift nhánh B). Bỏ feeder để bám golden.
         return HybridContextHandle(runner=self, context=context, page=page)
 
     def _release_context_in_thread(self, handle: "HybridContextHandle") -> None:
@@ -661,51 +562,26 @@ class HybridContextHandle:
     def _mint_so_in_thread(self, flow: str) -> str:
         from chatgpt_camoufox.chatgpt_camoufox.camoufox_vm import EnforcementError
 
-        # Đầu tiên: thử mint thẳng. Feeder script chạy nền nên Observer thường
-        # đã có data. Nếu lần này empty → fire burst events + retry 1 lần.
-        for attempt in (1, 2):
+        # Mint ``so`` KHỚP golden ``CamoufoxTokenGenerator.mint_so``: 1 lần bridge
+        # call ``sessionObserverToken(flow)`` trên page tĩnh, KHÔNG synthetic
+        # event, KHÔNG retry-burst. Empty → raise như golden để caller xử lý.
+        try:
+            result = self.page.evaluate(_BRIDGE_CALL, ["so", flow])
+        except Exception as exc:
+            raise EnforcementError(f"page.evaluate failed: {exc}") from exc
+        if not result or not result.get("ok"):
+            raise EnforcementError(
+                (result or {}).get("err") or "sessionObserverToken() failed"
+            )
+        val = result.get("value")
+        if isinstance(val, dict):
+            return val.get("so", "")
+        if isinstance(val, str) and val:
             try:
-                result = self.page.evaluate(_BRIDGE_CALL, ["so", flow])
-            except Exception as exc:
-                raise EnforcementError(f"page.evaluate failed: {exc}") from exc
-            if not result or not result.get("ok"):
-                # SDK lỗi (KHÔNG phải empty so) → raise ngay, retry vô ích.
-                raise EnforcementError(
-                    (result or {}).get("err") or "sessionObserverToken() failed"
-                )
-            val = result.get("value")
-            if isinstance(val, dict):
-                so = val.get("so", "")
-            elif isinstance(val, str) and val:
-                try:
-                    so = json.loads(val).get("so", val)
-                except Exception:
-                    so = val
-            else:
-                so = ""
-
-            if so:
-                return so
-
-            # Empty so → fire burst events + wait 800ms cho Observer collect,
-            # rồi retry. Chỉ retry 1 lần (attempt 1 → 2). Vẫn empty ở attempt
-            # 2 → raise để caller (HybridChatGPTRelay.build_sentinel_and_so_headers)
-            # quyết định: catch → so_token=None (fallback) hay propagate.
-            if attempt == 1:
-                logger.warning(
-                    "sessionObserverToken empty (attempt 1) → fire burst + retry"
-                )
-                try:
-                    self.page.evaluate(_OBSERVER_BURST_JS)
-                    self.page.wait_for_timeout(800)
-                except Exception as exc:
-                    logger.warning("burst events non-fatal: %s", exc)
-                continue
-
-        raise EnforcementError(
-            "sessionObserverToken() returned nothing sau retry với burst events "
-            "— Observer cache empty (page có thể bị throttle hoặc sdk reject)"
-        )
+                return json.loads(val).get("so", val)
+            except Exception:
+                return val
+        raise EnforcementError("sessionObserverToken() returned nothing")
 
     # ── CamoufoxTokenGenerator interface — route qua dedicated thread ─
 

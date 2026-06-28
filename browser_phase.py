@@ -1716,6 +1716,46 @@ async def _detect_about_you_form_error(page) -> str | None:
     return None
 
 
+async def _refill_about_you_birth(page, *, birthdate: str, log) -> bool:
+    """Điền lại field ngày sinh/năm sinh trên /about-you với giá trị ĐÚNG.
+
+    Gọi khi form báo lỗi validation năm sinh ("Enter a valid year of birth"):
+    submit lại cùng giá trị sai là vô nghĩa — phải sửa input trước. Đọc
+    min/max để biết field cần NĂM SINH hay TUỔI. Trả True nếu re-fill được.
+    """
+    from _human_input import (
+        human_type as _human_type,
+        resolve_birth_field_value,
+    )
+
+    # Date input → fill atomic
+    try:
+        date_loc = page.locator('input[type="date"]').first
+        if await date_loc.is_visible(timeout=200):
+            await page.fill('input[type="date"]', birthdate)
+            log(f"[browser] re-filled birthday={birthdate} (sau form error)")
+            return True
+    except Exception:
+        pass
+
+    for sel in ('input[name="age"]', 'input[type="number"]', 'input[inputmode="numeric"]'):
+        try:
+            loc = page.locator(sel).first
+            if not await loc.is_visible(timeout=200):
+                continue
+        except Exception:
+            continue
+        try:
+            value, kind = await resolve_birth_field_value(loc, birthdate, log=log)
+            await loc.fill("")
+            await _human_type(loc, value, delay_min_ms=40, delay_max_ms=100, log=log)
+            log(f"[browser] re-filled {kind}={value} (sau form error)")
+            return True
+        except Exception as exc:
+            log(f"[browser] re-fill birth field failed ({sel}): {exc}")
+    return False
+
+
 async def _log_about_you_dom(page, *, log) -> None:
     """Log DOM snapshot nhẹ của /about-you form khi hết retry — giúp debug."""
     try:
@@ -1790,7 +1830,11 @@ async def _fill_about_you(page, *, name: str, birthdate: str, timeout_seconds: f
     page.on("response", _on_resp)
     try:
         # ── Human typing helpers (anti-ban Task 2.2) ──
-        from _human_input import human_type as _human_type, dwell as _dwell
+        from _human_input import (
+            human_type as _human_type,
+            dwell as _dwell,
+            resolve_birth_field_value,
+        )
 
         # Name input
         name_input = None
@@ -1809,13 +1853,10 @@ async def _fill_about_you(page, *, name: str, birthdate: str, timeout_seconds: f
         await _human_type(name_loc, name, delay_min_ms=40, delay_max_ms=100, log=log)
         await _dwell(0.2, 0.5)  # tab/look at next field
 
-        # Age (parse from birthdate)
-        try:
-            year, month, day = birthdate.split("-")
-            today = datetime.utcnow()
-            age = today.year - int(year) - ((today.month, today.day) < (int(month), int(day)))
-        except ValueError as exc:
-            raise BrowserPhaseError(f"birthdate format sai: {birthdate}") from exc
+        # Birth field (parse from birthdate). Validate format fail-fast; giá
+        # trị thực (năm sinh vs tuổi) quyết định lúc điền theo min/max của input.
+        if len(birthdate.split("-")) != 3:
+            raise BrowserPhaseError(f"birthdate format sai: {birthdate}")
 
         # Try date input first, fallback to age number input. Probe ngắn 600ms:
         # khi đã gõ xong name thì form render xong rồi, không cần chờ 1.5s.
@@ -1840,19 +1881,25 @@ async def _fill_about_you(page, *, name: str, birthdate: str, timeout_seconds: f
                     continue
             if age_input:
                 age_loc = page.locator(age_input).first
-                await _human_type(age_loc, str(age), delay_min_ms=40, delay_max_ms=100, log=log)
-                log(f"[browser] human-typed age={age}")
+                # OpenAI A/B test: field number có thể là NĂM SINH (min 1896,
+                # validation "Enter a valid year of birth") HOẶC TUỔI — đọc
+                # min/max để điền đúng (resolve_birth_field_value).
+                value, kind = await resolve_birth_field_value(age_loc, birthdate, log=log)
+                await _human_type(age_loc, value, delay_min_ms=40, delay_max_ms=100, log=log)
+                log(f"[browser] human-typed {kind}={value}")
             else:
-                # Fallback: Tab + keyboard type
+                # Fallback: Tab + keyboard type. Không có loc để đọc min/max →
+                # điền NĂM SINH (UI /about-you hiện tại là year-of-birth).
                 await page.keyboard.press("Tab")
                 await _dwell(0.2, 0.5)
                 # Keyboard type with random delay per char (giảm tốc độ)
                 import random as _rand
-                for ch in str(age):
+                birth_year = birthdate.split("-")[0]
+                for ch in birth_year:
                     await page.keyboard.type(
                         ch, delay=_rand.randint(40, 100),
                     )
-                log(f"[browser] Tab + human-typed age={age}")
+                log(f"[browser] Tab + human-typed year={birth_year}")
 
         # Handle unchecked checkboxes/TOS trước submit — OpenAI có thể thêm field mới
         await _check_about_you_extras(page, log=log)
@@ -1952,6 +1999,14 @@ async def _fill_about_you(page, *, name: str, birthdate: str, timeout_seconds: f
                                 raise BrowserPhaseError(
                                     f"/about-you fatal error_code: {fatal_code}"
                                 )
+                        # Validation field ngày sinh ("Enter a valid year of
+                        # birth") → re-fill ĐÚNG giá trị (năm sinh/tuổi) thay vì
+                        # spam submit cùng input sai (root cause timeout 60s).
+                        if any(k in err_lower for k in (
+                            "year of birth", "date of birth", "birth",
+                            "valid age", "your age",
+                        )):
+                            await _refill_about_you_birth(page, birthdate=birthdate, log=log)
                     # Re-check extras (checkbox/TOS xuất hiện sau render)
                     await _check_about_you_extras(page, log=log)
                     # Thử submit lại với chiến thuật escalating

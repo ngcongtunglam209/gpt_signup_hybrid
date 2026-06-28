@@ -209,6 +209,77 @@ async def _resolve_job_proxy(log=None, *, knobs: dict | None = None) -> tuple[st
     return (url, line)
 
 
+async def _acquire_job_proxy_lease(
+    log=None,
+    *,
+    knobs: dict | None = None,
+    bad_format_retries: int = 3,
+) -> tuple[str | None, str | None, bool]:
+    """Lease 1 proxy cho 1 job — KHÁC ``_resolve_job_proxy`` ở chỗ dùng
+    ``pool.acquire()`` (least-used + no-immediate-repeat) thay ``pool.pick()``
+    cho mode ``round_robin``/``random``.
+
+    Khi N job song song với ≥N proxy live → mỗi job 1 IP riêng (lease=0 cho
+    mỗi proxy mới). Vượt quá: job thừa nhận proxy ít tải nhất.
+
+    Trả ``(url, line, requires_release)``:
+
+    - ``probe`` mode → fallback ``acquire_live_proxy`` (health-check + SID-rotate)
+      như cũ. KHÔNG dùng ``pool.acquire`` → ``requires_release=False``.
+    - ``round_robin`` / ``random`` → ``pool.acquire()`` + ``materialize_proxy``.
+      Format rác → ``mark_dead`` line + thử ``bad_format_retries`` lần.
+      Acquire thành công → ``requires_release=True``; caller PHẢI gọi
+      ``_release_job_proxy_lease(line, True)`` ở finally để giảm lease.
+
+    Pool rỗng / cạn retry → ``(None, None, False)`` (caller → direct).
+    """
+    pool = get_proxy_pool()
+    if pool.mode == "probe":
+        knobs = knobs or _current_proxy_knobs()
+        url, line = await acquire_live_proxy(
+            pool, log=log, **_acquire_kwargs(knobs)
+        )
+        return (url, line, False)
+
+    from .proxy_format import materialize_proxy
+
+    # round_robin / random — least-used acquire + materialize. Format rác
+    # (template/colon hỏng) → trả lease + mark_dead, thử proxy khác. Cap
+    # ``bad_format_retries`` để không loop vô tận khi cả pool format rác.
+    for _ in range(max(1, int(bad_format_retries))):
+        line = pool.acquire()
+        if not line:
+            return (None, None, False)
+        try:
+            url = materialize_proxy(line)
+        except ValueError:
+            if log:
+                log(f"[proxy] bad format {_mask_proxy(line)} — drop line")
+            # Trả lease TRƯỚC khi mark_dead để leases dict không lệch
+            # (mark_dead chỉ thêm vào _dead set, không touch _leases).
+            pool.release(line)
+            pool.mark_dead(line)
+            continue
+        return (url, line, True)
+    return (None, None, False)
+
+
+def _release_job_proxy_lease(line: str | None, requires_release: bool) -> None:
+    """Trả lease cho proxy đã acquire qua ``_acquire_job_proxy_lease``.
+
+    Idempotent + safe để gọi vô điều kiện trong finally:
+    - ``requires_release=False`` (probe mode hoặc pool rỗng) → no-op.
+    - ``line=None`` → no-op.
+
+    KHÔNG tự gate theo ``pool.mode`` hiện tại vì mode có thể đổi giữa
+    acquire/release (user save Settings) — dùng flag ``requires_release``
+    đã capture lúc acquire để release deterministic.
+    """
+    if not requires_release or not line:
+        return
+    get_proxy_pool().release(line)
+
+
 async def run_with_proxy_rotation(
     func,
     *,

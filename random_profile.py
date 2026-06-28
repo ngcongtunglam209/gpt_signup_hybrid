@@ -92,22 +92,40 @@ def random_password(*, length: int = 12) -> str:
     return f"{upper}{middle}{end}"
 
 
-def random_profile() -> dict:
-    """Combo random: name + age + password + birthdate (compute từ age)."""
+# Ngày sinh mặc định (yêu cầu user): năm cố định 1999, NGÀY và THÁNG random
+# trong [1, 12]. Giới hạn ≤ 12 để "swap-safe" — nếu form/locale hiểu nhầm thứ
+# tự DD/MM ↔ MM/DD thì giá trị vẫn luôn hợp lệ (không bao giờ sinh ngày/tháng
+# > 12). ``age`` được compute lại từ birthdate để DB/log nhất quán.
+DEFAULT_BIRTH_YEAR = 1999
+
+
+def _default_birthdate() -> str:
+    """Birthdate mặc định ISO ``YYYY-MM-DD``: năm 1999, ngày+tháng random [1,12]."""
+    month = secrets.randbelow(12) + 1   # 1..12
+    day = secrets.randbelow(12) + 1     # 1..12 (≤12 → swap-safe với tháng)
+    return f"{DEFAULT_BIRTH_YEAR:04d}-{month:02d}-{day:02d}"
+
+
+def _age_from_birthdate(birthdate: str) -> int:
+    """Tuổi tròn tính từ birthdate ISO ``YYYY-MM-DD`` (UI rule: year diff, đã
+    qua sinh nhật năm nay chưa)."""
     from datetime import datetime
-    age = random_age()
+    y, m, d = (int(x) for x in birthdate.split("-"))
+    today = datetime.utcnow()
+    return today.year - y - ((today.month, today.day) < (m, d))
+
+
+def random_profile() -> dict:
+    """Combo profile: name + password random, birthdate năm 1999 + ngày/tháng
+    random ≤ 12 (swap-safe)."""
     name = random_full_name()
     password = random_password()
-    today = datetime.utcnow()
-    birth_year = today.year - age
-    # Chọn ngày random trong năm để tránh trùng
-    month = secrets.randbelow(12) + 1
-    day = secrets.randbelow(28) + 1
+    birthdate = _default_birthdate()
     return {
         "name": name,
-        "age": age,
+        "age": _age_from_birthdate(birthdate),
         "password": password,
-        "birthdate": f"{birth_year:04d}-{month:02d}-{day:02d}",
+        "birthdate": birthdate,
     }
 
 
@@ -213,28 +231,22 @@ def random_india_profile() -> dict:
     name, first_name, last_name, age, password, birthdate, phone,
     address_line1, city, state, postal_code, country, country_code.
     """
-    from datetime import datetime
-
     first = secrets.choice(_IN_FIRST_NAMES)
     last = secrets.choice(_IN_LAST_NAMES)
-    age = random_age()
-    today = datetime.utcnow()
-    birth_year = today.year - age
-    month = secrets.randbelow(12) + 1
-    day = secrets.randbelow(28) + 1
 
     city, state, pin_prefix = secrets.choice(_IN_CITIES)
     house_no = secrets.randbelow(999) + 1
     street = secrets.choice(_IN_STREETS)
     postal_code = f"{pin_prefix}{secrets.randbelow(100):02d}"
 
+    birthdate = _default_birthdate()
     return {
         "name": f"{first} {last}",
         "first_name": first,
         "last_name": last,
-        "age": age,
+        "age": _age_from_birthdate(birthdate),
         "password": random_password(),
-        "birthdate": f"{birth_year:04d}-{month:02d}-{day:02d}",
+        "birthdate": birthdate,
         "phone": random_india_phone(),
         "address_line1": f"{house_no}, {street}",
         "city": city,

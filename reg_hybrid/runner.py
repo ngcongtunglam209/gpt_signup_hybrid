@@ -82,6 +82,13 @@ _CF_BLOCK_MARKERS: tuple[str, ...] = (
     "attention required",
 )
 
+# Proxy dead: connection refused / timeout / TLS handshake fail QUA proxy.
+# Không retry trong hybrid (rotate firefox_major vô nghĩa khi proxy chết) —
+# fail-fast để autoreg outer-loop acquire proxy mới. Re-export từ
+# ``_browser_retry.NETWORK_ERROR_MARKERS`` (single source of truth) để chiến
+# lược classify nhất quán với mark_dead helper ở autoreg.
+from _browser_retry import NETWORK_ERROR_MARKERS as _PROXY_DEAD_MARKERS  # noqa: E402
+
 # Sentinel SO empty / Observer chưa fire đủ events → context page có thể bị
 # throttle. Retry với fresh BrowserContext (acquire mới = page mới + feeder
 # script fresh) thường thoát.
@@ -257,9 +264,17 @@ def _classify_error(exc: BaseException) -> str:
       với impersonate khác.
     - ``"sentinel_observer"``: sentinel SO empty / Observer chưa fire đủ DOM
       events. Retry với fresh BrowserContext (feeder script fresh từ đầu).
+    - ``"proxy_dead"``: proxy connection refused / timeout / TLS fail qua
+      proxy (NS_ERROR_PROXY_*, ERR_PROXY_*, curl 7/28/35/56/97). Fail-fast —
+      rotate firefox_major không giúp khi proxy chết; autoreg outer-loop sẽ
+      mark_dead + acquire proxy mới cho attempt kế tiếp.
     - ``"terminal"``: combo dead / OTP timeout / pydantic validation. KHÔNG retry.
     """
     msg = str(exc).lower()
+    # Proxy check trước CF — `NS_ERROR_PROXY_CONNECTION_REFUSED` có khi server
+    # phía sau là Cloudflare; nếu hit CF_BLOCK_MARKERS trước sẽ rotate UA vô ích.
+    if any(m.lower() in msg for m in _PROXY_DEAD_MARKERS):
+        return "proxy_dead"
     if any(m in msg for m in _INVALID_STATE_MARKERS):
         return "invalid_state"
     if any(m in msg for m in _CF_BLOCK_MARKERS):
@@ -697,8 +712,10 @@ async def run_hybrid_signup(
             tokens = None
 
             # Quyết định retry: chỉ retry invalid_state / cf_block, và chưa hết
-            # attempt budget.
-            if attempt >= max_attempts or category == "terminal":
+            # attempt budget. ``proxy_dead`` fail-fast (rotate firefox_major
+            # không giúp khi proxy chết) — autoreg outer-loop sẽ mark_dead +
+            # acquire proxy mới cho attempt kế tiếp.
+            if attempt >= max_attempts or category in ("terminal", "proxy_dead"):
                 result.success = False
                 result.error = f"{type(exc).__name__}: {exc}"
                 # Nếu đã hết OTP timing, vẫn ghi phase1/phase2 best-effort để

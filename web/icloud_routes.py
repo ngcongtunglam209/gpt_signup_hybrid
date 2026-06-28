@@ -1197,6 +1197,10 @@ def build_icloud_router() -> APIRouter:
             auto_retry_max=int(all_settings.get("reg.auto_retry_max", 3)),
             auto_retry_delay=float(all_settings.get("reg.auto_retry_delay", 30)),
             reg_mode=reg_mode,
+            # Default True khi setting chưa có (backward compat: pool đã hoạt
+            # động khi key này được thêm vào allowlist). User tắt = autoreg
+            # bypass pool, mirror JobManager._use_proxy cho UI manual reg.
+            use_proxy=bool(all_settings.get("reg.use_proxy", True)),
         )
         await _autoreg_runner.start(config)
 

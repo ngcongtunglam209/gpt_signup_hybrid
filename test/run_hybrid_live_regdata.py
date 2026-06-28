@@ -48,8 +48,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 
-# ─── 5 dòng reg data user cung cấp (email|api_url icloud_v3) ──────────
-LINES: list[str] = [
+# ─── Reg data fallback (email|api_url icloud_v3) ─────────────────────
+# LINES được nạp động: ưu tiên file input_lines.txt (mỗi dòng `email|url`),
+# fallback hằng _FALLBACK_LINES dưới đây nếu file không tồn tại / rỗng.
+_FALLBACK_LINES: list[str] = [
     "blog.pod_36+8pjb9p@icloud.com|https://icloud-cf-mail-v2.n5pskgzs9g.workers.dev/readmail/rbH7JDLf1uMxsEpqQfuQ-9GclVPddc2M/data",
     "blog.pod_36+aupcv@icloud.com|https://icloud-cf-mail-v2.n5pskgzs9g.workers.dev/readmail/_HbsUPnYX7EbOfrPhC2HLUY7ymO2gqQA/data",
     "blog.pod_36+gl48bl@icloud.com|https://icloud-cf-mail-v2.n5pskgzs9g.workers.dev/readmail/eXOshjYH5fDmI-nV1IZGaQkvMwm1h13C/data",
@@ -61,6 +63,33 @@ REG_MODE = "hybrid"
 MAIL_MODE = "icloud_v3"
 
 OUT_DIR = ROOT / "runtime" / "live_hybrid_regdata"
+ACCOUNTS_FILE = OUT_DIR / "accounts.txt"
+INPUT_LINES_FILE = OUT_DIR / "input_lines.txt"
+_NO_2FA_MARKER = "<NO_2FA>"
+
+
+def _load_lines() -> list[str]:
+    """Nạp danh sách dòng reg.
+
+    Ưu tiên đọc INPUT_LINES_FILE nếu tồn tại: mỗi dòng non-empty là 1 account,
+    bỏ qua dòng trống và dòng comment bắt đầu bằng '#'. Nếu file không tồn tại
+    hoặc rỗng → fallback hằng _FALLBACK_LINES.
+    """
+    if INPUT_LINES_FILE.exists():
+        raw = INPUT_LINES_FILE.read_text(encoding="utf-8")
+        parsed: list[str] = []
+        for ln in raw.splitlines():
+            s = ln.strip()
+            if not s or s.startswith("#"):
+                continue
+            parsed.append(s)
+        if parsed:
+            return parsed
+    return list(_FALLBACK_LINES)
+
+
+# LINES nạp tại import-time; main() sẽ refresh lại trước khi build entries.
+LINES: list[str] = _load_lines()
 
 # Recheck endpoints
 _CHATGPT_BASE = "https://chatgpt.com"
@@ -91,6 +120,34 @@ def _recheck_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
+def _select_entries(line_index: int | None) -> list[tuple[int, str]]:
+    """Chọn các dòng reg cần chạy.
+
+    Trả list[(orig_idx_1based, line)]. line_index=None → toàn bộ LINES.
+    line_index (1-based) → chỉ dòng đó. ValueError nếu out-of-range.
+    """
+    if line_index is None:
+        return list(enumerate(LINES, 1))
+    if line_index < 1 or line_index > len(LINES):
+        raise ValueError(
+            f"--line/LINE_INDEX={line_index} ngoài phạm vi 1..{len(LINES)}"
+        )
+    return [(line_index, LINES[line_index - 1])]
+
+
+def _resolve_line_index(cli_line: int | None) -> int | None:
+    """Ưu tiên --line; fallback env LINE_INDEX; None → chạy tất cả."""
+    if cli_line is not None:
+        return cli_line
+    raw = os.environ.get("LINE_INDEX", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"LINE_INDEX không phải số nguyên: {raw!r}")
+
+
 # ─── Build request từ mail_modes spec (mẫu chuẩn) + ÉP reg_mode=hybrid ──
 def _build_request(line: str, *, password: str | None, headless: bool, proxy: str | None):
     from web.mail_modes import get_spec
@@ -105,8 +162,16 @@ def _build_request(line: str, *, password: str | None, headless: bool, proxy: st
         reg_mode=REG_MODE,  # spec hỗ trợ truyền reg_mode trực tiếp
     )
     # ÉP cứng lại lần nữa (đảm bảo dù spec đổi default) — đây là điểm khác smoke.
+    updates: dict = {}
     if request.reg_mode != REG_MODE:
-        request = request.model_copy(update={"reg_mode": REG_MODE})
+        updates["reg_mode"] = REG_MODE
+    # BẬT 2FA INLINE: enroll + activate 2FA ngay trong context vừa tạo account
+    # (CF-clean). spec icloud_v3.build_request KHÔNG nhận tham số mfa_inline nên
+    # set qua model_copy. Sau reg success → result.two_factor['secret'].
+    if not request.mfa_inline:
+        updates["mfa_inline"] = True
+    if updates:
+        request = request.model_copy(update=updates)
     return request
 
 
@@ -254,7 +319,7 @@ async def _run_one(
     log(
         f"START email={request.email} provider={request.mail_provider} "
         f"reg_mode={request.reg_mode} url_set={bool(request.icloud_v3_url)} "
-        f"headless={request.headless}"
+        f"headless={request.headless} mfa_inline={request.mfa_inline}"
     )
 
     row: dict = {
@@ -269,6 +334,9 @@ async def _run_one(
         "session_token_len": 0,
         "access_token_len": 0,
         "cookies_count": 0,
+        "two_factor_state": "n/a",
+        "two_factor_secret_len": 0,
+        "account_line": None,
         "recheck": {"status": "not_run", "reason": "reg chưa success"},
     }
 
@@ -312,6 +380,16 @@ async def _run_one(
         f"error={result.error or '<none>'}"
     )
 
+    # ── XUẤT KẾT QUẢ email|password|2fa (chỉ khi reg success) ──
+    if result.success:
+        acc = _write_account_line(
+            email=request.email, password=request.password, result=result, log=log,
+        )
+        secret, is_partial = _resolve_2fa_secret(result)
+        row["account_line"] = acc["line"]
+        row["two_factor_state"] = acc["secret_state"]
+        row["two_factor_secret_len"] = len(secret or "")
+
     # ── POST-REG DEACTIVATION RECHECK ──
     if not result.success:
         row["recheck"] = {"status": "not_run", "reason": "reg không success"}
@@ -342,6 +420,65 @@ def _save_json(idx: int, email: str, payload: dict) -> None:
     )
 
 
+def _resolve_2fa_secret(result) -> tuple[str | None, bool]:
+    """Lấy 2FA secret từ result.
+
+    Trả (secret, is_partial). Ưu tiên two_factor (enroll+activate đầy đủ),
+    fallback two_factor_partial (enroll OK nhưng activate fail).
+    """
+    tf = result.two_factor or {}
+    secret = tf.get("secret")
+    if secret:
+        return secret, False
+    tf_partial = result.two_factor_partial or {}
+    secret = tf_partial.get("secret")
+    if secret:
+        return secret, True
+    return None, False
+
+
+def _write_account_line(*, email: str, password: str | None, result, log) -> dict:
+    """Ghi 1 dòng `email|password|2fa` vào accounts.txt (append) + stdout.
+
+    Trả dict {line, secret_state} với secret_state ∈ {full, partial, none}.
+    """
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    pw = password or getattr(result, "password", None) or ""
+    secret, is_partial = _resolve_2fa_secret(result)
+
+    if secret and not is_partial:
+        line = f"{email}|{pw}|{secret}"
+        state = "full"
+    elif secret and is_partial:
+        line = f"{email}|{pw}|{secret}  # partial-2fa"
+        state = "partial"
+    else:
+        line = f"{email}|{pw}|{_NO_2FA_MARKER}"
+        state = "none"
+        log("[accounts] CẢNH BÁO: reg success nhưng KHÔNG có 2FA secret (full/partial) → ghi <NO_2FA>")
+
+    with ACCOUNTS_FILE.open("a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+    log(f"[accounts] +1 dòng ({state}): {line}")
+    return {"line": line, "secret_state": state}
+
+
+def _reset_accounts_file(log) -> None:
+    """Xóa accounts.txt đầu run để không lẫn dòng cũ.
+
+    Nếu file đã tồn tại → backup sang accounts_<timestamp>.bak rồi truncate file
+    chính về rỗng. Bảo đảm mỗi run chỉ chứa account của run hiện tại.
+    """
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    if ACCOUNTS_FILE.exists() and ACCOUNTS_FILE.read_text(encoding="utf-8").strip():
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = OUT_DIR / f"accounts_{stamp}.bak"
+        backup.write_text(ACCOUNTS_FILE.read_text(encoding="utf-8"), encoding="utf-8")
+        log(f"[accounts] backup dòng cũ → {backup.name}")
+    ACCOUNTS_FILE.write_text("", encoding="utf-8")
+    log(f"[accounts] reset {ACCOUNTS_FILE.name} (rỗng) đầu run")
+
+
 # ─── Load settings + proxy (mẫu chuẩn production) ────────────────────
 def _load_settings() -> dict:
     from db import get_engine, get_settings_repo
@@ -355,21 +492,29 @@ def _load_settings() -> dict:
         return {}
 
 
-async def _resolve_proxy(log) -> str | None:
+async def _acquire_per_email_proxy(log) -> tuple[str | None, str | None, bool]:
+    """Lease proxy PER-EMAIL mirror autoreg (Option A): least-used + no-immediate-repeat.
+
+    Sau khi acc xong, caller PHẢI gọi _release_job_proxy_lease(line, leased) ở finally.
+    """
     try:
-        from web.manager import _resolve_job_proxy
-        proxy, _proxy_line = await _resolve_job_proxy()
-        log(f"[proxy] resolved={'<set>' if proxy else 'DIRECT (pool rỗng)'}")
-        return proxy
+        from web.manager import _acquire_job_proxy_lease
+        from web.proxy_format import mask_proxy
+        url, line, leased = await _acquire_job_proxy_lease()
+        if url:
+            log(f"[proxy] {mask_proxy(url)} (leased={leased})")
+        else:
+            log("[proxy] DIRECT (pool rỗng)")
+        return url, line, leased
     except Exception as exc:  # noqa: BLE001
-        log(f"[proxy] resolve fail: {type(exc).__name__}: {exc} → DIRECT")
-        return None
+        log(f"[proxy] acquire fail: {type(exc).__name__}: {exc} → DIRECT")
+        return None, None, False
 
 
 # ─── DRY-RUN: parse + build 5 request, KHÔNG signup, KHÔNG network ────
-def _dry_run() -> int:
+def _dry_run(entries: list[tuple[int, str]]) -> int:
     log = _make_logger("dry-run")
-    log(f"=== DRY-RUN: build {len(LINES)} request (KHÔNG signup, KHÔNG network) ===")
+    log(f"=== DRY-RUN: build {len(entries)} request (KHÔNG signup, KHÔNG network) ===")
 
     # Settings (local SQLite — offline) cho password/headless; proxy=None.
     all_settings = _load_settings()
@@ -378,33 +523,37 @@ def _dry_run() -> int:
     log(f"[cfg] headless={headless} password={'<set>' if password else '<auto>'} proxy=None(dry)")
 
     ok = 0
-    for i, line in enumerate(LINES):
+    for idx, line in entries:
         try:
             request = _build_request(line, password=password, headless=headless, proxy=None)
         except Exception as exc:  # noqa: BLE001
-            log(f"[{i}] BUILD FAIL: {type(exc).__name__}: {exc}")
+            log(f"[{idx}] BUILD FAIL: {type(exc).__name__}: {exc}")
             continue
         url_ok = bool(request.icloud_v3_url)
         mode_ok = request.reg_mode == REG_MODE
-        if url_ok and mode_ok:
+        mfa_ok = request.mfa_inline is True
+        if url_ok and mode_ok and mfa_ok:
             ok += 1
         log(
-            f"[{i}] email={request.email} reg_mode={request.reg_mode} "
+            f"[{idx}] email={request.email} reg_mode={request.reg_mode} "
             f"provider={request.mail_provider} "
             f"icloud_v3_url={'SET' if url_ok else 'MISSING'} "
+            f"mfa_inline={request.mfa_inline} "
             f"otp_timeout={request.otp_timeout_seconds}s "
-            f"→ {'OK' if (url_ok and mode_ok) else 'FAIL'}"
+            f"→ {'OK' if (url_ok and mode_ok and mfa_ok) else 'FAIL'}"
         )
 
-    log(f"=== DRY-RUN result: {ok}/{len(LINES)} request build OK (reg_mode={REG_MODE}, url set) ===")
+    log(f"=== DRY-RUN result: {ok}/{len(entries)} request build OK "
+        f"(reg_mode={REG_MODE}, url set, mfa_inline=True) ===")
     log("LƯU Ý: dry-run KHÔNG gọi run_signup, KHÔNG gọi network signup, KHÔNG recheck.")
-    return 0 if ok == len(LINES) else 1
+    return 0 if ok == len(entries) else 1
 
 
 # ─── Chạy thật ───────────────────────────────────────────────────────
-async def _live_run() -> int:
+async def _live_run(entries: list[tuple[int, str]]) -> int:
     log = _make_logger("main")
-    log(f"=== LIVE reg hybrid — {len(LINES)} account (TUẦN TỰ) ===")
+    n_total = len(entries)
+    log(f"=== LIVE reg hybrid — {n_total} account (TUẦN TỰ) ===")
 
     all_settings = _load_settings()
     headless = bool(all_settings.get("reg.headless", True))
@@ -417,17 +566,31 @@ async def _live_run() -> int:
         f"password={'<set>' if password else '<auto>'}"
     )
 
-    proxy = await _resolve_proxy(log)
+    # Proxy acquire chuyển vào trong loop (per-email) — mirror autoreg Option A
+    # để mỗi acc 1 IP riêng (no-immediate-repeat + least-used).
+    _reset_accounts_file(log)
 
     summary: list[dict] = []
     grand_start = time.monotonic()
-    for idx, line in enumerate(LINES, 1):
+    for pos, (idx, line) in enumerate(entries, 1):
         bar = "─" * 78
-        print(f"\n{bar}\n[{idx}/{len(LINES)}] {line.split('|', 1)[0]}\n{bar}", flush=True)
-        row = await _run_one(
-            line, idx, len(LINES),
-            password=password, headless=headless, proxy=proxy, job_timeout=job_timeout,
+        print(f"\n{bar}\n[{pos}/{n_total}] (line {idx}) {line.split('|', 1)[0]}\n{bar}", flush=True)
+
+        # Acquire proxy per-email (lease least-used) + release ở finally
+        email_proxy, email_proxy_line, _proxy_leased = await _acquire_per_email_proxy(
+            _make_logger(f"acquire-{idx}")
         )
+        try:
+            row = await _run_one(
+                line, idx, n_total,
+                password=password, headless=headless, proxy=email_proxy,
+                job_timeout=job_timeout,
+            )
+            # Audit field — không leak credential, chỉ giúp cross-reference log
+            row["proxy_used_line"] = email_proxy_line
+        finally:
+            from web.manager import _release_job_proxy_lease
+            _release_job_proxy_lease(email_proxy_line, _proxy_leased)
         summary.append(row)
     grand_total = time.monotonic() - grand_start
 
@@ -444,9 +607,10 @@ async def _live_run() -> int:
     print(f"\n{'═' * 78}", flush=True)
     print(f"SUMMARY ({len(LINES)} account, grand total {grand_total:.1f}s)", flush=True)
     print("═" * 78, flush=True)
-    print(f"{'#':<3}{'email':<40}{'reg':<4}{'success':<9}{'recheck':<14}{'total':>9}", flush=True)
+    print(f"{'#':<3}{'email':<40}{'reg':<4}{'success':<9}{'2fa':<10}{'recheck':<14}{'total':>9}", flush=True)
     print("─" * 78, flush=True)
     n_success = n_active = n_deact = 0
+    n_2fa_full = n_2fa_partial = n_2fa_none = 0
     for i, r in enumerate(summary, 1):
         ok = "✓" if r["success"] else "✗"
         if r["success"]:
@@ -456,9 +620,16 @@ async def _live_run() -> int:
             n_active += 1
         elif rc == "DEACTIVATED":
             n_deact += 1
+        tf_state = r.get("two_factor_state", "n/a")
+        if tf_state == "full":
+            n_2fa_full += 1
+        elif tf_state == "partial":
+            n_2fa_partial += 1
+        elif tf_state == "none":
+            n_2fa_none += 1
         em = r["email"][:38] + ".." if len(r["email"]) > 40 else r["email"]
         print(
-            f"{i:<3}{em:<40}{'hyb':<4}{ok:<9}{rc:<14}{r['total_seconds']:>9.1f}",
+            f"{i:<3}{em:<40}{'hyb':<4}{ok:<9}{tf_state:<10}{rc:<14}{r['total_seconds']:>9.1f}",
             flush=True,
         )
         if not r["success"] and r.get("error"):
@@ -472,6 +643,20 @@ async def _live_run() -> int:
         f"other: {len(LINES) - n_active - n_deact}",
         flush=True,
     )
+    print(
+        f"2FA: full={n_2fa_full} | partial={n_2fa_partial} | none={n_2fa_none}",
+        flush=True,
+    )
+
+    # ── In toàn bộ accounts.txt (email|password|2fa) ──
+    print(f"\n{'═' * 78}", flush=True)
+    print(f"ACCOUNTS (email|password|2fa) — {ACCOUNTS_FILE}", flush=True)
+    print("═" * 78, flush=True)
+    if ACCOUNTS_FILE.exists():
+        content = ACCOUNTS_FILE.read_text(encoding="utf-8")
+        print(content if content.strip() else "(rỗng)", flush=True)
+    else:
+        print("(chưa có account nào reg success → accounts.txt chưa tạo)", flush=True)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     (OUT_DIR / "summary.json").write_text(
@@ -481,6 +666,9 @@ async def _live_run() -> int:
             "success_count": n_success,
             "active_count": n_active,
             "deactivated_count": n_deact,
+            "two_factor_full_count": n_2fa_full,
+            "two_factor_partial_count": n_2fa_partial,
+            "two_factor_none_count": n_2fa_none,
             "recheck_delay_seconds": _recheck_delay_seconds(),
             "rows": summary,
         }, indent=2, ensure_ascii=False, default=str),
@@ -495,13 +683,24 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Live test reg hybrid + deactivation recheck")
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="Chỉ parse + build 5 request (KHÔNG signup, KHÔNG network).",
+        help="Chỉ parse + build request (KHÔNG signup, KHÔNG network).",
+    )
+    parser.add_argument(
+        "--line", type=int, default=None,
+        help="Chỉ chạy 1 dòng (1-based). Bỏ trống → chạy toàn bộ.",
     )
     args = parser.parse_args()
 
+    # Refresh LINES từ input file (nếu có) trước khi build entries.
+    global LINES
+    LINES = _load_lines()
+
+    line_index = _resolve_line_index(args.line)
+    entries = _select_entries(line_index)
+
     if args.dry_run:
-        return _dry_run()
-    return asyncio.run(_live_run())
+        return _dry_run(entries)
+    return asyncio.run(_live_run(entries))
 
 
 if __name__ == "__main__":

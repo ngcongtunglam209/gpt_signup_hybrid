@@ -23,6 +23,51 @@ _log = logging.getLogger(__name__)
 LogCallback = Callable[[str, str, dict[str, Any]], Awaitable[None]]
 
 
+# Browser-close patterns thường xảy ra khi browser bị đóng giữa lúc đang
+# navigate. Một mình các pattern này KHÔNG đủ để mark proxy dead (false
+# positive: reaper kill do timeout, OOM, anti-bot reset…) — gating thêm bằng
+# OAI domain trong _is_browser_closed_proxy_error.
+_BROWSER_CLOSED_MARKERS: tuple[str, ...] = (
+    "Target page, context or browser has been closed",
+    "BrowserContext has been closed",
+    "Transport closed",
+    "Page closed",
+)
+
+# Domain cần navigate cho reg flow — nếu browser đóng giữa lúc đang navigate
+# đến đây thì proxy CHỊU TRÁCH NHIỆM (CF/sentinel block IP, TLS handshake fail
+# qua proxy, hoặc proxy tự reset). Anti-bot detection, resource pressure
+# thường không kèm domain trong exception message.
+_OAI_DOMAINS: tuple[str, ...] = (
+    "openai.com",
+    "chatgpt.com",
+    "auth.openai.com",
+    "sentinel.openai.com",
+)
+
+
+def _is_browser_closed_proxy_error(exc_or_msg) -> bool:
+    """Detect proxy fail dấu hiệu 'browser bị đóng lúc navigate domain OAI'.
+
+    Conservative: yêu cầu CẢ HAI điều kiện đồng thời để mark proxy dead —
+      1. Exception message khớp pattern browser-closed
+         (TargetClosedError, BrowserContext closed, Transport closed…).
+      2. Message chứa domain OAI (trace navigate đến endpoint OAI).
+
+    → Loại trừ false positive: browser crash do reaper timeout/OOM/anti-bot
+    không kèm domain → không mark; còn navigate tới OAI fail thì proxy có
+    rủi ro cao bị block → mark để pick proxy khác cho email kế tiếp.
+    """
+    if exc_or_msg is None:
+        return False
+    msg = str(exc_or_msg)
+    if not msg:
+        return False
+    if not any(marker in msg for marker in _BROWSER_CLOSED_MARKERS):
+        return False
+    return any(domain in msg for domain in _OAI_DOMAINS)
+
+
 @dataclass
 class AutoRegConfig:
     """Runtime config cho AutoRegRunner, build từ API request body."""
@@ -45,6 +90,10 @@ class AutoRegConfig:
     # Reg pipeline mode (Settings ``reg_mode.current``) — default ``browser`` để
     # backward compat. Hợp lệ: "browser" | "hybrid" (pure_request đã gỡ khỏi reg).
     reg_mode: str = "browser"
+    # Gate proxy pool cho autoreg (Settings ``reg.use_proxy``). False → autoreg
+    # bypass pool, mỗi email chạy DIRECT từ IP host. Mirror JobManager._use_proxy
+    # cho UI manual reg — autoreg trước đây bị bypass setting này (bug có sẵn).
+    use_proxy: bool = True
 
 
 @dataclass
@@ -279,15 +328,38 @@ class AutoRegRunner:
 
             email_proxy: str | None = None
             email_proxy_line: str | None = None
+            _proxy_leased: bool = False
             try:
                 prefix = f"[{email}]" if max_attempts == 1 else f"[{email}][attempt {attempt}/{max_attempts}]"
                 await self._log("info", f"{prefix} Starting signup", {"email": email, "attempt": attempt})
 
                 # Build SignupRequest via worker spec — inject proxy + headless từ Settings
-                # Proxy lấy từ pool rotation (round_robin/random) để mỗi email
-                # tránh trùng IP. Pool rỗng → None (direct).
-                from web.manager import _resolve_job_proxy
-                email_proxy, email_proxy_line = await _resolve_job_proxy()
+                # Proxy lease theo least-used + no-immediate-repeat (pool.acquire) →
+                # N email song song với ≥N proxy live = mỗi email 1 IP riêng,
+                # KHÔNG bị trùng do random.choice. Probe mode fallback
+                # acquire_live_proxy (no lease). Phải release ở finally để
+                # giảm lease count khi acc xong.
+                #
+                # Gate ``self._config.use_proxy`` (Settings ``reg.use_proxy``):
+                # False → skip acquire, chạy direct (mirror JobManager._use_proxy
+                # cho UI manual reg). Trước đây autoreg bypass setting này.
+                if self._config.use_proxy:
+                    from web.manager import _acquire_job_proxy_lease
+                    email_proxy, email_proxy_line, _proxy_leased = await _acquire_job_proxy_lease()
+                    # Log proxy đã chọn (mask credential) — observability cho user
+                    # biết acc đi IP gì, phát hiện sớm pool stuck/lệch IP.
+                    from web.proxy_format import mask_proxy as _mask
+                    await self._log(
+                        "info",
+                        f"{prefix} [proxy] {_mask(email_proxy)}",
+                        {"email": email, "proxy": _mask(email_proxy)},
+                    )
+                else:
+                    await self._log(
+                        "info",
+                        f"{prefix} [proxy] disabled — chạy direct (no proxy)",
+                        {"email": email},
+                    )
                 worker_config = self._resolve_worker_config(self._config)
                 spec = get_spec("worker")
                 parsed = spec.parse_line(email)
@@ -439,21 +511,32 @@ class AutoRegRunner:
                 })
                 await self._mark_email_failed(email)
                 return
+            finally:
+                # Trả lease cho proxy bất kể outcome (success/fail/cancel) để
+                # ``pool._leases`` không leak — least-used view chính xác cho
+                # email kế tiếp. No-op khi probe mode (requires_release=False)
+                # hoặc pool rỗng (line=None).
+                from web.manager import _release_job_proxy_lease
+                _release_job_proxy_lease(email_proxy_line, _proxy_leased)
 
     def _note_proxy_failure(self, line: str | None, exc_or_msg, *, prefix: str = "") -> None:
         """Mark proxy line chết khi gặp lỗi network — key = raw pool line (F-J).
 
         Idempotent: ``ProxyPool.mark_dead`` trả False nếu line đã chết / không
         thuộc pool, nên gọi nhiều lần an toàn. Conservative: chỉ mark khi
-        ``_is_proxy_network_error`` confirm đúng pattern proxy/network, tránh
-        kill oan vì lỗi nghiệp vụ (Stripe decline, OTP wrong, captcha…).
+        ``_is_proxy_network_error`` HOẶC ``_is_browser_closed_proxy_error``
+        confirm đúng pattern proxy/network, tránh kill oan vì lỗi nghiệp vụ
+        (Stripe decline, OTP wrong, captcha…).
         """
         if not line:
             return
         from web.manager import _is_proxy_network_error, _mask_proxy
         from web.proxy_pool import get_proxy_pool
 
-        if not _is_proxy_network_error(exc_or_msg):
+        if not (
+            _is_proxy_network_error(exc_or_msg)
+            or _is_browser_closed_proxy_error(exc_or_msg)
+        ):
             return
         if not get_proxy_pool().mark_dead(line):
             return

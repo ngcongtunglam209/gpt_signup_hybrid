@@ -1419,7 +1419,10 @@ class SentinelSidecar:
             return None
 
         async def _do_intercept() -> Optional[dict]:
-            from _human_input import human_type as _ht
+            from _human_input import (
+                human_type as _ht,
+                resolve_birth_field_value as _resolve_birth,
+            )
             import random as _r
 
             page = self._page
@@ -1705,10 +1708,8 @@ class SentinelSidecar:
                 if not filled_age:
                     try:
                         year_str, _m, _d = birthdate.split("-", 2)
-                        from datetime import datetime as _dt
-                        age = max(13, _dt.utcnow().year - int(year_str))
                     except Exception:
-                        age = 26
+                        year_str = "1999"
                     age_input = None
                     for sel in (
                         'input[name="age"]',
@@ -1723,12 +1724,17 @@ class SentinelSidecar:
                         except Exception:
                             continue
                     if age_input is not None:
+                        # OpenAI A/B test: field number có thể là NĂM SINH
+                        # (min 1896) hoặc TUỔI — đọc min/max để điền đúng.
+                        value, kind = await _resolve_birth(
+                            age_input, birthdate, log=self._log,
+                        )
                         await _ht(
-                            age_input, str(age),
+                            age_input, value,
                             delay_min_ms=80, delay_max_ms=160, log=self._log,
                         )
                         filled_age = True
-                        self._log(f"[sidecar.K2c] filled age input: {age}")
+                        self._log(f"[sidecar.K2c] filled {kind} input: {value}")
                     else:
                         # NO standalone age input found. The /about-you form
                         # may have changed (server A/B tests UI). Dump all
@@ -1771,17 +1777,18 @@ class SentinelSidecar:
                             filled_age = True  # treat as success
                         else:
                             # Last resort: Tab from name → keyboard type.
-                            # Only if some age-related field exists.
+                            # Only if some age-related field exists. Không có
+                            # loc để đọc min/max → điền NĂM SINH (UI hiện tại).
                             try:
                                 await page.keyboard.press("Tab")
                                 await asyncio.sleep(0.3)
-                                for ch in str(age):
+                                for ch in year_str:
                                     await page.keyboard.type(
                                         ch, delay=_r.randint(120, 200),
                                     )
                                 filled_age = True
                                 self._log(
-                                    f"[sidecar.K2c] Tab + typed age: {age}"
+                                    f"[sidecar.K2c] Tab + typed year: {year_str}"
                                 )
                             except Exception as exc:
                                 self._log(
