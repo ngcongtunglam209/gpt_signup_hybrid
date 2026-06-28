@@ -1458,6 +1458,11 @@ async def _drive_signup_flow(
             #                                    URL — fallback manual goto /about-you
             # 4xx (wrong/expired):               vòng lặp tiếp sẽ xử lý (Step A)
             #                                    → click Resend + re-poll
+            #
+            # GIỮ otp_submitted=True sau status=200 để Step B có thể trigger force
+            # goto /about-you nếu page kẹt không nav. State machine sẽ tự exit OTP
+            # branch khi screen đổi sang about_you / chatgpt (URL change). Nếu kẹt,
+            # Step B sau 15s force goto, sau 30s re-poll code mới (failsafe).
             if otp_status == 200 and otp_continue_url and otp_source == "api":
                 log(f"[flow] OTP OK (API fallback path) → goto {otp_continue_url}")
                 try:
@@ -1468,22 +1473,17 @@ async def _drive_signup_flow(
                     )
                 except Exception as exc:
                     log(f"[flow] goto continue_url failed: {type(exc).__name__}: {exc}")
-                otp_submitted = False
-                _otp_submit_ts = None
-                _otp_last_code = None
-                _otp_last_status = 0
+                # goto đã nav → state machine vòng tới sẽ detect screen mới
+                # (about_you). Keep otp_submitted=True làm fallback nếu goto fail.
                 same_screen_count = 0
             elif otp_status == 200 and otp_continue_url and otp_source == "ui":
                 log(
                     f"[flow] OTP OK (UI form path) — page tự nav tới "
                     f"{otp_continue_url.split('?')[0]}, KHÔNG goto manual"
                 )
-                # Reset state để state machine detect screen mới khi page
-                # nav xong. KHÔNG manual goto vì sẽ race với natural nav.
-                otp_submitted = False
-                _otp_submit_ts = None
-                _otp_last_code = None
-                _otp_last_status = 0
+                # Page tự nav natively. KHÔNG goto vì sẽ race với natural nav
+                # (NS_BINDING_ABORTED). Keep otp_submitted=True; Step B sẽ force
+                # goto /about-you nếu page kẹt >15s không nav.
                 same_screen_count = 0
             elif otp_status == 200 and not otp_continue_url:
                 # Server validated 200 nhưng body thiếu continue_url — rare.
@@ -1500,10 +1500,6 @@ async def _drive_signup_flow(
                     )
                 except Exception as exc:
                     log(f"[flow] goto /about-you failed: {type(exc).__name__}: {exc}")
-                otp_submitted = False
-                _otp_submit_ts = None
-                _otp_last_code = None
-                _otp_last_status = 0
                 same_screen_count = 0
             # status >= 400 hoặc 0 (no response observed): để vòng lặp tới (Step A/B)
             # xử lý — Step A handle 4xx, Step B handle 200 đang chờ nav.
