@@ -89,13 +89,22 @@ _CF_BLOCK_MARKERS: tuple[str, ...] = (
 # lược classify nhất quán với mark_dead helper ở autoreg.
 from _browser_retry import NETWORK_ERROR_MARKERS as _PROXY_DEAD_MARKERS  # noqa: E402
 
-# Sentinel SO empty / Observer chưa fire đủ events → context page có thể bị
-# throttle. Retry với fresh BrowserContext (acquire mới = page mới + feeder
-# script fresh) thường thoát.
+# Sentinel SO empty / Observer chưa fire đủ events / driver-pipe chết →
+# context page có thể bị throttle hoặc browser process die giữa flow. Retry
+# với fresh BrowserContext (acquire mới = page mới + feeder script fresh)
+# thường thoát.
 _SENTINEL_OBSERVER_MARKERS: tuple[str, ...] = (
     "sessionobservertoken",  # case-insensitive match qua msg.lower()
     "observer cache empty",
     "page.evaluate failed",
+    # Playwright driver pipe chết (browser process bị OS kill / anti-bot
+    # detection / resource pressure giữa lúc page.evaluate). Stack trace
+    # điển hình: "Page.evaluate: Connection closed while reading from the
+    # driver". Retry với fresh BrowserContext (Camoufox launch mới) phục hồi
+    # được vì driver pipe chỉ chết ở instance hiện tại.
+    "connection closed while reading from the driver",
+    "transport closed",
+    "target page, context or browser has been closed",
 )
 
 # Sentinel cache TTL: token mint trong page Camoufox có timestamp ở dx-VM,

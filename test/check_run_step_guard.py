@@ -140,28 +140,29 @@ def main() -> int:
             + "\n".join(_diff_sequences(GOLDEN_STEP_PATHS, golden_paths))
         )
 
-    # ── Guard chính: hybrid = [promo landing] + golden, đúng thứ tự ──
-    expected_hybrid = [PROMO_LANDING_PATH] + golden_paths
+    # ── Guard chính: hybrid == golden (không còn promo landing) ──
+    # Trước đây hybrid chèn 1× promo landing TRƯỚC csrf. Đã BỎ (camoufox launch
+    # qua proxy timeout 90s vì GET / extra) → hybrid = golden skeleton thuần.
+    # Bất kỳ promo landing nào xuất hiện trở lại = regression.
+    expected_hybrid = list(golden_paths)
     remaining, promo_at_head = _strip_known_valid_delta(hybrid_paths)
 
-    if not promo_at_head:
+    if promo_at_head:
         failures.append(
-            "Delta hợp lệ Δ#1 KHÔNG đúng: promo landing "
-            f"({PROMO_LANDING_PATH}) phải là bước ĐẦU TIÊN của hybrid.run() — "
-            f"thực tế bước đầu = {hybrid_paths[0] if hybrid_paths else '∅'}"
+            f"REGRESSION: promo landing ({PROMO_LANDING_PATH}) xuất hiện trở lại "
+            "ở đầu hybrid.run() — đã yêu cầu bỏ (launch qua proxy timeout). "
+            "Xoá `_visit_promo_landing()` khỏi reg_hybrid/relay.py."
         )
 
     if hybrid_paths != expected_hybrid:
-        # Tách rõ: phần ngoài delta hợp lệ (remaining) có khớp golden không?
-        seq_diff = _diff_sequences(golden_paths, remaining)
-        extra = [p for p in remaining if p not in golden_paths]
-        missing = [p for p in golden_paths if p not in remaining]
+        seq_diff = _diff_sequences(golden_paths, hybrid_paths)
+        extra = [p for p in hybrid_paths if p not in golden_paths]
+        missing = [p for p in golden_paths if p not in hybrid_paths]
         failures.append(
-            "DRIFT chuỗi bước: sau khi bỏ delta hợp lệ (promo landing ở đầu), "
-            "phần còn lại của hybrid KHÔNG khớp golden skeleton.\n"
+            "DRIFT chuỗi bước: hybrid KHÔNG khớp golden skeleton (sau khi bỏ promo).\n"
             f"  step THỪA (golden không có): {extra or '∅'}\n"
             f"  step THIẾU (golden có):      {missing or '∅'}\n"
-            "  diff theo index (golden_skeleton vs hybrid-sau-strip):\n"
+            "  diff theo index (golden_skeleton vs hybrid):\n"
             + ("\n".join(seq_diff) if seq_diff else "    (không có lệch theo index)")
         )
 
@@ -178,17 +179,16 @@ def main() -> int:
         for i, f in enumerate(failures, 1):
             print(f"\n[{i}] {f}")
         print(
-            "\n→ Chuỗi bước hybrid.run() đã DRIFT khỏi golden + delta hợp lệ. "
-            "Bất kỳ bước/thứ tự lệch ngoài {promo landing, OTP loop} là regression."
+            "\n→ Chuỗi bước hybrid.run() đã DRIFT khỏi golden. "
+            "Bất kỳ bước/thứ tự lệch ngoài OTP loop là regression."
         )
         return 1
 
     print(
-        "RESULT: PASS — hybrid.run() = golden skeleton + ĐÚNG delta hợp lệ.\n"
-        f"  Δ#1 promo landing GET {PROMO_LANDING_PATH} ở đầu (intentional).\n"
-        f"  Δ#2 OTP loop happy path = golden (1× send + 1× validate).\n"
+        "RESULT: PASS — hybrid.run() = golden skeleton thuần (đã bỏ promo).\n"
+        f"  Δ OTP loop happy path = golden (1× send + 1× validate).\n"
         f"  create_account POST = {h_ca} (== golden {g_ca}, không double-POST).\n"
-        "  Mọi bước còn lại khớp golden đúng thứ tự — không drift."
+        "  Mọi bước khớp golden đúng thứ tự — không drift."
     )
     return 0
 

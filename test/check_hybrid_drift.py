@@ -305,22 +305,24 @@ def case_a2_step_diff(mail_loop):
 
     h_paths = hsession.step_paths()
     g_paths = gsession.step_paths()
-    expected_hybrid = [PROMO_LANDING_PATH] + GOLDEN_STEP_PATHS
+    # Sau khi BỎ promo landing: hybrid happy path == golden skeleton thuần.
+    # Trước đây hybrid = [promo landing] + golden (intentional). Promo đã bị
+    # gỡ vì Camoufox launch qua proxy timeout 90s khi có thêm GET / extra.
+    expected_hybrid = list(GOLDEN_STEP_PATHS)
     extra = [p for p in h_paths if p not in expected_hybrid]
     missing = [p for p in expected_hybrid if p not in h_paths]
     detail = (
         f"hybrid steps={len(h_paths)}, golden steps={len(g_paths)}, "
         f"extra={extra}, missing={missing}"
     )
-    # Hành vi ĐÚNG (2.1 + promo landing intentional): golden == skeleton; happy
-    # path hybrid == [promo landing] + golden skeleton. Promo landing là delta
-    # CÓ CHỦ ĐÍCH (giữ), KHÔNG coi là drift — bước-sequence ngoài-OTP còn lại
-    # phải khớp golden đúng thứ tự (guard chi tiết ở test/check_run_step_guard.py).
+    # Hành vi ĐÚNG (sau bỏ promo): golden == skeleton; happy path hybrid ==
+    # golden skeleton thuần. Bất kỳ bước-sequence ngoài-OTP nào khác golden
+    # đều là drift (guard chi tiết ở test/check_run_step_guard.py).
     passed = (g_paths == GOLDEN_STEP_PATHS and h_paths == expected_hybrid)
     ce = None
     if not passed:
         ce = (
-            f"stepSequence(hybrid, exclude=OTP_LOOP) != [promo]+golden — "
+            f"stepSequence(hybrid, exclude=OTP_LOOP) != golden — "
             f"extra step(s) {extra or '∅'}, missing {missing or '∅'} "
             f"(drift nhánh A: bước ngoài OTP loop lệch golden skeleton)"
         )

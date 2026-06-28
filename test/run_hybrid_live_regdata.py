@@ -577,9 +577,8 @@ async def _live_run(entries: list[tuple[int, str]]) -> int:
         print(f"\n{bar}\n[{pos}/{n_total}] (line {idx}) {line.split('|', 1)[0]}\n{bar}", flush=True)
 
         # Acquire proxy per-email (lease least-used) + release ở finally
-        email_proxy, email_proxy_line, _proxy_leased = await _acquire_per_email_proxy(
-            _make_logger(f"acquire-{idx}")
-        )
+        proxy_log = _make_logger(f"proxy-{idx}")
+        email_proxy, email_proxy_line, _proxy_leased = await _acquire_per_email_proxy(proxy_log)
         try:
             row = await _run_one(
                 line, idx, n_total,
@@ -588,6 +587,17 @@ async def _live_run(entries: list[tuple[int, str]]) -> int:
             )
             # Audit field — không leak credential, chỉ giúp cross-reference log
             row["proxy_used_line"] = email_proxy_line
+
+            # Mark proxy dead nếu fail vì proxy network / browser-closed —
+            # mirror autoreg _note_proxy_failure. Conservative: chỉ mark khi
+            # error match pattern (idempotent, không kill oan).
+            if not row["success"]:
+                error_payload = row.get("error") or ""
+                from autoreg.runner import mark_proxy_dead_on_error
+                marked = mark_proxy_dead_on_error(
+                    email_proxy_line, error_payload, log=proxy_log,
+                )
+                row["proxy_marked_dead"] = bool(marked)
         finally:
             from web.manager import _release_job_proxy_lease
             _release_job_proxy_lease(email_proxy_line, _proxy_leased)

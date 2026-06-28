@@ -1,14 +1,14 @@
-"""Check: 3 mode reg đều dùng promo landing làm link truy cập ban đầu.
+"""Check: 2 mode reg (browser, pure_request) dùng promo landing.
 
 Verify (không thực sự gọi network/browser):
     [1] AST parse 5 file đã sửa → no SyntaxError.
     [2] config.PROMO_LANDING_URL == link promo yêu cầu.
     [3] browser_phase: 2 landing goto dùng PROMO_LANDING_URL (camoufox+chromium).
     [4] request_phase._prime_chatgpt_session GET promo landing TRƯỚC /auth/login.
-    [5] chatgpt_camoufox.headers.home_navigate trả nav header đúng (site=none,
-        no Referer) + reg_hybrid relay gọi _visit_promo_landing TRƯỚC get_csrf.
+    [5] reg_hybrid relay KHÔNG còn _visit_promo_landing — promo bị bỏ ở hybrid
+        (camoufox launch qua proxy bị timeout vô lý vì GET / extra).
 
-Chạy: python3 test/check_promo_landing.py
+Chạy: .venv/bin/python test/check_promo_landing.py
 """
 from __future__ import annotations
 
@@ -116,7 +116,7 @@ def check_request_phase() -> None:
         _fail("request_phase: promo GET thiếu Sec-Fetch-Site=none / pop Referer")
 
 
-# ── [5] hybrid: golden bất biến + _visit_promo_landing inline ────────
+# ── [5] hybrid: KHÔNG còn _visit_promo_landing (promo đã bỏ) ─────────
 def check_hybrid() -> None:
     # 5a. Golden chatgpt_camoufox KHÔNG bị sửa (cấm theo spec deferred-ban).
     hsrc = _read("ccx_headers")
@@ -125,26 +125,21 @@ def check_hybrid() -> None:
     else:
         _fail("ccx headers.py: còn home_navigate → vi phạm cấm sửa golden")
 
-    # 5b. relay.run() gọi _visit_promo_landing TRƯỚC get_csrf.
+    # 5b. relay.run() KHÔNG còn gọi _visit_promo_landing — promo bỏ ở hybrid.
+    # Lý do: GET promo landing TRƯỚC csrf qua Camoufox launch + proxy yếu hay
+    # bị timeout 90s (set_device_id/launch). Bỏ → giảm 1 GET, launch nhanh hơn.
     rsrc = _read("relay")
-    if "def _visit_promo_landing" not in rsrc:
-        _fail("relay: thiếu method _visit_promo_landing")
-        return
-    idx_visit = rsrc.find("self._visit_promo_landing()")
-    idx_csrf = rsrc.find("csrf = self.get_csrf()")
-    if idx_visit != -1 and idx_csrf != -1 and idx_visit < idx_csrf:
-        _ok("relay.run(): _visit_promo_landing() gọi TRƯỚC get_csrf()")
+    if "def _visit_promo_landing" in rsrc:
+        _fail("relay: vẫn còn method _visit_promo_landing (đã yêu cầu bỏ)")
+    elif "self._visit_promo_landing" in rsrc:
+        _fail("relay.run(): vẫn còn call self._visit_promo_landing (đã yêu cầu bỏ)")
     else:
-        _fail(f"relay.run(): thứ tự sai (visit={idx_visit}, csrf={idx_csrf})")
-    # Build nav header inline + dùng PROMO_LANDING_URL, KHÔNG gọi golden.
-    if (
-        "PROMO_LANDING_URL" in rsrc
-        and '"Sec-Fetch-Mode": "navigate"' in rsrc
-        and "home_navigate" not in rsrc
-    ):
-        _ok("relay._visit_promo_landing: nav header inline + PROMO_LANDING_URL (không đụng golden)")
+        _ok("relay: đã bỏ _visit_promo_landing (method + call) — hybrid không còn promo step")
+    # Golden chatgpt_camoufox vẫn không bị đụng (không gọi home_navigate trong relay).
+    if "home_navigate" not in rsrc:
+        _ok("relay: không gọi home_navigate (golden bất biến)")
     else:
-        _fail("relay._visit_promo_landing: thiếu inline nav / PROMO_LANDING_URL / còn gọi home_navigate")
+        _fail("relay: còn gọi home_navigate → vi phạm cấm sửa golden")
 
 
 def main() -> int:

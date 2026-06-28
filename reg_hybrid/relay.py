@@ -98,18 +98,14 @@ class HybridChatGPTRelay(ChatGPTRelay):
     # ── Override run() ────────────────────────────────────────────────
 
     def run(self) -> RelayResult:
-        """Skeleton golden ``ChatGPTRelay.run()`` + đúng 2 điểm khác có chủ đích.
+        """Skeleton golden ``ChatGPTRelay.run()`` + đúng 1 điểm khác có chủ đích.
 
         Mọi bước NGOÀI OTP gọi NGUYÊN method golden kế thừa (get_csrf/signin/
         authorize/register/otp_send/create_account/callback/get_session) —
         không thêm side-effect. Delta hybrid vs golden chỉ còn:
-            (1) Phase 0 ``_visit_promo_landing()`` — intentional, gắn campaign.
-            (2) Block OTP ``_acquire_and_validate_otp()`` — smart OTP loop thay
+            (1) Block OTP ``_acquire_and_validate_otp()`` — smart OTP loop thay
                 cho golden ``otp_reader.get_code() + otp_validate(code)``.
         """
-        # ── Δ#1: promo landing (intentional) — khớp user thật click từ ad ──
-        self._visit_promo_landing()
-
         # ── golden: csrf → signin → authorize → register → otp_send ──
         csrf = self.get_csrf()
         authorize_url = self.signin(csrf)
@@ -117,7 +113,7 @@ class HybridChatGPTRelay(ChatGPTRelay):
         self.register()
         self.otp_send()
 
-        # ── Δ#2: smart OTP acquisition/verify loop (thay get_code+validate) ──
+        # ── Δ: smart OTP acquisition/verify loop (thay get_code+validate) ──
         self._acquire_and_validate_otp()
 
         # ── golden: create_account → callback → get_session ──
@@ -258,45 +254,6 @@ class HybridChatGPTRelay(ChatGPTRelay):
                 )
 
     # ── Helpers ───────────────────────────────────────────────────────
-
-    def _visit_promo_landing(self) -> None:
-        """GET promo landing đầu flow — gắn campaign plus-1-month-free + warm CF.
-
-        Navigation header (Sec-Fetch-Site=none, no referer) tự build TẠI ĐÂY —
-        KHÔNG gọi golden ``chatgpt_camoufox`` (package bất biến theo spec
-        reg-hybrid-deactivated-after-signup). Thứ tự field bám Firefox golden nav.
-
-        LƯU Ý anti-ban: golden ``ChatGPTRelay.run()`` KHÔNG có bước GET home; đây
-        là request CỘNG THÊM (drift khỏi golden) theo yêu cầu gắn promo cho mọi
-        mode. Best-effort: lỗi KHÔNG fail flow — get_csrf vẫn chạy.
-        """
-        from config import PROMO_LANDING_URL
-
-        h: dict = {
-            "User-Agent": self.profile.user_agent,
-            "Accept": (
-                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-            ),
-            "Accept-Language": self.profile.accept_language,
-            "Accept-Encoding": "gzip, deflate, br, zstd",
-            "Cookie": None,  # slot — _request fill từ jar đúng vị trí Firefox
-            "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",  # vào từ ngoài (gõ/click link promo)
-            "Sec-Fetch-User": "?1",
-            "priority": "u=0, i",
-            "te": "trailers",
-        }
-        try:
-            self._get(PROMO_LANDING_URL, headers=h, allow_redirects=True)
-            self._hybrid_log(
-                "[hybrid-relay] promo landing visited (plus-1-month-free)"
-            )
-        except Exception as exc:  # noqa: BLE001 — best-effort
-            self._hybrid_log(
-                f"[hybrid-relay] promo landing visit failed (continue): {exc}"
-            )
 
     def _otp_validate_soft(self, code: str) -> tuple[bool, int, str]:
         """Validate OTP — KHÔNG raise. Trả ``(ok, status, body)``.

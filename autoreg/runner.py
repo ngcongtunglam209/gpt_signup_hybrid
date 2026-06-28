@@ -45,6 +45,20 @@ _OAI_DOMAINS: tuple[str, ...] = (
     "sentinel.openai.com",
 )
 
+# Launch-timeout patterns — Camoufox launch step (set_device_id) treo > 90s
+# THƯỜNG do proxy không kết nối nổi (Firefox cần bootstrap chrome:// qua proxy).
+# Gating bằng cặp (kind + op): kind chỉ định loại exception, op khẳng định
+# step launch cụ thể (không phải mint_token / export_cookies / mint_so —
+# những op chạy SAU khi launch xong).
+_LAUNCH_TIMEOUT_KIND_MARKERS: tuple[str, ...] = (
+    "HybridBrowserPoolError",
+    "camoufox op timeout",
+)
+_LAUNCH_TIMEOUT_OP_MARKERS: tuple[str, ...] = (
+    "set_device_id",
+    "/launch",
+)
+
 
 def _is_browser_closed_proxy_error(exc_or_msg) -> bool:
     """Detect proxy fail dấu hiệu 'browser bị đóng lúc navigate domain OAI'.
@@ -66,6 +80,75 @@ def _is_browser_closed_proxy_error(exc_or_msg) -> bool:
     if not any(marker in msg for marker in _BROWSER_CLOSED_MARKERS):
         return False
     return any(domain in msg for domain in _OAI_DOMAINS)
+
+
+def _is_launch_timeout_proxy_error(exc_or_msg) -> bool:
+    """Detect proxy fail dấu hiệu 'Camoufox launch step timeout'.
+
+    Camoufox launch trong reg_hybrid phải bootstrap Firefox + connect qua proxy
+    (chrome://, fingerprint feeder). Nếu proxy chậm/treo → launch step
+    ``set_device_id/launch`` quá 90s → ``HybridBrowserPoolError: camoufox op
+    timeout (set_device_id/launch > 90s)``.
+
+    Gating bằng CẶP (kind + op): yêu cầu **cả hai** substring có mặt để chỉ
+    catch step launch:
+      - kind: ``HybridBrowserPoolError`` hoặc ``camoufox op timeout``
+        (exception loại).
+      - op: ``set_device_id`` hoặc ``/launch`` (launch step cụ thể, không phải
+        op mint_token / export_cookies chạy SAU khi launch OK).
+
+    Trade-off (chấp nhận): chỉ 1 proxy chết → mark đúng + email kế tiếp đổi
+    proxy. Máy yếu khiến tất cả launch chậm → toàn pool bị mark dead → autoreg
+    fallback direct → user thấy ngay (vs kẹt 1 proxy bad không phát hiện).
+    """
+    if exc_or_msg is None:
+        return False
+    msg = str(exc_or_msg)
+    if not msg:
+        return False
+    if not any(marker in msg for marker in _LAUNCH_TIMEOUT_KIND_MARKERS):
+        return False
+    return any(marker in msg for marker in _LAUNCH_TIMEOUT_OP_MARKERS)
+
+
+def mark_proxy_dead_on_error(line: str | None, exc_or_msg, *, log=None) -> bool:
+    """Mark proxy dead khi error match pattern proxy network / browser-closed /
+    launch-timeout.
+
+    Module-level helper (no ``self``) — dùng cho test/diag scripts mirror autoreg
+    behavior (ví dụ ``test/run_hybrid_live_regdata.py`` chạy hybrid live test).
+    AutoRegRunner._note_proxy_failure cũng route qua đây để giữ DRY.
+
+    Idempotent + safe: line=None → False; line đã dead → False; pattern không
+    match → False. Trả True chỉ khi vừa flip live→dead.
+
+    Args:
+        line: raw pool line (mark_dead key).
+        exc_or_msg: Exception object hoặc error string.
+        log: optional ``callable(str)`` để log "[proxy] ... marked dead".
+
+    Returns:
+        True nếu vừa mark dead; False nếu skip (an toàn để gọi vô điều kiện).
+    """
+    if not line:
+        return False
+    from web.manager import _is_proxy_network_error, _mask_proxy
+    from web.proxy_pool import get_proxy_pool
+
+    if not (
+        _is_proxy_network_error(exc_or_msg)
+        or _is_browser_closed_proxy_error(exc_or_msg)
+        or _is_launch_timeout_proxy_error(exc_or_msg)
+    ):
+        return False
+    if not get_proxy_pool().mark_dead(line):
+        return False
+    if log is not None:
+        try:
+            log(f"[proxy] {_mask_proxy(line)} marked dead (network/browser-closed/launch-timeout)")
+        except Exception:  # noqa: BLE001 — logging fail không chặn flow
+            pass
+    return True
 
 
 @dataclass
@@ -522,35 +605,25 @@ class AutoRegRunner:
     def _note_proxy_failure(self, line: str | None, exc_or_msg, *, prefix: str = "") -> None:
         """Mark proxy line chết khi gặp lỗi network — key = raw pool line (F-J).
 
-        Idempotent: ``ProxyPool.mark_dead`` trả False nếu line đã chết / không
-        thuộc pool, nên gọi nhiều lần an toàn. Conservative: chỉ mark khi
-        ``_is_proxy_network_error`` HOẶC ``_is_browser_closed_proxy_error``
-        confirm đúng pattern proxy/network, tránh kill oan vì lỗi nghiệp vụ
-        (Stripe decline, OTP wrong, captcha…).
+        Delegate ``mark_proxy_dead_on_error`` module-level (DRY với
+        ``test/run_hybrid_live_regdata.py`` + diag scripts). Idempotent.
         """
-        if not line:
-            return
-        from web.manager import _is_proxy_network_error, _mask_proxy
-        from web.proxy_pool import get_proxy_pool
+        from web.proxy_format import mask_proxy
 
-        if not (
-            _is_proxy_network_error(exc_or_msg)
-            or _is_browser_closed_proxy_error(exc_or_msg)
-        ):
-            return
-        if not get_proxy_pool().mark_dead(line):
-            return
-        # Log fire-and-forget — đừng để logging fail chặn flow signup.
-        try:
-            asyncio.create_task(
-                self._log(
-                    "warn",
-                    f"{prefix} [proxy] {_mask_proxy(line)} lỗi network — loại khỏi pool",
-                    {"proxy": _mask_proxy(line)},
+        # Log fire-and-forget khi mark thành công — không chặn flow signup.
+        def _emit_log(msg: str) -> None:
+            # ``msg`` đã có prefix ``[proxy] ...`` từ helper. Chỉ cần prepend
+            # job-prefix + "lỗi network — loại khỏi pool" tail như cũ để giữ
+            # log signature tương thích (operators đang grep dòng này).
+            full = f"{prefix} [proxy] {mask_proxy(line)} lỗi network — loại khỏi pool"
+            try:
+                asyncio.create_task(
+                    self._log("warn", full, {"proxy": mask_proxy(line)})
                 )
-            )
-        except RuntimeError:
-            pass
+            except RuntimeError:
+                pass
+
+        mark_proxy_dead_on_error(line, exc_or_msg, log=_emit_log)
 
     async def _mark_email_failed(self, email: str) -> None:
         """Update icloud_emails status → 'disabled' để không bị pick lại.
