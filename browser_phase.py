@@ -625,6 +625,10 @@ async def _detect_screen(page) -> str:
         return "password_login"
     # /email-verification: ƯU TIÊN button "password" để bắt buộc set password
     # Nếu cả OTP input và password button cùng visible, password button thắng
+    #
+    # Anti-flaky: timeout 800ms cũ quá ngắn → SPA chưa kịp render password button
+    # → flow rớt vào nhánh OTP-only (passwordless) → password KHÔNG được set. Tăng
+    # lên 3000ms để khớp với latency SPA render thật (manual trace 1-2.5s).
     _PWD_BTN_SELECTOR = (
         'button:has-text("password"), a:has-text("password"), '
         '[role="button"]:has-text("password")'
@@ -632,7 +636,7 @@ async def _detect_screen(page) -> str:
     if "/email-verification" in cur or "/email-otp" in cur or "/identifier" in cur:
         try:
             pwd_btn = page.locator(_PWD_BTN_SELECTOR).first
-            if await pwd_btn.is_visible(timeout=800):
+            if await pwd_btn.is_visible(timeout=3000):
                 return "continue"
         except Exception:
             pass
@@ -640,7 +644,7 @@ async def _detect_screen(page) -> str:
     if "auth.openai.com" in cur:
         try:
             pwd_btn = page.locator(_PWD_BTN_SELECTOR).first
-            if await pwd_btn.is_visible(timeout=300):
+            if await pwd_btn.is_visible(timeout=800):
                 return "continue"
         except Exception:
             pass
@@ -786,8 +790,14 @@ async def _drive_signup_flow(
     otp_seconds_total = 0.0
     otp_already_polled = False  # tránh poll OTP nhiều lần trong cùng batch
     register_attempted = False
+    register_succeeded = False  # True chỉ sau POST /register trả 200 (password đã set)
     login_attempted = False
     continue_clicked = False
+    # Đếm số lần force goto /create-account/password — tránh loop vô hạn khi server
+    # cứ redirect ngược về /email-verification (rare edge case, vd account vừa
+    # registered nửa chừng bị stuck giữa flow).
+    force_pwd_goto_count = 0
+    _FORCE_PWD_GOTO_MAX = 3
     otp_submitted = False
     _otp_submit_ts: float | None = None
     _otp_reclick_done = False
@@ -819,6 +829,19 @@ async def _drive_signup_flow(
 
         if screen == "chatgpt":
             await _wait_chatgpt_session(ctx, page, timeout_seconds=30.0, log=log)
+            # Hard policy (2026-06-28): bắt buộc password phải được set qua
+            # /create-account/password POST 200. Nếu flow chạm chatgpt.com mà
+            # KHÔNG đi qua register POST (register_succeeded=False) VÀ cũng
+            # KHÔNG phải login flow (login_attempted=False) → account tạo
+            # passwordless → vi phạm policy, fail-fast.
+            if not register_succeeded and not login_attempted:
+                raise BrowserPhaseError(
+                    f"password chưa được set: flow đi vào chatgpt.com mà KHÔNG "
+                    f"qua /create-account/password (passwordless OTP path) — "
+                    f"URL: {page.url}"
+                )
+            # Verify /api/auth/session trả accessToken + user.id (confirm login OK).
+            await _verify_account_session(ctx, page, log=log)
             return callback_holder.get("url") or page.url, otp_seconds_total
 
         if screen == "auth_error":
@@ -1017,7 +1040,8 @@ async def _drive_signup_flow(
                 body_text = ""
 
             if status == 200:
-                log("[flow] register OK (HTTP 200) — page tự navigate qua redirect")
+                register_succeeded = True
+                log("[flow] register OK (HTTP 200) — password set, page tự navigate qua redirect")
                 # Page tự follow continue_url (server trả 302 → /email-verification).
                 # KHÔNG manual goto — để form submit redirect chain tự nhiên (sentinel
                 # observer sẽ thấy navigation hoàn chỉnh).
@@ -1090,6 +1114,68 @@ async def _drive_signup_flow(
             continue
 
         if screen == "otp":
+            # ── GUARD: pre-register passwordless trap ─────────────────────
+            # OpenAI đôi khi render /email-verification chỉ có OTP form (không
+            # có nút "Continue with password") — passwordless trend. Nếu rớt
+            # vào nhánh này TRƯỚC khi register POST → account tạo thành công
+            # NHƯNG KHÔNG có password (passwordless OTP-only).
+            #
+            # User yêu cầu (2026-06-28): bắt buộc password phải được set.
+            # → Force goto /create-account/password để buộc OpenAI render form
+            # password input. Giới hạn 3 lần để tránh loop (server có thể
+            # redirect ngược nếu screen_hint chỉ định OTP-only).
+            if not register_attempted and "auth.openai.com" in page.url:
+                if force_pwd_goto_count < _FORCE_PWD_GOTO_MAX:
+                    # Thử đợi thêm 4s xem password button có render trễ không
+                    # (race rare: SPA chunk JS late) trước khi force goto.
+                    _PWD_SEL = (
+                        'button:has-text("password"), a:has-text("password"), '
+                        '[role="button"]:has-text("password")'
+                    )
+                    try:
+                        late_btn = page.locator(_PWD_SEL).first
+                        if await late_btn.is_visible(timeout=4000):
+                            log(
+                                "[flow] pre-register OTP screen: password button "
+                                "rendered trễ → re-loop để click 'Continue with password'"
+                            )
+                            same_screen_count = 0
+                            last_screen = None
+                            await asyncio.sleep(0.5)
+                            continue
+                    except Exception:
+                        pass
+                    force_pwd_goto_count += 1
+                    log(
+                        f"[flow] OTP form hiện trước khi register POST "
+                        f"(passwordless path) — force goto /create-account/password "
+                        f"để set password ({force_pwd_goto_count}/{_FORCE_PWD_GOTO_MAX})"
+                    )
+                    try:
+                        await page.goto(
+                            "https://auth.openai.com/create-account/password",
+                            wait_until="domcontentloaded",
+                            timeout=15000,
+                        )
+                        await asyncio.sleep(1.0)
+                        last_screen = None
+                        same_screen_count = 0
+                    except Exception as exc:
+                        log(
+                            f"[flow] goto /create-account/password failed: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        await asyncio.sleep(1.0)
+                    continue
+                # Hết quota force goto → fail-fast, không cho qua nhánh OTP để
+                # tạo account passwordless (vi phạm user policy).
+                raise BrowserPhaseError(
+                    f"không vào được /create-account/password sau "
+                    f"{_FORCE_PWD_GOTO_MAX} lần goto — OpenAI cứ redirect "
+                    f"passwordless. URL: {page.url}"
+                )
+            # ── End guard ──
+
             # Detect "incorrect code" error → thử code kế (nếu có) hoặc resend + poll
             # Gate bằng `otp_submitted`: chỉ check error sau khi đã submit ít nhất 1 OTP.
             # Lý do: trang /email-verification fresh load có thể có element
@@ -1433,6 +1519,16 @@ async def _drive_signup_flow(
             )
             # Sau /about-you có thể vẫn còn step (rare), tiếp tục loop để chờ chatgpt.com
             await _wait_chatgpt_session(ctx, page, timeout_seconds=60.0, log=log)
+            # Hard policy: bắt buộc password phải được set (xem branch chatgpt
+            # ở trên). About-you chỉ chạy sau khi đã qua register POST trong
+            # signup flow → register_succeeded phải True; nếu False = bug nội bộ.
+            if not register_succeeded and not login_attempted:
+                raise BrowserPhaseError(
+                    f"password chưa được set: flow chạm /about-you mà KHÔNG "
+                    f"qua /create-account/password POST 200 — "
+                    f"URL: {page.url}"
+                )
+            await _verify_account_session(ctx, page, log=log)
             return callback_url, otp_seconds_total
 
         # screen == 'unknown' → đợi page settle
@@ -1453,6 +1549,7 @@ async def _handle_login_after_password(
     login_branch = await _wait_after_login(page, timeout_seconds=20.0, log=log)
     if login_branch == "chatgpt":
         await _wait_chatgpt_session(ctx, page, timeout_seconds=30.0, log=log)
+        await _verify_account_session(ctx, page, log=log)
         return callback_holder.get("url") or page.url, otp_seconds
 
     # Cần OTP cho login (hoặc account chưa hoàn thành onboarding)
@@ -1507,6 +1604,9 @@ async def _handle_login_after_password(
         callback_url = callback_holder.get("url") or page.url
 
     await _wait_chatgpt_session(ctx, page, timeout_seconds=60.0, log=log)
+    # Verify /api/auth/session — login flow phải có accessToken + user.id (xem
+    # _verify_account_session). Áp dụng cho cả login lẫn signup-after-login.
+    await _verify_account_session(ctx, page, log=log)
     return callback_url, otp_seconds
 
 
@@ -2057,6 +2157,109 @@ async def _fill_about_you(page, *, name: str, birthdate: str, timeout_seconds: f
             page.remove_listener("response", _on_resp)
         except Exception:
             pass
+
+
+async def _verify_account_session(
+    ctx,
+    page,
+    *,
+    log,
+    timeout_seconds: float = 20.0,
+) -> dict:
+    """Gọi `/api/auth/session` qua fetch() trong page context để confirm acc
+    đã login thành công sau reg.
+
+    Yêu cầu cứng (fail-fast nếu thiếu):
+      - accessToken (JWT): bắt buộc — chứng minh server đã issue token.
+      - user.id: bắt buộc — chứng minh tài khoản có thật trong DB.
+
+    Nếu page chưa ở chatgpt.com → goto trước (relative fetch /api/auth/session
+    cần đúng origin). Retry tối đa 4 lần (5s/lần) trong window timeout_seconds
+    vì NextAuth có thể commit cookies trễ vài giây sau callback.
+
+    Trả về session dict đầy đủ. Raise BrowserPhaseError nếu hết retry.
+    """
+    if "chatgpt.com" not in page.url:
+        log(f"[verify] page đang ở {page.url.split('?')[0]} — goto chatgpt.com trước")
+        try:
+            await page.goto(
+                "https://chatgpt.com/",
+                wait_until="domcontentloaded",
+                timeout=20_000,
+            )
+        except Exception as exc:
+            log(f"[verify] goto chatgpt.com fail: {type(exc).__name__}: {exc}")
+
+    deadline = time.monotonic() + timeout_seconds
+    attempt = 0
+    last_error = "no attempt"
+    while time.monotonic() < deadline:
+        attempt += 1
+        try:
+            result = await page.evaluate(
+                """
+                async () => {
+                    try {
+                        const r = await fetch('/api/auth/session', {
+                            credentials: 'include',
+                            headers: {'Accept': 'application/json'},
+                        });
+                        const text = await r.text();
+                        return {ok: r.ok, status: r.status, body: text};
+                    } catch (e) {
+                        return {ok: false, status: 0, error: String(e)};
+                    }
+                }
+                """
+            )
+        except Exception as exc:
+            last_error = f"page.evaluate fail: {type(exc).__name__}: {exc}"
+            log(f"[verify] attempt {attempt}: {last_error}")
+            await asyncio.sleep(2.0)
+            continue
+
+        status = result.get("status", 0)
+        if not result.get("ok"):
+            last_error = (
+                f"HTTP {status}: {result.get('error') or (result.get('body') or '')[:120]}"
+            )
+            log(f"[verify] attempt {attempt}: /api/auth/session {last_error}")
+            await asyncio.sleep(2.0)
+            continue
+
+        body_text = result.get("body") or ""
+        try:
+            data = json.loads(body_text) if body_text else {}
+        except Exception as exc:
+            last_error = f"JSON parse fail: {exc} body={body_text[:120]!r}"
+            log(f"[verify] attempt {attempt}: {last_error}")
+            await asyncio.sleep(2.0)
+            continue
+
+        access_token = data.get("accessToken") or ""
+        user = data.get("user") or {}
+        user_id = user.get("id") or ""
+
+        if access_token and user_id:
+            log(
+                f"[verify] /api/auth/session OK "
+                f"(user_id={str(user_id)[:24]}..., access_token len={len(access_token)}, "
+                f"expires={data.get('expires', '?')})"
+            )
+            return data
+
+        last_error = (
+            f"session thiếu accessToken/user.id "
+            f"(has_token={bool(access_token)}, has_user_id={bool(user_id)}, "
+            f"keys={list(data.keys())[:8]})"
+        )
+        log(f"[verify] attempt {attempt}: {last_error} — chờ NextAuth commit cookies")
+        await asyncio.sleep(2.0)
+
+    raise BrowserPhaseError(
+        f"verify /api/auth/session FAIL sau {attempt} attempt "
+        f"(timeout {timeout_seconds}s): {last_error}"
+    )
 
 
 async def _wait_chatgpt_session(ctx, page, *, timeout_seconds: float, log) -> None:
